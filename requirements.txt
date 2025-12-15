@@ -10,7 +10,7 @@ clip-interrogator>=0.6.0
 
 # Note: PyTorch and ONNX Runtime are handled by setup scripts
 # The setup script will automatically install:
-#   - PyTorch with CUDA (if GPU detected) or CPU-only
+#   - PyTorch with CUDA (if NVIDIA GPU detected), PyTorch with ROCm (if AMD GPU detected on linux) or PyTorch (for CPU-only)
 #   - onnxruntime-gpu (if GPU detected) or onnxruntime (CPU-only)
 #
 # Manual installation:
