@@ -71,15 +71,51 @@ echo ""
 
 # Detect OS
 OS_TYPE=$(uname -s)
-echo -e "${BLUE}[4/7] Detecting GPU and CUDA support...${NC}"
+echo -e "${BLUE}[4/7] Detecting GPU and acceleration support...${NC}"
 echo ""
 
 INSTALL_CUDA="n"
+INSTALL_ROCM="n"
+GPU_TYPE="cpu"
 CUDA_VERSION="cpu"
 
-# Check for NVIDIA GPU (Linux only, Mac doesn't support NVIDIA CUDA)
+# Check for AMD GPU with ROCm (Linux only)
 if [ "$OS_TYPE" = "Linux" ]; then
-    if command -v nvidia-smi &> /dev/null; then
+    if command -v rocm-smi &> /dev/null || command -v rocminfo &> /dev/null; then
+        echo -e "${GREEN}      AMD GPU detected! Getting GPU information...${NC}"
+        echo ""
+
+        if command -v rocm-smi &> /dev/null; then
+            rocm-smi --showproductname 2>/dev/null || echo "      AMD GPU Present"
+        fi
+        echo ""
+
+        # Detect ROCm version
+        if [ -f /opt/rocm/.info/version ]; then
+            ROCM_VERSION=$(cat /opt/rocm/.info/version | cut -d'-' -f1)
+            echo -e "      Detected ROCm Version: ${ROCM_VERSION}"
+        elif command -v rocminfo &> /dev/null; then
+            ROCM_VERSION=$(rocminfo | grep "ROCm Version" | awk '{print $3}' || echo "unknown")
+            echo -e "      Detected ROCm Version: ${ROCM_VERSION}"
+        else
+            ROCM_VERSION="6.0"
+            echo -e "      ROCm detected (version unknown, defaulting to 6.0)"
+        fi
+
+        # Determine PyTorch ROCm version
+        # ROCm 6.0+ uses rocm6.0, ROCm 5.7 uses rocm5.7, etc.
+        ROCM_MAJOR=$(echo "$ROCM_VERSION" | cut -d'.' -f1)
+        ROCM_MINOR=$(echo "$ROCM_VERSION" | cut -d'.' -f2)
+        PYTORCH_ROCM="rocm${ROCM_MAJOR}.${ROCM_MINOR}"
+
+        echo -e "      Recommended PyTorch ROCm Version: ${PYTORCH_ROCM}"
+        echo ""
+        INSTALL_ROCM="y"
+        GPU_TYPE="rocm"
+        CUDA_VERSION="$PYTORCH_ROCM"
+
+    # Check for NVIDIA GPU if no AMD GPU found
+    elif command -v nvidia-smi &> /dev/null; then
         echo -e "${GREEN}      NVIDIA GPU detected! Getting GPU information...${NC}"
         echo ""
         nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
@@ -116,13 +152,15 @@ if [ "$OS_TYPE" = "Linux" ]; then
         echo -e "      Recommended PyTorch CUDA Version: ${CUDA_INDEX}"
         echo ""
         INSTALL_CUDA="y"
+        GPU_TYPE="cuda"
         CUDA_VERSION="$CUDA_INDEX"
     else
-        echo -e "${YELLOW}      [WARNING] NVIDIA GPU not detected or drivers not installed${NC}"
+        echo -e "${YELLOW}      [WARNING] No AMD or NVIDIA GPU detected${NC}"
         echo ""
         echo "      This application can run on CPU, but GPU is HIGHLY recommended"
-        echo "      for performance. If you have an NVIDIA GPU, please install"
-        echo "      drivers from: https://www.nvidia.com/download/index.aspx"
+        echo "      for performance."
+        echo "      - AMD GPU: Install ROCm from https://rocm.docs.amd.com/"
+        echo "      - NVIDIA GPU: Install drivers from https://www.nvidia.com/download/index.aspx"
         echo ""
     fi
 elif [ "$OS_TYPE" = "Darwin" ]; then
@@ -147,14 +185,21 @@ if python3 -c "import torch" 2>/dev/null; then
     CUDA_AVAILABLE=$(python3 -c "import torch; print(torch.cuda.is_available())")
     echo "      CUDA Available: ${CUDA_AVAILABLE}"
 
-    if [ "$INSTALL_CUDA" = "y" ]; then
-        # Check if current PyTorch has CUDA support
+    if [ "$INSTALL_CUDA" = "y" ] || [ "$INSTALL_ROCM" = "y" ]; then
+        # Check if current PyTorch has GPU support
         if [ "$CUDA_AVAILABLE" = "False" ]; then
             echo ""
-            echo -e "${YELLOW}      [WARNING] PyTorch is installed but WITHOUT CUDA support!${NC}"
-            echo "      Your system has CUDA ${DETECTED_CUDA} available."
-            echo ""
-            read -p "      Reinstall PyTorch with CUDA ${DETECTED_CUDA} support? (y/n): " REINSTALL
+            if [ "$INSTALL_ROCM" = "y" ]; then
+                echo -e "${YELLOW}      [WARNING] PyTorch is installed but WITHOUT ROCm support!${NC}"
+                echo "      Your system has ROCm ${ROCM_VERSION} available."
+                echo ""
+                read -p "      Reinstall PyTorch with ROCm ${ROCM_VERSION} support? (y/n): " REINSTALL
+            else
+                echo -e "${YELLOW}      [WARNING] PyTorch is installed but WITHOUT CUDA support!${NC}"
+                echo "      Your system has CUDA ${DETECTED_CUDA} available."
+                echo ""
+                read -p "      Reinstall PyTorch with CUDA ${DETECTED_CUDA} support? (y/n): " REINSTALL
+            fi
             if [ "$REINSTALL" = "y" ] || [ "$REINSTALL" = "Y" ]; then
                 NEED_PYTORCH="y"
             else
@@ -201,7 +246,12 @@ if [ "$NEED_PYTORCH" = "y" ]; then
     echo "      Removing existing PyTorch installation..."
     pip uninstall -y torch torchvision torchaudio 2>/dev/null || true
 
-    if [ "$INSTALL_CUDA" = "y" ]; then
+    if [ "$INSTALL_ROCM" = "y" ]; then
+        echo "      Installing PyTorch with ROCm ${ROCM_VERSION} support..."
+        echo "      This may take several minutes (downloading ~2GB)..."
+        echo ""
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/${CUDA_VERSION}
+    elif [ "$INSTALL_CUDA" = "y" ]; then
         echo "      Installing PyTorch with CUDA ${DETECTED_CUDA} support..."
         echo "      This may take several minutes (downloading ~2GB)..."
         echo ""
@@ -226,7 +276,24 @@ echo ""
 
 # Install other requirements
 echo -e "${BLUE}[7/7] Installing remaining dependencies...${NC}"
-pip install -r requirements.txt --upgrade
+echo ""
+
+# Install ONNX Runtime based on GPU availability
+if [ "$INSTALL_CUDA" = "y" ]; then
+    echo "      Installing ONNX Runtime with CUDA support for WD Tagger..."
+    pip install "onnxruntime-gpu>=1.16.0"
+elif [ "$INSTALL_ROCM" = "y" ]; then
+    echo "      Installing ONNX Runtime (CPU version - no ROCm pip package available)..."
+    echo "      Note: WD Tagger will run on CPU. For ROCm support, build from source."
+    pip install "onnxruntime>=1.16.0"
+else
+    echo "      Installing ONNX Runtime (CPU-only)..."
+    pip install "onnxruntime>=1.16.0"
+fi
+
+# Install other dependencies (excluding onnxruntime-gpu from requirements.txt)
+echo "      Installing other dependencies..."
+pip install -r requirements.txt --upgrade 2>&1 | grep -v "onnxruntime"
 if [ $? -ne 0 ]; then
     echo ""
     echo -e "${RED}[ERROR] Failed to install dependencies!${NC}"
@@ -239,26 +306,67 @@ echo "============================================================"
 echo "VERIFYING INSTALLATION"
 echo "============================================================"
 echo ""
+echo "PyTorch:"
 python3 << 'EOF'
 import torch
-print(f'PyTorch Version: {torch.__version__}')
-print(f'CUDA Available: {torch.cuda.is_available()}')
+print(f'  Version: {torch.__version__}')
+print(f'  CUDA Available: {torch.cuda.is_available()}')
 if torch.cuda.is_available():
-    print(f'GPU: {torch.cuda.get_device_name(0)}')
+    print(f'  GPU: {torch.cuda.get_device_name(0)}')
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    print('MPS (Apple Silicon) Available: True')
+    print('  MPS (Apple Silicon) Available: True')
 else:
-    print('GPU: N/A (CPU mode)')
+    print('  GPU: N/A (CPU mode)')
+EOF
+echo ""
+echo "ONNX Runtime:"
+python3 << 'EOF'
+import onnxruntime as ort
+print(f'  Version: {ort.__version__}')
+providers = ort.get_available_providers()
+print(f'  CUDA Provider: {"Yes" if "CUDAExecutionProvider" in providers else "No"}')
 EOF
 echo ""
 
-if [ "$INSTALL_CUDA" = "y" ]; then
+if [ "$INSTALL_ROCM" = "y" ]; then
+    PYTORCH_OK=false
+
     if python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
-        echo -e "${GREEN}[SUCCESS] GPU acceleration is enabled!${NC}"
+        PYTORCH_OK=true
+        echo -e "${GREEN}[SUCCESS] ROCm GPU acceleration is enabled!${NC}"
+        echo "  - PyTorch: ROCm enabled (for CLIP models)"
+        echo "  - ONNX Runtime: CPU mode (no ROCm pip package available)"
+        echo ""
+        echo -e "${YELLOW}  Note: For ONNX Runtime ROCm support, you need to build from source${NC}"
+        echo "  Visit: https://onnxruntime.ai/docs/build/eps.html#migraphx"
         echo ""
     else
-        echo -e "${YELLOW}[WARNING] CUDA is still not available!${NC}"
-        echo "Please check the installation and try running this script again."
+        echo -e "${YELLOW}[WARNING] PyTorch ROCm is not available!${NC}"
+        echo ""
+    fi
+
+elif [ "$INSTALL_CUDA" = "y" ]; then
+    PYTORCH_OK=false
+    ONNX_OK=false
+
+    if python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+        PYTORCH_OK=true
+    else
+        echo -e "${YELLOW}[WARNING] PyTorch CUDA is not available!${NC}"
+        echo ""
+    fi
+
+    if python3 -c "import onnxruntime as ort; exit(0 if 'CUDAExecutionProvider' in ort.get_available_providers() else 1)" 2>/dev/null; then
+        ONNX_OK=true
+    else
+        echo -e "${YELLOW}[WARNING] ONNX Runtime CUDA is not available!${NC}"
+        echo ""
+    fi
+
+    if [ "$PYTORCH_OK" = true ] && [ "$ONNX_OK" = true ]; then
+        echo -e "${GREEN}[SUCCESS] GPU acceleration is fully enabled!${NC}"
+        echo "  - PyTorch: CUDA enabled (for CLIP models)"
+        echo "  - ONNX Runtime: CUDA enabled (for WD Tagger models)"
         echo ""
     fi
 fi
