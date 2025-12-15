@@ -1,0 +1,161 @@
+# Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        User Interface Layer (PyQt6)                 │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                     main_window.py                            │  │
+│  │  ┌─────────────────┐  ┌───────────┐  ┌─────────────────────┐  │  │
+│  │  │ Interrogation   │  │ Gallery   │  │ Database/Settings   │  │  │
+│  │  │ Tab             │  │ Tab       │  │ Tab                 │  │  │
+│  │  │ - Model config  │  │ - Browser │  │ - DB stats          │  │  │
+│  │  │ - Image queue   │  │ - Preview │  │ - Tag filters mgmt  │  │  │
+│  │  │ - Tag filters   │  │ - Editor  │  │ - App settings      │  │  │
+│  │  │ - Batch ops     │  │ - Organize│  │ - DB mode (local/   │  │  │
+│  │  └─────────────────┘  └───────────┘  │   global)           │  │  │
+│  │                                      └─────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│  ┌────────────┐  ┌──────────────┐  ┌──────────────────────────┐     │
+│  │ widgets.py │  │ dialogs.py   │  │ dialogs_advanced.py      │     │
+│  │ - Gallery  │  │ - CLIP Cfg   │  │ - Advanced Inspection    │     │
+│  │ - Tag Edit │  │ - WD Config  │  │ - Multi-model comparison │     │
+│  │ - Results  │  │ - Organize   │  │ - WD sensitivity ratings │     │
+│  │            │  │              │  │ - DB vs File comparison  │     │
+│  └────────────┘  └──────────────┘  └──────────────────────────┘     │
+│  ┌─────────────────────┐                                            │
+│  │ workers.py          │                                            │
+│  │ - Interrogation     │                                            │
+│  │ - Organization      │                                            │
+│  │ - Background threads│                                            │
+│  └─────────────────────┘                                            │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Uses
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Business Logic Layer                            │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                    Interrogators                              │  │
+│  │  ┌────────────────────┐           ┌────────────────────────┐  │  │
+│  │  │ base_interrogator  │◄──────────┤ clip_interrogator.py   │  │  │
+│  │  │ (Abstract)         │           │ - CLIP model           │  │  │
+│  │  │ - load_model()     │           │ - 4 modes              │  │  │
+│  │  │ - interrogate()    │           │ - Caption generation   │  │  │
+│  │  │ - get_model_type() │           └────────────────────────┘  │  │
+│  │  └────────────────────┘                                       │  │
+│  │           ▲                                                   │  │
+│  │           │                                                   │  │
+│  │           │                ┌────────────────────────────┐     │  │
+│  │           └────────────────┤ wd_interrogator.py         │     │  │
+│  │                            │ - WD Tagger model          │     │  │
+│  │                            │ - Confidence thresholds    │     │  │
+│  │                            │ - ONNX inference           │     │  │
+│  │                            └────────────────────────────┘     │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                     Core Utilities                            │  │
+│  │  ┌────────────────┐  ┌─────────────┐  ┌──────────────────┐    │  │
+│  │  │ database.py    │  │ hashing.py  │  │ file_manager.py  │    │  │
+│  │  │ - SQLite ORM   │  │ - SHA256    │  │ - File I/O       │    │  │
+│  │  │ - Cache mgmt   │  │ - Metadata  │  │ - Organization   │    │  │
+│  │  │ - 3 tables     │  │ extraction  │  │ - Tag read/write │    │  │
+│  │  │ - Local/Global │  │             │  │                  │    │  │
+│  │  │   DB modes     │  │             │  │                  │    │  │
+│  │  └────────────────┘  └─────────────┘  └──────────────────┘    │  │
+│  │                                                               │  │
+│  │  ┌────────────────────────────────────────────────────────┐   │  │
+│  │  │ tag_filters.py                                         │   │  │
+│  │  │ - TagFilterSettings class                              │   │  │
+│  │  │ - Remove list (blacklist unwanted tags)                │   │  │
+│  │  │ - Replace rules (tag substitution)                     │   │  │
+│  │  │ - Keep list (force-include low-confidence tags)        │   │  │
+│  │  │ - Filters apply ONLY to .txt files (DB unchanged)      │   │  │
+│  │  └────────────────────────────────────────────────────────┘   │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Persists to
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Data Layer                                   │
+│  ┌──────────────────┐    ┌────────────────┐    ┌────────────────┐   │
+│  │ interrogations.db│    │ *.jpg, *.png   │    │ *.txt files    │   │
+│  │ SQLite Database  │    │ Image files    │    │ Tag files      │   │
+│  │                  │    │                │    │                │   │
+│  │ - images         │    │ User's gallery │    │ Comma-separated│   │
+│  │ - models         │    │ directory      │    │ tags           │   │
+│  │ - interrogations │    │                │    │                │   │
+│  └──────────────────┘    └────────────────┘    └────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Data Flow: Batch Interrogation                  │
+└─────────────────────────────────────────────────────────────────────┘
+
+1. User clicks "Batch Interrogate"
+           │
+           ▼
+2. Main Window creates InterrogationWorker (QThread)
+           │
+           ▼
+3. Worker iterates through images
+           │
+           ├─► Hash image (SHA256)
+           │
+           ├─► Check database cache
+           │   │
+           │   ├─► If cached: Use stored results ──────┐
+           │   │                                       │
+           │   └─► If not cached:                      │
+           │       │                                   │
+           │       ├─► Call interrogator.interrogate() │
+           │       │                                   │
+           │       ├─► Save to database                │
+           │       │                                   │
+           │       └─► Continue ───────────────────────┤
+           │                                           │
+           ├─► Apply tag filters (remove/replace/keep) │
+           │                                           │
+           ├─► Write .txt file (if enabled) ◄──────────┘
+           │
+           ├─► Emit progress signal to UI
+           │
+           └─► Update gallery visual indicator
+
+4. Worker emits finished signal
+           │
+           ▼
+5. Main Window updates statistics and re-enables buttons
+
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                  Thread Safety & Concurrency                        │
+└─────────────────────────────────────────────────────────────────────┘
+
+Main Thread (GUI)              Worker Thread (Background)
+      │                                  │
+      │  Start batch interrogate         │
+      ├─────────────────────────────────►│
+      │                                  │
+      │                                  │ Process images
+      │                                  │ Access database
+      │  ◄────── Progress signal ────────┤
+      │  Update progress bar             │
+      │                                  │
+      │  ◄────── Result signal ──────────┤
+      │  Update gallery status           │
+      │                                  │
+      │  ◄────── Error signal ───────────┤
+      │  Log error                       │
+      │                                  │
+      │  ◄────── Finished signal ────────┤
+      │  Re-enable buttons               │
+      │  Show completion dialog          │
+      │                                  ×
+      ▼
+
+Note: SQLite database handles concurrent access safely.
+      Worker thread never directly modifies Qt widgets.
+      All UI updates via signal/slot mechanism.
