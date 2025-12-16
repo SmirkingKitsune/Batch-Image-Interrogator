@@ -2,14 +2,19 @@ PyQt6>=6.6.0
 PyQt6-WebEngine>=6.6.0
 Pillow>=10.0.0
 numpy>=1.24.0
-onnxruntime>=1.16.0
 huggingface-hub>=0.19.0
 pandas>=2.0.0
 
-# Optional: CLIP Interrogator
+# CLIP Interrogator
 clip-interrogator>=0.6.0
-torch>=2.9.1
-torchvision>=0.24.1
 
-# Optional: For GPU support with ONNX Runtime
-# onnxruntime-gpu>=1.16.0
+# Note: PyTorch and ONNX Runtime are handled by setup scripts
+# The setup script will automatically install:
+#   - PyTorch with CUDA (if NVIDIA GPU detected), PyTorch with ROCm (if AMD GPU detected on linux) or PyTorch (for CPU-only)
+#   - onnxruntime-gpu (if GPU detected) or onnxruntime (CPU-only)
+#
+# Manual installation:
+#   GPU: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#        pip install onnxruntime-gpu>=1.16.0
+#   CPU: pip install torch torchvision
+#        pip install onnxruntime>=1.16.0

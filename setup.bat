@@ -267,7 +267,20 @@ echo.
 
 REM Install other requirements
 echo [7/7] Installing remaining dependencies...
-pip install -r requirements.txt --upgrade
+echo.
+
+REM Install ONNX Runtime based on GPU availability
+if "!INSTALL_CUDA!"=="y" (
+    echo       Installing ONNX Runtime with GPU support for WD Tagger...
+    pip install onnxruntime-gpu>=1.16.0
+) else (
+    echo       Installing ONNX Runtime (CPU-only)...
+    pip install onnxruntime>=1.16.0
+)
+
+REM Install other dependencies (excluding onnxruntime-gpu from requirements.txt)
+echo       Installing other dependencies...
+pip install -r requirements.txt --upgrade | findstr /V "onnxruntime"
 if errorlevel 1 (
     echo.
     echo [ERROR] Failed to install dependencies!
@@ -281,17 +294,28 @@ echo ============================================================
 echo VERIFYING INSTALLATION
 echo ============================================================
 echo.
-python -c "import torch; print(f'PyTorch Version: {torch.__version__}'); print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
+echo PyTorch:
+python -c "import torch; print(f'  Version: {torch.__version__}'); print(f'  CUDA Available: {torch.cuda.is_available()}'); print(f'  GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
+echo.
+echo ONNX Runtime:
+python -c "import onnxruntime as ort; print(f'  Version: {ort.__version__}'); providers = ort.get_available_providers(); print(f'  CUDA Provider: {\"Yes\" if \"CUDAExecutionProvider\" in providers else \"No\"}')"
 echo.
 
 if "!INSTALL_CUDA!"=="y" (
     python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" >nul 2>&1
     if errorlevel 1 (
-        echo [WARNING] CUDA is still not available!
-        echo Please check the installation and try running this script again.
+        echo [WARNING] PyTorch CUDA is not available!
+        echo.
+    )
+
+    python -c "import onnxruntime as ort; exit(0 if 'CUDAExecutionProvider' in ort.get_available_providers() else 1)" >nul 2>&1
+    if errorlevel 1 (
+        echo [WARNING] ONNX Runtime CUDA is not available!
         echo.
     ) else (
-        echo [SUCCESS] GPU acceleration is enabled!
+        echo [SUCCESS] GPU acceleration is fully enabled!
+        echo   - PyTorch: CUDA enabled (for CLIP models)
+        echo   - ONNX Runtime: CUDA enabled (for WD Tagger models)
         echo.
     )
 )

@@ -16,7 +16,7 @@ A professional PyQt6-based application for batch image interrogation and tagging
 - **Smart File Organization**: Organize images by tags with recursive search and directory selection to prevent re-organizing
 - **Confidence Scores**: WD Tagger provides confidence scores for each tag
 - **Gallery View**: Thumbnail-based image browser with visual indicators for tagged images
-- **GPU Acceleration**: CUDA support for 10-50x faster processing
+- **GPU Acceleration**: CUDA (NVIDIA) and ROCm (AMD) support for 10-50x faster processing
 
 ## Architecture
 
@@ -47,8 +47,8 @@ image_interrogator/
 
 **Optional:**
 
-- CUDA-capable NVIDIA GPU (recommended for optimal performance)
-- NVIDIA drivers installed (if you have a GPU)
+- **NVIDIA GPU**: CUDA-capable GPU with drivers installed (recommended for optimal performance)
+- **AMD GPU (Linux only)**: ROCm-capable GPU with ROCm installed (see ROCm Support section)
 
 ### Quick Start (Recommended)
 
@@ -77,7 +77,7 @@ The setup script will:
 
 ### Manual Installation (Advanced)
 
-If you prefer manual setup:
+If you prefer manual setup or the automated script fails:
 
 **Step 1: Create Virtual Environment**
 ```bash
@@ -87,35 +87,58 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 **Step 2: Install PyTorch**
 
-For CPU-only installation:
+Choose the installation that matches your GPU:
+
+**Option A: NVIDIA GPU (CUDA)**
+```bash
+# Recommended: CUDA 12.6 (RTX 30/40 series, GTX 16 series)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+# Or CUDA 13.0 (latest, RTX 40 series)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+
+# Or CUDA 12.8 (newer GPUs)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+# Or CUDA 11.8 (older GPUs: GTX 10 series, RTX 20 series)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+```
+
+**Option B: AMD GPU (ROCm) - Linux only**
+```bash
+# ROCm 6.0 (RX 7000 series)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.0
+
+# ROCm 5.7 (RX 6000 series)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm5.7
+```
+
+**Option C: CPU Only (no GPU)**
 ```bash
 pip install torch torchvision
 ```
 
-For GPU support (recommended):
+**Step 3: Install ONNX Runtime**
+
+**For NVIDIA GPU:**
 ```bash
-# Install PyTorch with CUDA support first
-# Choose the appropriate CUDA version based on your GPU driver:
-
-# For CUDA 12.6 (recommended for most modern GPUs)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-
-# For CUDA 12.8 (newer GPUs)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-
-# For CUDA 13.0 (latest)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+pip install onnxruntime-gpu>=1.16.0
 ```
 
-**Step 3: Install Other Dependencies**
+**For AMD GPU or CPU:**
+```bash
+pip install onnxruntime>=1.16.0
+```
+
+**Step 4: Install Other Dependencies**
 ```bash
 pip install -r requirements.txt
-
-# For ONNX GPU support (WD Tagger)
-pip install onnxruntime-gpu
 ```
 
-**Important Note**: PyTorch bundles the necessary CUDA runtime libraries, so you only need compatible NVIDIA drivers installed. A separate CUDA Toolkit installation is not required unless you're compiling custom CUDA code.
+**Important Notes**:
+- PyTorch bundles CUDA runtime libraries - no separate CUDA Toolkit installation needed
+- ONNX Runtime GPU package is CUDA-only (AMD users get CPU version)
+- Check your NVIDIA driver supports the CUDA version you're installing
 
 ## Usage
 
@@ -361,37 +384,316 @@ landscape, sunset, mountains, scenic, nature, beautiful sky
 
 ## Performance Tips
 
-1. **GPU Usage**: Always use CUDA if available for 10-50x speedup
+1. **GPU Usage**: Always use CUDA (NVIDIA) or ROCm (AMD) if available for 10-50x speedup
 2. **Batch Size**: Process images in batches for optimal performance
 3. **Cache Utilization**: The database cache eliminates redundant processing
-4. **Model Selection**: 
+4. **Model Selection**:
    - WD Tagger is faster and provides confidence scores
    - CLIP provides more natural language descriptions
 
+## GPU Acceleration
+
+### CUDA Support (NVIDIA GPUs)
+
+The application provides full GPU acceleration for NVIDIA GPUs on Windows, Linux, and macOS (deprecated):
+
+#### Requirements
+- NVIDIA GPU with CUDA Compute Capability 3.5 or higher
+- NVIDIA drivers installed (CUDA Toolkit not required - PyTorch bundles CUDA runtime)
+- Windows: GeForce/RTX/Quadro series
+- Linux: GeForce/RTX/Quadro/Tesla series
+- macOS: Legacy support only (Apple deprecated NVIDIA GPU support)
+
+#### Installation
+
+1. **Install NVIDIA drivers** (if not already installed):
+   - Windows: https://www.nvidia.com/download/index.aspx
+   - Linux: Use your distribution's package manager or NVIDIA's official installer
+
+2. **Run the setup script**:
+
+   **Windows:**
+   ```bash
+   setup.bat
+   ```
+
+   **Linux:**
+   ```bash
+   ./setup.sh
+   ```
+
+   The script will:
+   - Automatically detect your NVIDIA GPU
+   - Detect CUDA version from `nvidia-smi`
+   - Install PyTorch with matching CUDA support (12.6, 12.8, 13.0, or 11.8)
+   - Install ONNX Runtime GPU for WD Tagger acceleration
+
+#### GPU Acceleration Status
+
+✅ **CLIP Models**: Full CUDA acceleration via PyTorch
+✅ **WD Tagger Models**: Full CUDA acceleration via ONNX Runtime GPU
+
+#### Performance
+
+- **CLIP interrogation**: 10-50x faster than CPU (depending on GPU)
+- **WD Tagger interrogation**: 10-50x faster than CPU (depending on GPU)
+- **Batch processing**: Optimal performance with GPU acceleration
+
+#### Supported CUDA Versions
+
+The setup script automatically detects and installs the correct version:
+- **CUDA 13.0**: Latest (RTX 40 series recommended)
+- **CUDA 12.8**: Recent GPUs
+- **CUDA 12.6**: Most common (RTX 30/40 series)
+- **CUDA 11.8**: Older GPUs (GTX 10 series, RTX 20 series)
+
+#### Verification
+
+After running the setup script, you should see:
+
+**Windows:**
+```
+PyTorch:
+  Version: 2.x.x+cu126
+  CUDA Available: True
+  GPU: NVIDIA GeForce RTX 4090
+
+ONNX Runtime:
+  Version: 1.x.x
+  CUDA Provider: Yes
+
+[SUCCESS] GPU acceleration is fully enabled!
+  - PyTorch: CUDA enabled (for CLIP models)
+  - ONNX Runtime: CUDA enabled (for WD Tagger models)
+```
+
+**Linux:**
+```
+PyTorch:
+  Version: 2.x.x+cu126
+  CUDA Available: True
+  GPU: NVIDIA GeForce RTX 4090
+
+ONNX Runtime:
+  Version: 1.x.x
+  CUDA Provider: Yes
+
+[SUCCESS] GPU acceleration is fully enabled!
+  - PyTorch: CUDA enabled (for CLIP models)
+  - ONNX Runtime: CUDA enabled (for WD Tagger models)
+```
+
+#### Manual Installation
+
+If you prefer to install manually or the setup script fails:
+
+```bash
+# Activate virtual environment
+# Windows: venv\Scripts\activate
+# Linux: source venv/bin/activate
+
+# Install PyTorch with CUDA 12.6 (most common)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+# Install ONNX Runtime GPU
+pip install onnxruntime-gpu>=1.16.0
+
+# Install other dependencies
+pip install -r requirements.txt
+```
+
+For other CUDA versions, change `cu126` to:
+- `cu130` for CUDA 13.0
+- `cu128` for CUDA 12.8
+- `cu118` for CUDA 11.8
+
+### ROCm Support (AMD GPUs on Linux)
+
+The application supports AMD GPUs on Linux through ROCm:
+
+### Requirements
+- **Linux only** (ROCm is not available on Windows/Mac)
+- AMD GPU with ROCm support (RX 6000/7000 series, Radeon VII, Vega, etc.)
+- ROCm 5.7 or later installed
+
+### Installation
+
+1. **Install ROCm** (if not already installed):
+   ```bash
+   # Ubuntu/Debian
+   # Visit https://rocm.docs.amd.com/projects/install-on-linux/en/latest/
+   ```
+
+2. **Run the setup script**:
+   ```bash
+   ./setup.sh
+   ```
+
+   The script will:
+   - Automatically detect your AMD GPU
+   - Detect your ROCm version
+   - Install PyTorch with ROCm support
+   - Install ONNX Runtime (CPU version, see note below)
+
+### GPU Acceleration Status
+
+✅ **CLIP Models**: Full ROCm acceleration via PyTorch
+⚠️ **WD Tagger Models**: CPU-only (ONNX Runtime ROCm pip package not available)
+
+### Performance Notes
+
+- **CLIP interrogation**: Full GPU acceleration with ROCm (10-50x faster than CPU)
+- **WD Tagger interrogation**: Runs on CPU (no pre-built ROCm package for ONNX Runtime)
+- For ONNX Runtime ROCm support, you must build from source: https://onnxruntime.ai/docs/build/eps.html#migraphx
+
+### Verification
+
+After running the setup script, you should see:
+```
+PyTorch:
+  Version: 2.x.x+rocmX.X
+  CUDA Available: True
+  GPU: AMD Radeon RX 7900 XTX
+
+ONNX Runtime:
+  Version: 1.x.x
+  CUDA Provider: No
+
+[SUCCESS] ROCm GPU acceleration is enabled!
+  - PyTorch: ROCm enabled (for CLIP models)
+  - ONNX Runtime: CPU mode (no ROCm pip package available)
+```
+
+### GPU Acceleration Comparison
+
+| Feature | CUDA (NVIDIA) | ROCm (AMD) | CPU Only |
+|---------|---------------|------------|----------|
+| **Platforms** | Windows, Linux | Linux only | All |
+| **CLIP Models** | ✅ GPU (10-50x) | ✅ GPU (10-50x) | ❌ CPU (1x) |
+| **WD Tagger** | ✅ GPU (10-50x) | ❌ CPU (1x)* | ❌ CPU (1x) |
+| **Setup** | Automatic | Automatic | Automatic |
+| **Driver Required** | NVIDIA | ROCm | None |
+| **Best For** | Maximum performance | AMD Linux users | Testing/compatibility |
+
+\* WD Tagger on ROCm requires building ONNX Runtime from source
+
+### Recommended GPU Configuration
+
+**For best performance:**
+1. **NVIDIA GPU (preferred)**: Full acceleration for both CLIP and WD Tagger
+2. **AMD GPU on Linux**: Full acceleration for CLIP, CPU for WD Tagger
+3. **CPU only**: Works but significantly slower (use for testing or compatibility)
+
+**Minimum recommended:**
+- NVIDIA: GTX 1060 6GB or better
+- AMD: RX 6600 or better
+- VRAM: 6GB minimum, 8GB+ recommended for larger models
+
 ## Troubleshooting
 
-### CUDA Not Detected (CPU Mode Warning)
+### GPU Not Detected (NVIDIA/CUDA)
 
 If you see "CUDA not available (CPU mode will be used)" but you have an NVIDIA GPU:
 
-1. **Run the setup script**: `setup.bat` (Windows) or `./setup.sh` (Linux/Mac)
-2. The script will detect your GPU and CUDA version
-3. Allow it to reinstall PyTorch with CUDA support when prompted
-4. Verify with: `python verify_cuda.py`
-
-**Common causes:**
-- PyTorch CPU-only version is installed (check with: `python -c "import torch; print(torch.__version__)"`)
-  - Look for `+cpu` in the version (bad) vs `+cu130` (good)
-- NVIDIA drivers not installed or outdated
-- Incompatible CUDA version between PyTorch and drivers
-
-**Quick fix:**
+#### Quick Fix
 ```bash
 # Windows
 setup.bat
 
 # Linux/Mac
 ./setup.sh
+```
+
+The setup script will:
+1. Detect your GPU and CUDA version
+2. Offer to reinstall PyTorch with CUDA support
+3. Install ONNX Runtime GPU for WD Tagger acceleration
+4. Verify the installation
+
+#### Manual Verification
+
+**Check PyTorch version:**
+```bash
+python -c "import torch; print(torch.__version__)"
+```
+- ❌ Bad: `2.x.x+cpu` (CPU-only)
+- ✅ Good: `2.x.x+cu126` (CUDA 12.6)
+
+**Check CUDA availability:**
+```bash
+python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
+```
+
+**Check ONNX Runtime:**
+```bash
+python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+```
+- ✅ Should include: `CUDAExecutionProvider`
+- ❌ Missing: Only shows `CPUExecutionProvider`
+
+#### Common Causes
+
+1. **PyTorch CPU-only installed**: Reinstall with CUDA support
+2. **NVIDIA drivers missing/outdated**:
+   - Windows: Download from https://www.nvidia.com/download/index.aspx
+   - Linux: `sudo apt install nvidia-driver-XXX` or use your package manager
+3. **Wrong CUDA version**: Setup script will detect and fix
+4. **ONNX Runtime CPU-only**: Run `pip install onnxruntime-gpu --force-reinstall`
+
+#### Verify Drivers
+
+```bash
+nvidia-smi
+```
+Should show your GPU and CUDA version. If this fails, install/update NVIDIA drivers.
+
+### GPU Not Detected (AMD/ROCm)
+
+If you have an AMD GPU on Linux but it's not being detected:
+
+#### Quick Fix
+```bash
+./setup.sh
+```
+
+#### Manual Verification
+
+**Check if ROCm is installed:**
+```bash
+rocm-smi
+# or
+rocminfo
+```
+
+**Check PyTorch version:**
+```bash
+python -c "import torch; print(torch.__version__)"
+```
+- ✅ Good: `2.x.x+rocm6.0` (ROCm 6.0)
+- ❌ Bad: `2.x.x+cpu` (CPU-only)
+
+**Check GPU availability:**
+```bash
+python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
+```
+Note: ROCm uses the CUDA API in PyTorch, so `cuda.is_available()` returns True for AMD GPUs.
+
+#### Common Causes
+
+1. **ROCm not installed**:
+   - Install from https://rocm.docs.amd.com/
+   - Ubuntu: `sudo apt install rocm-hip-runtime`
+2. **PyTorch CPU-only installed**: Reinstall with ROCm support
+3. **Unsupported GPU**: Check ROCm compatibility at https://rocm.docs.amd.com/
+4. **Wrong ROCm version**: Setup script will detect and match
+
+#### ROCm Version Check
+```bash
+# Check installed ROCm version
+cat /opt/rocm/.info/version
+
+# Should match PyTorch ROCm version
+python -c "import torch; print(torch.__version__)"
 ```
 
 ### Model Loading Fails
