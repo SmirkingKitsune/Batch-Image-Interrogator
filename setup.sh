@@ -281,24 +281,30 @@ echo ""
 # Install ONNX Runtime based on GPU availability
 if [ "$INSTALL_CUDA" = "y" ]; then
     echo "      Installing ONNX Runtime with CUDA support for WD Tagger..."
-    pip install "onnxruntime-gpu>=1.16.0"
+    pip install "onnxruntime-gpu>=1.16.0" || echo -e "${YELLOW}      [WARNING] Failed to install ONNX Runtime GPU. Continuing anyway...${NC}"
 elif [ "$INSTALL_ROCM" = "y" ]; then
     echo "      Installing ONNX Runtime (CPU version - no ROCm pip package available)..."
     echo "      Note: WD Tagger will run on CPU. For ROCm support, build from source."
-    pip install "onnxruntime>=1.16.0"
+    pip install "onnxruntime>=1.16.0" || echo -e "${YELLOW}      [WARNING] Failed to install ONNX Runtime. Continuing anyway...${NC}"
 else
     echo "      Installing ONNX Runtime (CPU-only)..."
-    pip install "onnxruntime>=1.16.0"
+    pip install "onnxruntime>=1.16.0" || echo -e "${YELLOW}      [WARNING] Failed to install ONNX Runtime. Continuing anyway...${NC}"
 fi
 
-# Install other dependencies (excluding onnxruntime-gpu from requirements.txt)
-echo "      Installing other dependencies..."
-pip install -r requirements.txt --upgrade 2>&1 | grep -v "onnxruntime"
+# Install other dependencies from requirements.txt
+echo "      Installing packages from requirements.txt..."
+echo "      (This may take a few minutes...)"
+echo ""
+pip install -r requirements.txt --upgrade
 if [ $? -ne 0 ]; then
     echo ""
-    echo -e "${RED}[ERROR] Failed to install dependencies!${NC}"
+    echo -e "${RED}[ERROR] Failed to install dependencies from requirements.txt!${NC}"
+    echo "Please check the error messages above."
     exit 1
 fi
+
+echo ""
+echo -e "${GREEN}      All dependencies installed successfully!${NC}"
 echo ""
 
 # Verify installation
@@ -326,6 +332,11 @@ print(f'  Version: {ort.__version__}')
 providers = ort.get_available_providers()
 print(f'  CUDA Provider: {"Yes" if "CUDAExecutionProvider" in providers else "No"}')
 EOF
+echo ""
+echo "Critical Dependencies:"
+python3 -c "import PyQt6; print('  PyQt6: Installed')" 2>/dev/null || echo -e "${RED}  [ERROR] PyQt6: NOT INSTALLED${NC}"
+python3 -c "from clip_interrogator import Interrogator; print('  CLIP Interrogator: Installed')" 2>/dev/null || echo -e "${RED}  [ERROR] CLIP Interrogator: NOT INSTALLED${NC}"
+python3 -c "import PIL; print('  Pillow: Installed')" 2>/dev/null || echo -e "${RED}  [ERROR] Pillow: NOT INSTALLED${NC}"
 echo ""
 
 if [ "$INSTALL_ROCM" = "y" ]; then
