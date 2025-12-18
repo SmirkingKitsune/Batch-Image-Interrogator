@@ -273,20 +273,36 @@ REM Install ONNX Runtime based on GPU availability
 if "!INSTALL_CUDA!"=="y" (
     echo       Installing ONNX Runtime with GPU support for WD Tagger...
     pip install onnxruntime-gpu>=1.16.0
+    if errorlevel 1 (
+        echo.
+        echo       [WARNING] Failed to install ONNX Runtime GPU. Continuing anyway...
+        echo.
+    )
 ) else (
-    echo       Installing ONNX Runtime (CPU-only)...
+    echo       Installing ONNX Runtime (CPU-only^)...
     pip install onnxruntime>=1.16.0
+    if errorlevel 1 (
+        echo.
+        echo       [WARNING] Failed to install ONNX Runtime. Continuing anyway...
+        echo.
+    )
 )
 
-REM Install other dependencies (excluding onnxruntime-gpu from requirements.txt)
-echo       Installing other dependencies...
-pip install -r requirements.txt --upgrade | findstr /V "onnxruntime"
+REM Install other dependencies from requirements.txt
+echo       Installing packages from requirements.txt...
+echo       (This may take a few minutes...)
+echo.
+pip install -r requirements.txt --upgrade
 if errorlevel 1 (
     echo.
-    echo [ERROR] Failed to install dependencies!
+    echo [ERROR] Failed to install dependencies from requirements.txt!
+    echo Please check the error messages above.
     pause
     exit /b 1
 )
+
+echo.
+echo       All dependencies installed successfully!
 echo.
 
 REM Verify installation
@@ -299,6 +315,11 @@ python -c "import torch; print(f'  Version: {torch.__version__}'); print(f'  CUD
 echo.
 echo ONNX Runtime:
 python -c "import onnxruntime as ort; print(f'  Version: {ort.__version__}'); providers = ort.get_available_providers(); print(f'  CUDA Provider: {\"Yes\" if \"CUDAExecutionProvider\" in providers else \"No\"}')"
+echo.
+echo Critical Dependencies:
+python -c "import PyQt6; print('  PyQt6: Installed')" 2>nul || echo   [ERROR] PyQt6: NOT INSTALLED
+python -c "from clip_interrogator import Interrogator; print('  CLIP Interrogator: Installed')" 2>nul || echo   [ERROR] CLIP Interrogator: NOT INSTALLED
+python -c "import PIL; print('  Pillow: Installed')" 2>nul || echo   [ERROR] Pillow: NOT INSTALLED
 echo.
 
 if "!INSTALL_CUDA!"=="y" (
