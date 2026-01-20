@@ -279,9 +279,31 @@ echo -e "${BLUE}[7/7] Installing remaining dependencies...${NC}"
 echo ""
 
 # Install ONNX Runtime based on GPU availability
+ARCH=$(uname -m)
 if [ "$INSTALL_CUDA" = "y" ]; then
     echo "      Installing ONNX Runtime with CUDA support for WD Tagger..."
-    pip install "onnxruntime-gpu>=1.16.0" || echo -e "${YELLOW}      [WARNING] Failed to install ONNX Runtime GPU. Continuing anyway...${NC}"
+
+    # Check if ARM64 - onnxruntime-gpu doesn't provide ARM wheels on PyPI
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        echo -e "${YELLOW}      [INFO] ARM64 detected - onnxruntime-gpu wheels not available on PyPI${NC}"
+        echo "      Installing CPU-only ONNX Runtime (WD Tagger will run on CPU)..."
+        echo "      Tip: Run ./build_onnx_arm64.sh to build ONNX Runtime with GPU support."
+        pip install "onnxruntime>=1.16.0" || echo -e "${YELLOW}      [WARNING] Failed to install ONNX Runtime. Continuing anyway...${NC}"
+    else
+        # For x86_64, try GPU version
+        ONNX_INSTALLED=false
+        if pip install "onnxruntime-gpu>=1.16.0" --extra-index-url https://pypi.nvidia.com 2>/dev/null; then
+            ONNX_INSTALLED=true
+        elif pip install "onnxruntime-gpu>=1.16.0" 2>/dev/null; then
+            ONNX_INSTALLED=true
+        fi
+
+        if [ "$ONNX_INSTALLED" = false ]; then
+            echo -e "${YELLOW}      [WARNING] Could not install ONNX Runtime GPU.${NC}"
+            echo "      Falling back to CPU-only ONNX Runtime..."
+            pip install "onnxruntime>=1.16.0" || echo -e "${YELLOW}      [WARNING] Failed to install ONNX Runtime. Continuing anyway...${NC}"
+        fi
+    fi
 elif [ "$INSTALL_ROCM" = "y" ]; then
     echo "      Installing ONNX Runtime (CPU version - no ROCm pip package available)..."
     echo "      Note: WD Tagger will run on CPU. For ROCm support, build from source."
@@ -369,16 +391,30 @@ elif [ "$INSTALL_CUDA" = "y" ]; then
 
     if python3 -c "import onnxruntime as ort; exit(0 if 'CUDAExecutionProvider' in ort.get_available_providers() else 1)" 2>/dev/null; then
         ONNX_OK=true
-    else
-        echo -e "${YELLOW}[WARNING] ONNX Runtime CUDA is not available!${NC}"
-        echo ""
     fi
 
-    if [ "$PYTORCH_OK" = true ] && [ "$ONNX_OK" = true ]; then
-        echo -e "${GREEN}[SUCCESS] GPU acceleration is fully enabled!${NC}"
-        echo "  - PyTorch: CUDA enabled (for CLIP models)"
-        echo "  - ONNX Runtime: CUDA enabled (for WD Tagger models)"
-        echo ""
+    # Handle ARM64 vs x86_64 differently for success messages
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        if [ "$PYTORCH_OK" = true ]; then
+            echo -e "${GREEN}[SUCCESS] GPU acceleration is enabled!${NC}"
+            echo "  - PyTorch: CUDA enabled (for CLIP models)"
+            echo "  - ONNX Runtime: CPU mode (no ARM64 GPU wheels on PyPI)"
+            echo ""
+            echo -e "${YELLOW}  Tip: Run ./build_onnx_arm64.sh to build ONNX Runtime with GPU support${NC}"
+            echo ""
+        fi
+    else
+        if [ "$ONNX_OK" = false ]; then
+            echo -e "${YELLOW}[WARNING] ONNX Runtime CUDA is not available!${NC}"
+            echo ""
+        fi
+
+        if [ "$PYTORCH_OK" = true ] && [ "$ONNX_OK" = true ]; then
+            echo -e "${GREEN}[SUCCESS] GPU acceleration is fully enabled!${NC}"
+            echo "  - PyTorch: CUDA enabled (for CLIP models)"
+            echo "  - ONNX Runtime: CUDA enabled (for WD Tagger models)"
+            echo ""
+        fi
     fi
 fi
 
