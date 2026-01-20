@@ -564,7 +564,7 @@ ONNX Runtime:
   - ONNX Runtime: CPU mode (no ROCm pip package available)
 ```
 
-### ARM64 Support (NVIDIA Jetson, Grace Blackwell)
+### ARM64 Support (NVIDIA Spark, Jetson, Grace Blackwell)
 
 The application supports ARM64 Linux systems with NVIDIA GPUs (e.g., Jetson Orin, Grace Hopper, Grace Blackwell):
 
