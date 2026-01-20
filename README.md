@@ -564,18 +564,77 @@ ONNX Runtime:
   - ONNX Runtime: CPU mode (no ROCm pip package available)
 ```
 
+### ARM64 Support (NVIDIA Jetson, Grace Blackwell)
+
+The application supports ARM64 Linux systems with NVIDIA GPUs (e.g., Jetson Orin, Grace Hopper, Grace Blackwell):
+
+#### GPU Acceleration Status
+
+✅ **CLIP Models**: Full CUDA acceleration via PyTorch
+⚠️ **WD Tagger Models**: CPU-only by default (no pre-built ARM64 wheels on PyPI)
+
+#### Installation
+
+```bash
+./setup.sh
+```
+
+The setup script will:
+- Detect ARM64 architecture automatically
+- Install PyTorch with CUDA support
+- Install CPU-only ONNX Runtime (GPU wheels not available on PyPI for ARM64)
+
+#### Building ONNX Runtime GPU for ARM64
+
+To enable GPU acceleration for WD Tagger on ARM64, you can build ONNX Runtime from source:
+
+```bash
+./build_onnx_arm64.sh
+```
+
+**Requirements:**
+- CUDA Toolkit installed (`nvcc` in PATH)
+- cuDNN installed
+- CMake 3.26+
+- Build tools (gcc, g++, make)
+- 10GB+ free disk space
+- 30-60+ minutes build time
+
+The build script will:
+1. Check all prerequisites
+2. Clone ONNX Runtime source
+3. Build with CUDA support for ARM64
+4. Install the wheel into your virtual environment
+
+#### Verification
+
+After setup (without building ONNX Runtime):
+```
+[SUCCESS] GPU acceleration is enabled!
+  - PyTorch: CUDA enabled (for CLIP models)
+  - ONNX Runtime: CPU mode (no ARM64 GPU wheels on PyPI)
+```
+
+After building ONNX Runtime:
+```
+[SUCCESS] GPU acceleration is fully enabled!
+  - PyTorch: CUDA enabled (for CLIP models)
+  - ONNX Runtime: CUDA enabled (for WD Tagger models)
+```
+
 ### GPU Acceleration Comparison
 
-| Feature | CUDA (NVIDIA) | ROCm (AMD) | CPU Only |
-|---------|---------------|------------|----------|
-| **Platforms** | Windows, Linux | Linux only | All |
-| **CLIP Models** | ✅ GPU (10-50x) | ✅ GPU (10-50x) | ❌ CPU (1x) |
-| **WD Tagger** | ✅ GPU (10-50x) | ❌ CPU (1x)* | ❌ CPU (1x) |
-| **Setup** | Automatic | Automatic | Automatic |
-| **Driver Required** | NVIDIA | ROCm | None |
-| **Best For** | Maximum performance | AMD Linux users | Testing/compatibility |
+| Feature | CUDA (NVIDIA x86) | CUDA (NVIDIA ARM64) | ROCm (AMD) | CPU Only |
+|---------|-------------------|---------------------|------------|----------|
+| **Platforms** | Windows, Linux | Linux only | Linux only | All |
+| **CLIP Models** | ✅ GPU (10-50x) | ✅ GPU (10-50x) | ✅ GPU (10-50x) | ❌ CPU (1x) |
+| **WD Tagger** | ✅ GPU (10-50x) | ⚠️ CPU (1x)* | ❌ CPU (1x)** | ❌ CPU (1x) |
+| **Setup** | Automatic | Automatic | Automatic | Automatic |
+| **Driver Required** | NVIDIA | NVIDIA | ROCm | None |
+| **Best For** | Maximum performance | ARM64 NVIDIA users | AMD Linux users | Testing/compatibility |
 
-\* WD Tagger on ROCm requires building ONNX Runtime from source
+\* WD Tagger on ARM64 can use GPU by running `./build_onnx_arm64.sh`
+\*\* WD Tagger on ROCm requires building ONNX Runtime from source
 
 ### Recommended GPU Configuration
 
