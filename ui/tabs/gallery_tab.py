@@ -536,6 +536,24 @@ class GalleryTab(QWidget):
         self.recursive = recursive
         self.refresh_gallery()
 
+    def set_images_direct(self, image_paths: List[str]):
+        """
+        Set gallery images directly from pre-scanned paths.
+
+        This avoids duplicate directory scanning when paths are already
+        loaded by another component (e.g., InterrogationTab).
+
+        Args:
+            image_paths: List of absolute image path strings
+        """
+        self.all_images = image_paths
+
+        # Apply filters
+        self._apply_filters()
+
+        # Update tag filter with available tags
+        self._update_tag_filter()
+
     def refresh_gallery(self):
         """Refresh the image gallery from current directory."""
         if not self.current_directory:
