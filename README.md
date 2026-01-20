@@ -55,7 +55,7 @@ image_interrogator/
 The easiest way to set up the project is using the automated setup script:
 
 **Windows:**
-```bash
+```cmd
 setup.bat
 ```
 
@@ -149,12 +149,13 @@ pip install -r requirements.txt
 The run scripts will perform a quick health check and alert you if GPU acceleration is not enabled:
 
 **Windows:**
-```bash
+```cmd
 run.bat
 ```
 
 **Linux/Mac:**
 ```bash
+chmod +x run.sh
 ./run.sh
 ```
 
@@ -413,12 +414,13 @@ The application provides full GPU acceleration for NVIDIA GPUs on Windows, Linux
 2. **Run the setup script**:
 
    **Windows:**
-   ```bash
+   ```cmd
    setup.bat
    ```
 
    **Linux:**
    ```bash
+   chmod +x setup.sh
    ./setup.sh
    ```
 
@@ -526,6 +528,7 @@ The application supports AMD GPUs on Linux through ROCm:
 
 2. **Run the setup script**:
    ```bash
+   chmod +x setup.sh
    ./setup.sh
    ```
 
@@ -576,6 +579,7 @@ The application supports ARM64 Linux systems with NVIDIA GPUs (e.g., Jetson Orin
 #### Installation
 
 ```bash
+chmod +x setup.sh
 ./setup.sh
 ```
 
@@ -589,6 +593,7 @@ The setup script will:
 To enable GPU acceleration for WD Tagger on ARM64, you can build ONNX Runtime from source:
 
 ```bash
+chmod +x build_onnx_arm64.sh
 ./build_onnx_arm64.sh
 ```
 
@@ -655,11 +660,14 @@ After building ONNX Runtime:
 If you see "CUDA not available (CPU mode will be used)" but you have an NVIDIA GPU:
 
 #### Quick Fix
-```bash
+```cmd
 # Windows
 setup.bat
+```
 
+```bash
 # Linux/Mac
+chmod +x setup.sh
 ./setup.sh
 ```
 
@@ -712,6 +720,7 @@ If you have an AMD GPU on Linux but it's not being detected:
 
 #### Quick Fix
 ```bash
+chmod +x setup.sh
 ./setup.sh
 ```
 
