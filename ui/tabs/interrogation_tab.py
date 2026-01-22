@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
                              QTableWidget, QTableWidgetItem, QHeaderView,
                              QRadioButton, QButtonGroup, QScrollArea,
                              QLineEdit, QTextEdit)
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon, QPixmap
 from pathlib import Path
 from typing import Dict, Optional, List
@@ -16,7 +16,7 @@ from core import InterrogationDatabase, FileManager, TagFilterSettings
 from interrogators import CLIPInterrogator, WDInterrogator
 from ui.dialogs import create_clip_config_widget, create_wd_config_widget
 from ui.dialogs_advanced import AdvancedImageInspectionDialog
-from ui.workers import InterrogationWorker
+from ui.workers import InterrogationWorker, DirectoryLoadWorker
 
 
 class InterrogationTab(QWidget):
@@ -24,6 +24,7 @@ class InterrogationTab(QWidget):
 
     # Signals
     directory_changed = pyqtSignal(str, bool)  # directory_path, recursive
+    directory_loading_finished = pyqtSignal(list)  # image_paths (for cross-tab sharing)
     model_loaded = pyqtSignal(str)  # model_info
     model_unloaded = pyqtSignal()
     interrogation_started = pyqtSignal()
@@ -54,6 +55,8 @@ class InterrogationTab(QWidget):
         self.current_model_type = "WD"
         self.current_directory = None
         self.interrogation_worker = None
+        self.directory_load_worker = None
+        self.loaded_image_paths = []  # Store paths from async loading
 
         # Track all discovered tags during batch interrogation
         self.all_discovered_tags = {}  # tag -> (confidence, count)
@@ -414,28 +417,25 @@ class InterrogationTab(QWidget):
             self.current_directory = Path(directory)
             self.dir_label.setText(str(self.current_directory))
 
-            # Load images into queue
-            self.load_image_queue()
+            # Start async directory loading
+            self._start_directory_load()
 
-            # Enable batch button if model is loaded
-            if self.current_interrogator and self.current_interrogator.is_loaded:
-                self.batch_interrogate_button.setEnabled(True)
-
-            # Emit signal
+            # Emit signal for other tabs
             recursive = self.recursive_checkbox.isChecked()
             self.directory_changed.emit(str(self.current_directory), recursive)
 
     def _on_recursive_changed(self):
         """Handle recursive checkbox state change."""
-        self.load_image_queue()
-
-        # Emit signal if directory is set
+        # Restart async directory loading with new recursive setting
         if self.current_directory:
+            self._start_directory_load()
+
+            # Emit signal for other tabs
             recursive = self.recursive_checkbox.isChecked()
             self.directory_changed.emit(str(self.current_directory), recursive)
 
     def load_image_queue(self):
-        """Load images from current directory into the queue."""
+        """Load images from current directory into the queue (sync, for backward compat)."""
         if not self.current_directory:
             return
 
@@ -457,6 +457,152 @@ class InterrogationTab(QWidget):
 
         search_type = "recursively" if recursive else "in directory"
         self.progress_label.setText(f"Loaded {len(images)} images {search_type}")
+
+    def _start_directory_load(self):
+        """Start async directory loading in background thread."""
+        if not self.current_directory:
+            return
+
+        # Cancel any existing directory load operation (non-blocking)
+        if self.directory_load_worker and self.directory_load_worker.isRunning():
+            self.directory_load_worker.cancel()
+            # Disconnect signals so stale results are ignored - worker will finish in background
+            try:
+                self.directory_load_worker.progress.disconnect()
+                self.directory_load_worker.finished.disconnect()
+                self.directory_load_worker.error.disconnect()
+            except TypeError:
+                pass  # Signals already disconnected
+
+        # Clear queue and show loading state
+        self.image_queue.clear()
+        self.loaded_image_paths = []
+        recursive = self.recursive_checkbox.isChecked()
+
+        # Show indeterminate progress during scan
+        self.progress_bar.setMaximum(0)  # Indeterminate mode
+        scan_type = "recursively" if recursive else ""
+        self.progress_label.setText(f"Scanning directory {scan_type}...".strip())
+
+        # Disable batch button while loading
+        self.batch_interrogate_button.setEnabled(False)
+
+        # Create and start worker
+        self.directory_load_worker = DirectoryLoadWorker(
+            str(self.current_directory),
+            recursive=recursive
+        )
+        self.directory_load_worker.progress.connect(self._on_directory_load_progress)
+        self.directory_load_worker.finished.connect(self._on_directory_load_finished)
+        self.directory_load_worker.error.connect(self._on_directory_load_error)
+        self.directory_load_worker.start()
+
+    def _on_directory_load_progress(self, count: int, current_file: str):
+        """Handle directory loading progress update."""
+        recursive = self.recursive_checkbox.isChecked()
+        scan_type = "Scanning recursively" if recursive else "Scanning"
+        if current_file:
+            self.progress_label.setText(f"{scan_type}: Found {count} images... ({current_file})")
+        else:
+            self.progress_label.setText(f"{scan_type}: Found {count} images...")
+
+    def _on_directory_load_finished(self, image_paths: List[str]):
+        """Handle directory loading completion - start batched population."""
+        self.loaded_image_paths = image_paths
+        self._batch_recursive = self.recursive_checkbox.isChecked()
+
+        # Store batch loading ID to detect stale batches
+        self._batch_load_id = id(image_paths)
+
+        # Initialize batch state
+        self._batch_index = 0
+        self._batch_size = 100  # Process 100 items per batch
+
+        # Clear and prepare queue for batch loading
+        self.image_queue.clear()
+        self.image_queue.setUpdatesEnabled(False)
+
+        # Setup determinate progress bar for loading phase
+        total = len(image_paths)
+        if total > 0:
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText(f"Loading 0/{total} images (0%)")
+            # Start batch processing
+            QTimer.singleShot(0, self._add_image_batch)
+        else:
+            self.progress_bar.setMaximum(100)
+            self.progress_bar.setValue(0)
+            self._finish_directory_load()
+
+    def _add_image_batch(self):
+        """Add a batch of images to the queue, then schedule next batch."""
+        # Check if this batch is stale (directory changed during loading)
+        if not hasattr(self, '_batch_load_id') or self._batch_load_id != id(self.loaded_image_paths):
+            return
+
+        image_paths = self.loaded_image_paths
+        total = len(image_paths)
+        end_index = min(self._batch_index + self._batch_size, total)
+
+        # Add batch of items
+        for i in range(self._batch_index, end_index):
+            image_path = image_paths[i]
+            # Show relative path if recursive, otherwise just filename
+            if self._batch_recursive:
+                try:
+                    rel_path = Path(image_path).relative_to(self.current_directory)
+                    display_name = str(rel_path)
+                except ValueError:
+                    display_name = Path(image_path).name
+            else:
+                display_name = Path(image_path).name
+
+            item = QListWidgetItem(f"☐ {display_name}")
+            item.setData(Qt.ItemDataRole.UserRole, image_path)
+            self.image_queue.addItem(item)
+
+        self._batch_index = end_index
+
+        # Update progress bar and label
+        percent = int((end_index / total) * 100)
+        self.progress_bar.setValue(end_index)
+        self.progress_label.setText(f"Loading {end_index}/{total} images ({percent}%)")
+
+        # Schedule next batch or finish
+        if self._batch_index < total:
+            QTimer.singleShot(0, self._add_image_batch)
+        else:
+            self._finish_directory_load()
+
+    def _finish_directory_load(self):
+        """Complete directory loading after all batches processed."""
+        # Re-enable updates
+        self.image_queue.setUpdatesEnabled(True)
+
+        # Reset progress bar to idle state
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+
+        # Update status
+        search_type = "recursively" if self._batch_recursive else "in directory"
+        self.progress_label.setText(f"Loaded {len(self.loaded_image_paths)} images {search_type}")
+
+        # Enable batch button if model is loaded and images found
+        if self.current_interrogator and self.current_interrogator.is_loaded and self.loaded_image_paths:
+            self.batch_interrogate_button.setEnabled(True)
+
+        # Emit signal with loaded paths for cross-tab sharing
+        self.directory_loading_finished.emit(self.loaded_image_paths)
+
+    def _on_directory_load_error(self, error_message: str):
+        """Handle directory loading error."""
+        # Reset progress bar
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+
+        self.progress_label.setText(f"Error loading directory: {error_message}")
+        QMessageBox.warning(self, "Directory Error", f"Failed to load directory:\n{error_message}")
 
     def get_current_model_config(self) -> Dict:
         """Get the current model configuration from the active tab."""
@@ -565,9 +711,8 @@ class InterrogationTab(QWidget):
         if not self.current_directory or not self.current_interrogator:
             return
 
-        # Get all images
-        recursive = self.recursive_checkbox.isChecked()
-        images = FileManager.find_images(str(self.current_directory), recursive=recursive)
+        # Use pre-loaded image paths from async directory scan
+        images = [Path(p) for p in self.loaded_image_paths]
         if not images:
             QMessageBox.information(self, "Info", "No images found in directory")
             return

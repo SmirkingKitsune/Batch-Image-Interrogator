@@ -1,5 +1,6 @@
 """Worker threads for background processing in PyQt6."""
 
+import os
 from PyQt6.QtCore import QThread, pyqtSignal
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -186,3 +187,87 @@ class OrganizationWorker(QThread):
                 self.error.emit(str(image_path), str(e))
         
         self.finished.emit(moved_count)
+
+
+class DirectoryLoadWorker(QThread):
+    """Worker thread for scanning directories for images without blocking UI."""
+
+    # Signals
+    progress = pyqtSignal(int, str)   # count_so_far, current_file
+    finished = pyqtSignal(list)        # complete list of image paths (strings)
+    error = pyqtSignal(str)            # error_message
+
+    SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'}
+
+    def __init__(self, directory: str, recursive: bool = False):
+        super().__init__()
+        self.directory = directory
+        self.recursive = recursive
+        self.is_cancelled = False
+
+    def cancel(self):
+        """Cancel the directory scan."""
+        self.is_cancelled = True
+
+    def run(self):
+        """Execute directory scan using os.scandir for cancellable iteration."""
+        try:
+            dir_path = Path(self.directory)
+            if not dir_path.exists() or not dir_path.is_dir():
+                self.error.emit(f"Invalid directory: {self.directory}")
+                self.finished.emit([])
+                return
+
+            image_paths = []
+            count = 0
+
+            if self.recursive:
+                # Use os.walk for recursive scanning (cancellable)
+                for root, dirs, files in os.walk(self.directory):
+                    if self.is_cancelled:
+                        break
+
+                    for filename in files:
+                        if self.is_cancelled:
+                            break
+
+                        ext = os.path.splitext(filename)[1].lower()
+                        if ext in self.SUPPORTED_EXTENSIONS:
+                            full_path = os.path.join(root, filename)
+                            image_paths.append(full_path)
+                            count += 1
+
+                            # Emit progress every 10 files for responsive feedback
+                            if count % 10 == 0:
+                                self.progress.emit(count, filename)
+            else:
+                # Use os.scandir for non-recursive scanning (faster than glob)
+                with os.scandir(self.directory) as entries:
+                    for entry in entries:
+                        if self.is_cancelled:
+                            break
+
+                        if entry.is_file():
+                            ext = os.path.splitext(entry.name)[1].lower()
+                            if ext in self.SUPPORTED_EXTENSIONS:
+                                image_paths.append(entry.path)
+                                count += 1
+
+                                # Emit progress every 10 files for responsive feedback
+                                if count % 10 == 0:
+                                    self.progress.emit(count, entry.name)
+
+            if self.is_cancelled:
+                self.finished.emit([])
+                return
+
+            # Sort and deduplicate
+            image_paths = sorted(set(image_paths))
+
+            # Emit final progress
+            self.progress.emit(len(image_paths), "")
+            self.finished.emit(image_paths)
+
+        except Exception as e:
+            self.error.emit(str(e))
+            self.finished.emit([])
