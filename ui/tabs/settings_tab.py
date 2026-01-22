@@ -1,10 +1,12 @@
 """Settings Tab - Database statistics and application settings."""
 
+from datetime import datetime
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                              QGroupBox, QLabel, QPushButton, QFormLayout,
                              QLineEdit, QComboBox, QCheckBox, QRadioButton,
                              QSlider, QProgressBar, QMessageBox, QTextEdit,
-                             QTabWidget, QListWidget, QTableWidget, QTableWidgetItem)
+                             QTabWidget, QListWidget, QListWidgetItem,
+                             QTableWidget, QTableWidgetItem)
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
 from typing import Dict, List
@@ -93,6 +95,141 @@ class DatabaseStatsWidget(QWidget):
             self.update_stats()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to vacuum database:\n{str(e)}")
+
+
+class QueueStatusWidget(QWidget):
+    """Widget for displaying and managing the database operation queue."""
+
+    # Signals
+    process_queue_requested = pyqtSignal()
+    clear_queue_requested = pyqtSignal()
+
+    def __init__(self, database, parent=None):
+        super().__init__(parent)
+        self.database = database
+        self.setup_ui()
+
+    def setup_ui(self):
+        """Setup the UI components."""
+        layout = QVBoxLayout(self)
+
+        # Status label
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        # Queue list
+        self.queue_list = QListWidget()
+        self.queue_list.setMaximumHeight(100)
+        self.queue_list.setVisible(False)
+        layout.addWidget(self.queue_list)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.update_status)
+        button_layout.addWidget(self.refresh_button)
+
+        self.process_button = QPushButton("Process Queue")
+        self.process_button.clicked.connect(self._on_process_clicked)
+        self.process_button.setEnabled(False)
+        button_layout.addWidget(self.process_button)
+
+        self.clear_button = QPushButton("Clear Queue")
+        self.clear_button.clicked.connect(self._on_clear_clicked)
+        self.clear_button.setEnabled(False)
+        button_layout.addWidget(self.clear_button)
+
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+        # Initial update
+        self.update_status()
+
+    def update_status(self):
+        """Update the queue status display."""
+        status = self.database.get_queue_status()
+        pending_count = status.get('pending_count', 0)
+        operations = status.get('operations', [])
+
+        if pending_count == 0:
+            self.status_label.setText(
+                "<b>Queue Status:</b> Empty\n\n"
+                "No pending operations. Database writes are completing successfully."
+            )
+            self.queue_list.setVisible(False)
+            self.process_button.setEnabled(False)
+            self.clear_button.setEnabled(False)
+        else:
+            near_capacity = status.get('near_capacity', False)
+            at_capacity = status.get('at_capacity', False)
+
+            warning = ""
+            if at_capacity:
+                warning = "\n\n<font color='red'><b>Warning:</b> Queue is at capacity!</font>"
+            elif near_capacity:
+                warning = "\n\n<font color='orange'><b>Warning:</b> Queue is approaching capacity.</font>"
+
+            self.status_label.setText(
+                f"<b>Queue Status:</b> {pending_count} pending operation(s){warning}\n\n"
+                f"These operations will be retried when the database becomes available."
+            )
+
+            # Populate queue list
+            self.queue_list.clear()
+            for op in operations[:10]:
+                summary = op.get('summary', op.get('operation', 'Unknown'))
+                timestamp = op.get('timestamp', '')
+                retry_count = op.get('retry_count', 0)
+
+                if timestamp:
+                    try:
+                        dt = datetime.fromisoformat(timestamp)
+                        time_str = dt.strftime('%H:%M:%S')
+                    except ValueError:
+                        time_str = ''
+                else:
+                    time_str = ''
+
+                item_text = f"\u2022 {summary}"
+                if time_str:
+                    item_text += f" ({time_str})"
+                if retry_count > 0:
+                    item_text += f" [retried {retry_count}x]"
+
+                item = QListWidgetItem(item_text)
+                self.queue_list.addItem(item)
+
+            if len(operations) > 10:
+                item = QListWidgetItem(f"... and {len(operations) - 10} more")
+                item.setForeground(Qt.GlobalColor.gray)
+                self.queue_list.addItem(item)
+
+            self.queue_list.setVisible(True)
+            self.process_button.setEnabled(True)
+            self.clear_button.setEnabled(True)
+
+    def _on_process_clicked(self):
+        """Handle Process Queue button click."""
+        self.process_queue_requested.emit()
+
+    def _on_clear_clicked(self):
+        """Handle Clear Queue button click."""
+        status = self.database.get_queue_status()
+        pending_count = status.get('pending_count', 0)
+
+        reply = QMessageBox.warning(
+            self,
+            "Clear Queue",
+            f"Are you sure you want to clear all {pending_count} queued operations?\n\n"
+            "This will permanently discard the data and cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self.clear_queue_requested.emit()
 
 
 class TagFilterWidget(QWidget):
@@ -288,6 +425,16 @@ class SettingsTab(QWidget):
         stats_group.setLayout(stats_layout)
         layout.addWidget(stats_group)
 
+        # === Operation Queue Status ===
+        queue_group = QGroupBox("Operation Queue")
+        queue_layout = QVBoxLayout()
+        self.queue_widget = QueueStatusWidget(self.database)
+        self.queue_widget.process_queue_requested.connect(self._on_process_queue)
+        self.queue_widget.clear_queue_requested.connect(self._on_clear_queue)
+        queue_layout.addWidget(self.queue_widget)
+        queue_group.setLayout(queue_layout)
+        layout.addWidget(queue_group)
+
         # === Application Settings ===
         settings_group = QGroupBox("Application Settings")
         settings_layout = QVBoxLayout()
@@ -383,8 +530,9 @@ class SettingsTab(QWidget):
         self.update_stats()
 
     def update_stats(self):
-        """Update database statistics."""
+        """Update database statistics and queue status."""
         self.stats_widget.update_stats()
+        self.queue_widget.update_status()
 
     def get_auto_unload_enabled(self) -> bool:
         """Get whether auto-unload is enabled."""
@@ -413,3 +561,24 @@ class SettingsTab(QWidget):
                 f"New database location:\n{self.database.get_db_location()}\n\n"
                 f"The database will switch when you select a new directory."
             )
+
+    def _on_process_queue(self):
+        """Handle process queue request from queue widget."""
+        # Get the main window to trigger queue processing
+        main_window = self.window()
+        if hasattr(main_window, '_process_queue_now'):
+            main_window._process_queue_now()
+
+    def _on_clear_queue(self):
+        """Handle clear queue request from queue widget."""
+        count = self.database.clear_operation_queue()
+        QMessageBox.information(
+            self,
+            "Queue Cleared",
+            f"Cleared {count} queued operations."
+        )
+        self.queue_widget.update_status()
+
+    def update_queue_status(self):
+        """Update the queue status display."""
+        self.queue_widget.update_status()
