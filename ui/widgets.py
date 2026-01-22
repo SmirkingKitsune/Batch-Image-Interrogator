@@ -43,11 +43,11 @@ class ImageGalleryWidget(QListWidget):
         if pixmap.isNull():
             return
         
-        # Scale to fit
+        # Scale to fit (use FastTransformation for bulk loading performance)
         scaled_pixmap = pixmap.scaled(
-            200, 200, 
+            200, 200,
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
+            Qt.TransformationMode.FastTransformation
         )
         
         # Create item
