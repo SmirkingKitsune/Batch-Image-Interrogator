@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
                              QGroupBox, QLabel, QPushButton, QComboBox,
                              QLineEdit, QCheckBox, QScrollArea, QFrame,
                              QTabWidget, QSlider, QMessageBox)
-from PyQt6.QtCore import Qt, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QPixmap
 from pathlib import Path
 from typing import Dict, Optional, List
@@ -623,14 +623,56 @@ class GalleryTab(QWidget):
         return images
 
     def _update_gallery_display(self):
-        """Update the gallery widget with filtered images."""
+        """Update the gallery widget with filtered images - start batched loading."""
         self.image_gallery.clear_gallery()
 
-        for image_path in self.filtered_images:
+        # Store batch loading ID to detect stale batches
+        self._gallery_batch_id = id(self.filtered_images)
+
+        # Initialize batch state
+        self._gallery_batch_index = 0
+        self._gallery_batch_size = 50  # Smaller batches since image loading is expensive
+
+        total = len(self.filtered_images)
+        if total > 0:
+            self.image_gallery.setUpdatesEnabled(False)
+            self.image_count_label.setText(f"Loading 0/{total} images (0%)")
+            # Start batch processing
+            QTimer.singleShot(0, self._add_gallery_batch)
+        else:
+            self.image_count_label.setText("0 images")
+
+    def _add_gallery_batch(self):
+        """Add a batch of images to the gallery, then schedule next batch."""
+        # Check if this batch is stale (filters changed during loading)
+        if not hasattr(self, '_gallery_batch_id') or self._gallery_batch_id != id(self.filtered_images):
+            return
+
+        images = self.filtered_images
+        total = len(images)
+        end_index = min(self._gallery_batch_index + self._gallery_batch_size, total)
+
+        # Add batch of images
+        for i in range(self._gallery_batch_index, end_index):
+            image_path = images[i]
             has_tags = FileManager.has_text_file(Path(image_path))
             self.image_gallery.add_image(image_path, has_tags)
 
-        # Update count label
+        self._gallery_batch_index = end_index
+
+        # Update progress with percentage
+        percent = int((end_index / total) * 100)
+        self.image_count_label.setText(f"Loading {end_index}/{total} images ({percent}%)")
+
+        # Schedule next batch or finish
+        if self._gallery_batch_index < total:
+            QTimer.singleShot(0, self._add_gallery_batch)
+        else:
+            self._finish_gallery_display()
+
+    def _finish_gallery_display(self):
+        """Complete gallery display after all batches processed."""
+        self.image_gallery.setUpdatesEnabled(True)
         self.image_count_label.setText(f"{len(self.filtered_images)} images")
 
     def _on_filter_changed(self, selected_tags: List[str]):
