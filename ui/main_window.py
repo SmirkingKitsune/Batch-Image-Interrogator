@@ -1,23 +1,30 @@
 """Main application window for Image Interrogator."""
 
+import threading
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTabWidget,
                              QFileDialog, QMessageBox, QStatusBar, QLabel)
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction
 from pathlib import Path
 from typing import Optional, Dict
 
 from core import InterrogationDatabase, TagFilterSettings
 from ui.tabs import InterrogationTab, GalleryTab, SettingsTab
+from ui.dialogs_database import DatabaseBusyDialog, QueueProcessingDialog
+from ui.workers import DatabaseQueueWorker
 
 
 class MainWindow(QMainWindow):
     """Main application window."""
-    
+
+    # Internal signal for thread-safe dialog display
+    _database_busy = pyqtSignal(str, dict, int)  # operation, params, retry_count
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Image Interrogator - Batch Tagging Tool")
         self.setGeometry(100, 100, 1600, 900)
+        self.setMinimumSize(1024, 600)
         
         # Core components
         self.database = InterrogationDatabase()
@@ -30,6 +37,11 @@ class MainWindow(QMainWindow):
         # Workers
         self.interrogation_worker = None
         self.organization_worker = None
+        self.queue_worker = None
+
+        # Database busy dialog state
+        self._busy_response_event = threading.Event()
+        self._busy_response_value = "abort"
 
         # Model configs
         self.clip_config = {
@@ -48,8 +60,12 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         self.setup_menubar()
         self.setup_connections()
-        
+        self._setup_database_signals()
+
         self.statusBar().showMessage("Ready - Select a directory to begin")
+
+        # Check for pending queue operations after UI is ready
+        QTimer.singleShot(1000, self._check_startup_queue)
     
     def setup_ui(self):
         """Setup the main UI with tabs."""
@@ -117,6 +133,126 @@ class MainWindow(QMainWindow):
     def setup_connections(self):
         """Setup signal/slot connections between tabs."""
         self.setup_cross_tab_signals()
+
+    def _setup_database_signals(self):
+        """Setup database busy callback and signal connections."""
+        # Connect internal signal to slot (for thread-safe dialog display)
+        self._database_busy.connect(self._on_database_busy)
+
+        # Set the callback on the database
+        self.database.set_busy_callback(self._emit_database_busy)
+
+    def _emit_database_busy(self, operation: str, params: Dict, retry_count: int) -> str:
+        """
+        Called from worker thread when database is busy.
+
+        Emits signal to show dialog on main thread and waits for response.
+        """
+        # Reset the event
+        self._busy_response_event.clear()
+        self._busy_response_value = "abort"
+
+        # Emit signal to main thread
+        self._database_busy.emit(operation, params, retry_count)
+
+        # Wait for response from main thread (with timeout)
+        # Max wait of 5 minutes - if no response, treat as abort
+        if self._busy_response_event.wait(timeout=300):
+            return self._busy_response_value
+        else:
+            return "abort"
+
+    def _on_database_busy(self, operation: str, params: Dict, retry_count: int):
+        """Handle database busy signal on main thread - show dialog."""
+        # Get queue status for display
+        queue_status = self.database.get_queue_status()
+        queued_operations = queue_status.get('operations', [])
+
+        # Check if operation is queueable
+        is_queueable = self.database._operation_queue.is_queueable(operation)
+
+        # Create and show dialog
+        dialog = DatabaseBusyDialog(
+            operation=operation,
+            params=params,
+            retry_count=retry_count,
+            queued_operations=queued_operations,
+            is_queueable=is_queueable,
+            parent=self
+        )
+
+        # Connect dialog signals
+        dialog.retry_requested.connect(lambda: self._set_busy_response("retry"))
+        dialog.queue_and_continue.connect(lambda: self._set_busy_response("queue"))
+        dialog.force_close_requested.connect(lambda: self._set_busy_response("abort"))
+
+        # Show dialog (non-blocking for retry button)
+        dialog.show()
+
+    def _set_busy_response(self, response: str):
+        """Set the response value and signal the waiting thread."""
+        self._busy_response_value = response
+        self._busy_response_event.set()
+
+    def _check_startup_queue(self):
+        """Check for pending queue operations at startup."""
+        status = self.database.get_queue_status()
+        pending_count = status.get('pending_count', 0)
+
+        if pending_count > 0:
+            operations = status.get('operations', [])
+
+            dialog = QueueProcessingDialog(
+                pending_count=pending_count,
+                operations=operations,
+                parent=self
+            )
+
+            dialog.processing_requested.connect(self._process_queue_now)
+            dialog.skip_requested.connect(
+                lambda: self.statusBar().showMessage(
+                    f"{pending_count} queued operations will be processed later", 5000
+                )
+            )
+            dialog.clear_requested.connect(self._clear_queue)
+
+            dialog.exec()
+
+    def _process_queue_now(self):
+        """Process queued operations."""
+        self.queue_worker = DatabaseQueueWorker(self.database)
+        self.queue_worker.progress.connect(
+            lambda cur, total, msg: self.statusBar().showMessage(
+                f"Processing queue: {cur}/{total} - {msg}"
+            )
+        )
+        self.queue_worker.finished.connect(self._on_queue_processing_finished)
+        self.queue_worker.start()
+
+    def _on_queue_processing_finished(self, success_count: int, failed_count: int):
+        """Handle queue processing completion."""
+        total = success_count + failed_count
+        if failed_count == 0:
+            self.statusBar().showMessage(
+                f"Queue processed: {success_count} operations completed successfully", 5000
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Queue Processing Complete",
+                f"Processed {total} operations:\n"
+                f"  - {success_count} succeeded\n"
+                f"  - {failed_count} failed\n\n"
+                f"Failed operations remain in queue."
+            )
+
+        # Update settings tab if visible
+        self.settings_tab.update_stats()
+
+    def _clear_queue(self):
+        """Clear all queued operations."""
+        count = self.database.clear_operation_queue()
+        self.statusBar().showMessage(f"Cleared {count} queued operations", 5000)
 
     def setup_cross_tab_signals(self):
         """Connect signals between tabs for cross-tab communication."""
