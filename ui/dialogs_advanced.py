@@ -6,8 +6,8 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QTabWidget, QWidget, QTableWidget, QTableWidgetItem,
                              QProgressBar, QMessageBox, QMenu, QScrollArea,
                              QCheckBox, QLineEdit)
-from PyQt6.QtCore import Qt, pyqtSignal, QSize
-from PyQt6.QtGui import QKeySequence, QColor, QShortcut
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QSettings
+from PyQt6.QtGui import QKeySequence, QColor, QShortcut, QBrush
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -155,6 +155,9 @@ class AdvancedImageInspectionDialog(QDialog):
     # Signals
     tags_saved = pyqtSignal(str, list)  # image_path, tags
 
+    # Settings keys
+    SETTINGS_KEY_LAST_TAB = "AdvancedImageInspectionDialog/lastTabIndex"
+
     def __init__(self,
                  image_path: str,
                  image_list: List[str],
@@ -297,6 +300,15 @@ class AdvancedImageInspectionDialog(QDialog):
         # Tab 3: Tag Editor
         editor_tab = self._create_editor_tab()
         self.main_tabs.addTab(editor_tab, "Tag Editor")
+
+        # Connect tab change signal to save preference
+        self.main_tabs.currentChanged.connect(self._on_tab_changed)
+
+        # Restore last selected tab
+        settings = QSettings()
+        last_tab = settings.value(self.SETTINGS_KEY_LAST_TAB, 0, type=int)
+        if 0 <= last_tab < self.main_tabs.count():
+            self.main_tabs.setCurrentIndex(last_tab)
 
         return self.main_tabs
 
@@ -548,6 +560,10 @@ class AdvancedImageInspectionDialog(QDialog):
             if tags:
                 all_tags.update(tags)
 
+        # Also include tags from the file that may not be in the database
+        if self.current_file_tags:
+            all_tags.update(self.current_file_tags)
+
         # Convert to sorted list
         all_tags_list = sorted(all_tags, key=str.lower)
 
@@ -765,6 +781,9 @@ class AdvancedImageInspectionDialog(QDialog):
             'manually_added': QColor(200, 230, 255) # Light cyan
         }
 
+        # Black text for legibility on light pastel backgrounds (fixes dark theme)
+        text_color = QBrush(QColor(0, 0, 0))
+
         for item in comparison_data:
             row = self.comparison_table.rowCount()
             self.comparison_table.insertRow(row)
@@ -775,12 +794,14 @@ class AdvancedImageInspectionDialog(QDialog):
                 tag_text += f" (was: {item['original_tag']})"
             tag_item = QTableWidgetItem(tag_text)
             tag_item.setBackground(colors.get(item['status'], Qt.GlobalColor.white))
+            tag_item.setForeground(text_color)
             self.comparison_table.setItem(row, 0, tag_item)
 
             # Confidence column
             conf_text = f"{item['confidence']:.4f}" if item['confidence'] is not None else "N/A"
             conf_item = QTableWidgetItem(conf_text)
             conf_item.setBackground(colors.get(item['status'], Qt.GlobalColor.white))
+            conf_item.setForeground(text_color)
             self.comparison_table.setItem(row, 1, conf_item)
 
             # Status column
@@ -794,11 +815,13 @@ class AdvancedImageInspectionDialog(QDialog):
             }
             status_item = QTableWidgetItem(status_labels.get(item['status'], item['status']))
             status_item.setBackground(colors.get(item['status'], Qt.GlobalColor.white))
+            status_item.setForeground(text_color)
             self.comparison_table.setItem(row, 2, status_item)
 
             # Location column
             loc_item = QTableWidgetItem(item['location'])
             loc_item.setBackground(colors.get(item['status'], Qt.GlobalColor.white))
+            loc_item.setForeground(text_color)
             self.comparison_table.setItem(row, 3, loc_item)
 
     def _navigate_previous(self):
@@ -888,3 +911,8 @@ class AdvancedImageInspectionDialog(QDialog):
         self.comparison_table.setItem(0, 0, msg_item)
 
         self.comparison_info_label.setText("No interrogation data available")
+
+    def _on_tab_changed(self, index: int):
+        """Save the currently selected tab to settings."""
+        settings = QSettings()
+        settings.setValue(self.SETTINGS_KEY_LAST_TAB, index)
