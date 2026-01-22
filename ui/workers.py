@@ -237,8 +237,8 @@ class DirectoryLoadWorker(QThread):
                             image_paths.append(full_path)
                             count += 1
 
-                            # Emit progress every 50 files
-                            if count % 50 == 0:
+                            # Emit progress every 10 files for responsive feedback
+                            if count % 10 == 0:
                                 self.progress.emit(count, filename)
             else:
                 # Use os.scandir for non-recursive scanning (faster than glob)
@@ -253,8 +253,8 @@ class DirectoryLoadWorker(QThread):
                                 image_paths.append(entry.path)
                                 count += 1
 
-                                # Emit progress every 50 files
-                                if count % 50 == 0:
+                                # Emit progress every 10 files for responsive feedback
+                                if count % 10 == 0:
                                     self.progress.emit(count, entry.name)
 
             if self.is_cancelled:
