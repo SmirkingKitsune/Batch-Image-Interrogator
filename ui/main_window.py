@@ -122,12 +122,20 @@ class MainWindow(QMainWindow):
         """Connect signals between tabs for cross-tab communication."""
         # === Directory Changes ===
         # When directory is selected in Interrogation tab, update other tabs
-        self.interrogation_tab.directory_changed.connect(self.gallery_tab.set_directory)
+        # Note: gallery_tab.set_directory would trigger sync scanning, so we use
+        # directory_loading_finished -> set_images_direct instead for efficiency
+        self.interrogation_tab.directory_changed.connect(self._on_directory_changed)
         self.interrogation_tab.directory_changed.connect(self.settings_tab.set_directory)
         self.interrogation_tab.directory_changed.connect(
             lambda dir, recursive: self.statusBar().showMessage(
                 f"Directory: {dir}{' (recursive)' if recursive else ''}", 5000
             )
+        )
+
+        # When directory loading finishes, pass pre-scanned paths to gallery
+        # This avoids duplicate scanning and keeps UI responsive
+        self.interrogation_tab.directory_loading_finished.connect(
+            self.gallery_tab.set_images_direct
         )
 
         # === Model Loading ===
@@ -153,6 +161,13 @@ class MainWindow(QMainWindow):
         self.gallery_tab.tags_saved.connect(
             lambda path, tags: self.settings_tab.update_stats()
         )
+
+    def _on_directory_changed(self, directory: str, recursive: bool):
+        """Handle directory change - update gallery state without sync scanning."""
+        # Update gallery's directory reference without triggering a sync scan
+        # (the actual image list will come from directory_loading_finished signal)
+        self.gallery_tab.current_directory = Path(directory)
+        self.gallery_tab.recursive = recursive
 
     def _on_interrogation_started(self):
         """Handle interrogation start across tabs."""
