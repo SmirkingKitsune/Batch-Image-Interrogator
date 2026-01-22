@@ -3,8 +3,11 @@
 import os
 from PyQt6.QtCore import QThread, pyqtSignal
 from pathlib import Path
-from typing import List, Dict, Any, Optional
-from core import InterrogationDatabase, hash_image_content, get_image_metadata, FileManager, TagFilterSettings
+from typing import List, Dict, Any, Optional, Tuple
+from core import (
+    InterrogationDatabase, hash_image_content, get_image_metadata,
+    FileManager, TagFilterSettings, DatabaseBusyError, DatabaseQueuedError
+)
 from core.base_interrogator import BaseInterrogator
 
 
@@ -77,25 +80,38 @@ class InterrogationWorker(QThread):
                 else:
                     # Interrogate image
                     results = self.interrogator.interrogate(image_path_str)
-                    
+
                     # Register image and save to database
                     metadata = get_image_metadata(image_path_str)
-                    image_id = self.database.register_image(
-                        image_path_str,
-                        file_hash,
-                        metadata['width'],
-                        metadata['height'],
-                        metadata['file_size']
-                    )
-                    
-                    self.database.save_interrogation(
-                        image_id,
-                        model_id,
-                        results['tags'],
-                        results.get('confidence_scores'),
-                        results.get('raw_output')
-                    )
-                
+                    try:
+                        image_id = self.database.register_image(
+                            image_path_str,
+                            file_hash,
+                            metadata['width'],
+                            metadata['height'],
+                            metadata['file_size']
+                        )
+                    except DatabaseBusyError as e:
+                        # User chose to abort - can't save without image_id
+                        self.error.emit(image_path_str, f"Database busy: {e}")
+                        continue
+
+                    try:
+                        self.database.save_interrogation(
+                            image_id,
+                            model_id,
+                            results['tags'],
+                            results.get('confidence_scores'),
+                            results.get('raw_output')
+                        )
+                    except DatabaseQueuedError:
+                        # Operation was queued for later - continue processing
+                        pass
+                    except DatabaseBusyError as e:
+                        # User chose to abort this operation
+                        self.error.emit(image_path_str, f"Database busy: {e}")
+                        continue
+
                 # Write to text file if requested
                 if self.write_files:
                     # Apply tag filters if configured
@@ -271,3 +287,70 @@ class DirectoryLoadWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
             self.finished.emit([])
+
+
+class DatabaseQueueWorker(QThread):
+    """Worker thread for processing queued database operations."""
+
+    # Signals
+    progress = pyqtSignal(int, int, str)  # current, total, message
+    operation_completed = pyqtSignal(str)  # operation_id
+    operation_failed = pyqtSignal(str, str)  # operation_id, error_message
+    finished = pyqtSignal(int, int)  # success_count, failed_count
+
+    def __init__(self, database: InterrogationDatabase):
+        super().__init__()
+        self.database = database
+        self.is_cancelled = False
+
+    def cancel(self):
+        """Cancel the operation."""
+        self.is_cancelled = True
+
+    def run(self):
+        """Execute queued operations processing."""
+        status = self.database.get_queue_status()
+        operations = status.get('operations', [])
+        total = len(operations)
+
+        if total == 0:
+            self.finished.emit(0, 0)
+            return
+
+        success_count = 0
+        failed_count = 0
+
+        for idx, op in enumerate(operations):
+            if self.is_cancelled:
+                break
+
+            op_id = op.get('id', '')
+            op_name = op.get('operation', 'unknown')
+            summary = op.get('summary', op_name)
+
+            self.progress.emit(idx + 1, total, f"Processing: {summary}")
+
+            try:
+                # Get the pending operations and find this one
+                pending = self.database._operation_queue.get_pending_operations()
+                matching_op = next((p for p in pending if p.id == op_id), None)
+
+                if matching_op:
+                    self.database._execute_queued_operation(
+                        matching_op.id,
+                        matching_op.operation,
+                        matching_op.params
+                    )
+                    self.database._operation_queue.mark_completed(op_id)
+                    success_count += 1
+                    self.operation_completed.emit(op_id)
+                else:
+                    # Operation no longer in queue
+                    failed_count += 1
+
+            except Exception as e:
+                self.database._operation_queue.mark_failed(op_id, str(e))
+                failed_count += 1
+                self.operation_failed.emit(op_id, str(e))
+
+        self.finished.emit(success_count, failed_count)
