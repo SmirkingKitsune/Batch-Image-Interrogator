@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Dict, Optional, List
 
 from core import InterrogationDatabase, FileManager, TagFilterSettings
-from interrogators import CLIPInterrogator, WDInterrogator
-from ui.dialogs import create_clip_config_widget, create_wd_config_widget
+from interrogators import CLIPInterrogator, WDInterrogator, CamieInterrogator
+from ui.dialogs import create_clip_config_widget, create_wd_config_widget, create_camie_config_widget
 from ui.dialogs_advanced import AdvancedImageInspectionDialog
 from ui.workers import InterrogationWorker, DirectoryLoadWorker
 
@@ -31,7 +31,7 @@ class InterrogationTab(QWidget):
     interrogation_finished = pyqtSignal()
 
     def __init__(self, database, clip_config: Dict, wd_config: Dict,
-                 tag_filters, parent=None):
+                 camie_config: Dict, tag_filters, parent=None):
         """
         Initialize the Interrogation Tab.
 
@@ -39,6 +39,7 @@ class InterrogationTab(QWidget):
             database: InterrogationDatabase instance
             clip_config: Dictionary with CLIP configuration
             wd_config: Dictionary with WD configuration
+            camie_config: Dictionary with Camie configuration
             tag_filters: TagFilterSettings instance
             parent: Parent widget
         """
@@ -48,6 +49,7 @@ class InterrogationTab(QWidget):
         self.database = database
         self.clip_config = clip_config
         self.wd_config = wd_config
+        self.camie_config = camie_config
         self.tag_filters = tag_filters
 
         # Internal state
@@ -64,6 +66,7 @@ class InterrogationTab(QWidget):
         # Widget references (will be set in setup_ui)
         self.clip_config_refs = None
         self.wd_config_refs = None
+        self.camie_config_refs = None
 
         # Setup UI
         self.setup_ui()
@@ -136,6 +139,10 @@ class InterrogationTab(QWidget):
         wd_widget, self.wd_config_refs = create_wd_config_widget(self.wd_config, self)
         self.model_config_tabs.addTab(wd_widget, "WD Tagger")
 
+        # Camie tab
+        camie_widget, self.camie_config_refs = create_camie_config_widget(self.camie_config, self)
+        self.model_config_tabs.addTab(camie_widget, "Camie Tagger")
+      
         model_config_layout.addWidget(self.model_config_tabs)
         model_config_group.setLayout(model_config_layout)
         layout.addWidget(model_config_group)
@@ -626,12 +633,37 @@ class InterrogationTab(QWidget):
                 'mode': self.clip_config_refs['mode_combo'].currentText(),
                 'device': self.clip_config_refs['device_combo'].currentText()
             }
-        else:  # WD tab
+        elif current_tab_index == 1:  # WD tab
             return {
                 'type': 'WD',
                 'wd_model': self.wd_config_refs['wd_model_combo'].currentText(),
                 'threshold': self.wd_config_refs['threshold_spin'].value(),
                 'device': self.wd_config_refs['device_combo'].currentText()
+            }
+        else:  # Camie tab (index 2)
+            # Get enabled categories from checkboxes
+            enabled_categories = [
+                cat for cat, cb in self.camie_config_refs['category_checkboxes'].items()
+                if cb.isChecked()
+            ]
+
+            # Get category-specific thresholds if profile is category_specific
+            threshold_profile = self.camie_config_refs['threshold_profile_combo'].currentText()
+            category_thresholds = None
+            if threshold_profile == 'category_specific':
+                category_thresholds = {
+                    cat: spin.value()
+                    for cat, spin in self.camie_config_refs['category_threshold_spins'].items()
+                }
+
+            return {
+                'type': 'Camie',
+                'camie_model': self.camie_config_refs['camie_model_combo'].currentText(),
+                'threshold': self.camie_config_refs['threshold_spin'].value(),
+                'threshold_profile': threshold_profile,
+                'device': self.camie_config_refs['device_combo'].currentText(),
+                'category_thresholds': category_thresholds,
+                'enabled_categories': enabled_categories
             }
 
     def load_model(self):
@@ -658,13 +690,23 @@ class InterrogationTab(QWidget):
                 model_info = f"CLIP - {config['clip_model']}"
                 if config['caption_model']:
                     model_info += f"\nCaption: {config['caption_model']}"
-            else:
+            elif config['type'] == 'WD':
                 self.current_interrogator = WDInterrogator(model_name=config['wd_model'])
                 self.current_interrogator.load_model(
                     threshold=config['threshold'],
                     device=config['device']
                 )
                 model_info = f"WD - {config['wd_model']}"
+            else:  # Camie
+                self.current_interrogator = CamieInterrogator(model_name=config['camie_model'])
+                self.current_interrogator.load_model(
+                    threshold=config['threshold'],
+                    device=config['device'],
+                    threshold_profile=config['threshold_profile'],
+                    category_thresholds=config.get('category_thresholds'),
+                    enabled_categories=config.get('enabled_categories')
+                )
+                model_info = f"Camie - {config['camie_model']}"
 
             # Update status
             self.current_model_type = config['type']
