@@ -354,3 +354,226 @@ class DatabaseQueueWorker(QThread):
                 self.operation_failed.emit(op_id, str(e))
 
         self.finished.emit(success_count, failed_count)
+
+
+class CacheScanWorker(QThread):
+    """Worker thread for scanning model caches in background."""
+
+    # Signals
+    progress = pyqtSignal(int, int, str)  # current, total, message
+    finished = pyqtSignal(dict)  # {type: [ModelCacheInfo]}
+
+    def __init__(self, cache_manager):
+        """Initialize the cache scan worker.
+
+        Args:
+            cache_manager: ModelCacheManager instance
+        """
+        super().__init__()
+        self.cache_manager = cache_manager
+        self.is_cancelled = False
+
+    def cancel(self):
+        """Cancel the scan operation."""
+        self.is_cancelled = True
+
+    def run(self):
+        """Execute cache scanning."""
+        try:
+            # Get all models and scan their cache status
+            all_models = self.cache_manager.get_all_models()
+
+            # Count total models for progress
+            total = sum(len(models) for models in all_models.values())
+            current = 0
+
+            # Emit progress for each model (cache manager already scanned them)
+            for model_type, models in all_models.items():
+                for model in models:
+                    if self.is_cancelled:
+                        self.finished.emit({})
+                        return
+
+                    current += 1
+                    status = "Cached" if model.is_cached else "Not cached"
+                    self.progress.emit(current, total, f"{model.display_name}: {status}")
+
+            self.finished.emit(all_models)
+
+        except Exception as e:
+            print(f"Error scanning caches: {e}")
+            self.finished.emit({})
+
+
+class CacheDeleteWorker(QThread):
+    """Worker thread for deleting model caches in background."""
+
+    # Signals
+    progress = pyqtSignal(int, int, str)  # current, total, message
+    finished = pyqtSignal(int, int)  # success_count, error_count
+
+    def __init__(self, cache_manager, model_ids: List[str], delete_tensorrt: bool = False):
+        """Initialize the cache delete worker.
+
+        Args:
+            cache_manager: ModelCacheManager instance
+            model_ids: List of model IDs to delete
+            delete_tensorrt: Whether to also delete TensorRT engines
+        """
+        super().__init__()
+        self.cache_manager = cache_manager
+        self.model_ids = model_ids
+        self.delete_tensorrt = delete_tensorrt
+        self.is_cancelled = False
+
+    def cancel(self):
+        """Cancel the delete operation."""
+        self.is_cancelled = True
+
+    def run(self):
+        """Execute cache deletion."""
+        total = len(self.model_ids)
+        success_count = 0
+        error_count = 0
+
+        for idx, model_id in enumerate(self.model_ids):
+            if self.is_cancelled:
+                break
+
+            self.progress.emit(idx + 1, total, f"Deleting: {model_id}")
+
+            try:
+                # Delete HuggingFace cache
+                if self.cache_manager.delete_hf_model_cache(model_id):
+                    success_count += 1
+                else:
+                    # Model might not have been cached
+                    pass
+
+                # Delete TensorRT engine if requested
+                if self.delete_tensorrt:
+                    self.cache_manager.delete_tensorrt_engine(model_id)
+
+            except Exception as e:
+                print(f"Error deleting cache for {model_id}: {e}")
+                error_count += 1
+
+        self.finished.emit(success_count, error_count)
+
+
+class TensorRTConversionWorker(QThread):
+    """Worker thread for converting ONNX models to TensorRT engines."""
+
+    # Signals
+    progress = pyqtSignal(int, int, str)  # current, total, message
+    conversion_complete = pyqtSignal(str)  # model_id
+    conversion_failed = pyqtSignal(str, str)  # model_id, error_message
+    finished = pyqtSignal(int, int)  # success_count, error_count
+
+    def __init__(self, cache_manager, model_ids: List[str], provider_settings=None):
+        """Initialize the TensorRT conversion worker.
+
+        Args:
+            cache_manager: ModelCacheManager instance
+            model_ids: List of model IDs to convert
+            provider_settings: Optional ONNXProviderSettings for provider options
+        """
+        super().__init__()
+        self.cache_manager = cache_manager
+        self.model_ids = model_ids
+        self.provider_settings = provider_settings
+        self.is_cancelled = False
+
+    def cancel(self):
+        """Cancel the conversion operation."""
+        self.is_cancelled = True
+
+    def run(self):
+        """Execute TensorRT conversion."""
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            self.finished.emit(0, len(self.model_ids))
+            return
+
+        # Check if TensorRT provider is available
+        available_providers = ort.get_available_providers()
+        if 'TensorrtExecutionProvider' not in available_providers:
+            for model_id in self.model_ids:
+                self.conversion_failed.emit(model_id, "TensorRT provider not available")
+            self.finished.emit(0, len(self.model_ids))
+            return
+
+        total = len(self.model_ids)
+        success_count = 0
+        error_count = 0
+
+        # Get TensorRT cache directory
+        from core.model_cache import TRT_CACHE_DIR
+        TRT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        for idx, model_id in enumerate(self.model_ids):
+            if self.is_cancelled:
+                break
+
+            self.progress.emit(idx + 1, total, f"Converting: {model_id}")
+
+            try:
+                # Get ONNX model path
+                onnx_path = self.cache_manager.get_onnx_model_path(model_id)
+
+                if onnx_path is None or not onnx_path.exists():
+                    self.conversion_failed.emit(model_id, "ONNX model not found (not cached)")
+                    error_count += 1
+                    continue
+
+                # Create TensorRT session to trigger engine compilation
+                providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider']
+                provider_options = [
+                    {
+                        'trt_engine_cache_enable': True,
+                        'trt_engine_cache_path': str(TRT_CACHE_DIR),
+                        'trt_fp16_enable': True,
+                        'trt_max_workspace_size': 2147483648,  # 2GB
+                    },
+                    {}  # CUDA provider options (empty)
+                ]
+
+                # This will create the TensorRT engine if it doesn't exist
+                session = ort.InferenceSession(
+                    str(onnx_path),
+                    providers=providers,
+                    provider_options=provider_options
+                )
+
+                # Run a dummy inference to ensure engine is compiled
+                # Get input shape from the model
+                input_info = session.get_inputs()[0]
+                input_name = input_info.name
+                input_shape = input_info.shape
+
+                # Create dummy input (typically images are [1, 3, H, W] or [1, H, W, 3])
+                import numpy as np
+                # Handle dynamic dimensions
+                resolved_shape = []
+                for dim in input_shape:
+                    if isinstance(dim, int):
+                        resolved_shape.append(dim)
+                    else:
+                        # Dynamic dimension, use common sizes
+                        resolved_shape.append(448)  # Common WD tagger size
+
+                dummy_input = np.zeros(resolved_shape, dtype=np.float32)
+                session.run(None, {input_name: dummy_input})
+
+                self.conversion_complete.emit(model_id)
+                success_count += 1
+
+            except Exception as e:
+                error_msg = str(e)
+                if len(error_msg) > 200:
+                    error_msg = error_msg[:200] + "..."
+                self.conversion_failed.emit(model_id, error_msg)
+                error_count += 1
+
+        self.finished.emit(success_count, error_count)

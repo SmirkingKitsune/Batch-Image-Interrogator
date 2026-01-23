@@ -12,9 +12,9 @@ from PyQt6.QtGui import QIcon, QPixmap
 from pathlib import Path
 from typing import Dict, Optional, List
 
-from core import InterrogationDatabase, FileManager, TagFilterSettings
-from interrogators import CLIPInterrogator, WDInterrogator
-from ui.dialogs import create_clip_config_widget, create_wd_config_widget
+from core import InterrogationDatabase, FileManager, TagFilterSettings, ONNXProviderSettings
+from interrogators import CLIPInterrogator, WDInterrogator, CamieInterrogator
+from ui.dialogs import create_clip_config_widget, create_wd_config_widget, create_camie_config_widget
 from ui.dialogs_advanced import AdvancedImageInspectionDialog
 from ui.workers import InterrogationWorker, DirectoryLoadWorker
 
@@ -31,7 +31,7 @@ class InterrogationTab(QWidget):
     interrogation_finished = pyqtSignal()
 
     def __init__(self, database, clip_config: Dict, wd_config: Dict,
-                 tag_filters, parent=None):
+                 camie_config: Dict, tag_filters, provider_settings=None, parent=None):
         """
         Initialize the Interrogation Tab.
 
@@ -39,7 +39,9 @@ class InterrogationTab(QWidget):
             database: InterrogationDatabase instance
             clip_config: Dictionary with CLIP configuration
             wd_config: Dictionary with WD configuration
+            camie_config: Dictionary with Camie configuration
             tag_filters: TagFilterSettings instance
+            provider_settings: ONNXProviderSettings instance for ONNX execution providers
             parent: Parent widget
         """
         super().__init__(parent)
@@ -48,7 +50,9 @@ class InterrogationTab(QWidget):
         self.database = database
         self.clip_config = clip_config
         self.wd_config = wd_config
+        self.camie_config = camie_config
         self.tag_filters = tag_filters
+        self.provider_settings = provider_settings
 
         # Internal state
         self.current_interrogator = None
@@ -64,6 +68,7 @@ class InterrogationTab(QWidget):
         # Widget references (will be set in setup_ui)
         self.clip_config_refs = None
         self.wd_config_refs = None
+        self.camie_config_refs = None
 
         # Setup UI
         self.setup_ui()
@@ -135,6 +140,10 @@ class InterrogationTab(QWidget):
         # WD tab
         wd_widget, self.wd_config_refs = create_wd_config_widget(self.wd_config, self)
         self.model_config_tabs.addTab(wd_widget, "WD Tagger")
+
+        # Camie tab
+        camie_widget, self.camie_config_refs = create_camie_config_widget(self.camie_config, self)
+        self.model_config_tabs.addTab(camie_widget, "Camie Tagger")
 
         model_config_layout.addWidget(self.model_config_tabs)
         model_config_group.setLayout(model_config_layout)
@@ -354,7 +363,7 @@ class InterrogationTab(QWidget):
         preview_layout.addWidget(self.current_image_label)
 
         preview_group.setLayout(preview_layout)
-        layout.addWidget(preview_group)
+        layout.addWidget(preview_group, 1)  # Preview grows modestly
 
         # Discovered Tags (real-time display)
         tags_group = QGroupBox("Discovered Tags (Real-time)")
@@ -366,11 +375,11 @@ class InterrogationTab(QWidget):
         self.discovered_tags_table.horizontalHeader().setStretchLastSection(False)
         self.discovered_tags_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.discovered_tags_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.discovered_tags_table.setMaximumHeight(200)
+        self.discovered_tags_table.setMinimumHeight(150)
         tags_layout.addWidget(self.discovered_tags_table)
 
         tags_group.setLayout(tags_layout)
-        layout.addWidget(tags_group)
+        layout.addWidget(tags_group, 3)  # Tags table gets priority for extra space
 
         # Progress
         progress_group = QGroupBox("Progress")
@@ -384,7 +393,7 @@ class InterrogationTab(QWidget):
         progress_layout.addWidget(self.progress_label)
 
         progress_group.setLayout(progress_layout)
-        layout.addWidget(progress_group)
+        layout.addWidget(progress_group, 0)  # Progress stays compact at minimum size
 
         return widget
 
@@ -626,12 +635,37 @@ class InterrogationTab(QWidget):
                 'mode': self.clip_config_refs['mode_combo'].currentText(),
                 'device': self.clip_config_refs['device_combo'].currentText()
             }
-        else:  # WD tab
+        elif current_tab_index == 1:  # WD tab
             return {
                 'type': 'WD',
                 'wd_model': self.wd_config_refs['wd_model_combo'].currentText(),
                 'threshold': self.wd_config_refs['threshold_spin'].value(),
                 'device': self.wd_config_refs['device_combo'].currentText()
+            }
+        else:  # Camie tab (index 2)
+            # Get enabled categories from checkboxes
+            enabled_categories = [
+                cat for cat, cb in self.camie_config_refs['category_checkboxes'].items()
+                if cb.isChecked()
+            ]
+
+            # Get category-specific thresholds if profile is category_specific
+            threshold_profile = self.camie_config_refs['threshold_profile_combo'].currentText()
+            category_thresholds = None
+            if threshold_profile == 'category_specific':
+                category_thresholds = {
+                    cat: spin.value()
+                    for cat, spin in self.camie_config_refs['category_threshold_spins'].items()
+                }
+
+            return {
+                'type': 'Camie',
+                'camie_model': self.camie_config_refs['camie_model_combo'].currentText(),
+                'threshold': self.camie_config_refs['threshold_spin'].value(),
+                'threshold_profile': threshold_profile,
+                'device': self.camie_config_refs['device_combo'].currentText(),
+                'category_thresholds': category_thresholds,
+                'enabled_categories': enabled_categories
             }
 
     def load_model(self):
@@ -658,13 +692,25 @@ class InterrogationTab(QWidget):
                 model_info = f"CLIP - {config['clip_model']}"
                 if config['caption_model']:
                     model_info += f"\nCaption: {config['caption_model']}"
-            else:
+            elif config['type'] == 'WD':
                 self.current_interrogator = WDInterrogator(model_name=config['wd_model'])
                 self.current_interrogator.load_model(
                     threshold=config['threshold'],
-                    device=config['device']
+                    device=config['device'],
+                    provider_settings=self.provider_settings
                 )
                 model_info = f"WD - {config['wd_model']}"
+            else:  # Camie
+                self.current_interrogator = CamieInterrogator(model_name=config['camie_model'])
+                self.current_interrogator.load_model(
+                    threshold=config['threshold'],
+                    device=config['device'],
+                    threshold_profile=config['threshold_profile'],
+                    category_thresholds=config.get('category_thresholds'),
+                    enabled_categories=config.get('enabled_categories'),
+                    provider_settings=self.provider_settings
+                )
+                model_info = f"Camie - {config['camie_model']}"
 
             # Update status
             self.current_model_type = config['type']
@@ -805,6 +851,8 @@ class InterrogationTab(QWidget):
 
     def on_interrogation_result(self, image_path: str, results: Dict):
         """Handle interrogation result."""
+        import json as json_module
+
         # Update queue status
         for i in range(self.image_queue.count()):
             item = self.image_queue.item(i)
@@ -820,16 +868,35 @@ class InterrogationTab(QWidget):
         if confidence_scores is None:
             confidence_scores = {}
 
+        # Extract category info from raw_output for Camie
+        tag_categories = {}
+        raw_output = results.get('raw_output', '')
+        if raw_output and self.current_model_type == "Camie":
+            try:
+                raw_data = json_module.loads(raw_output)
+                categories = raw_data.get('categories', {})
+                for category, tag_list in categories.items():
+                    for tag_info in tag_list:
+                        tag_name = tag_info.get('tag', '')
+                        if tag_name:
+                            tag_categories[tag_name] = category
+            except (json_module.JSONDecodeError, AttributeError):
+                pass
+
         # Add new tags to accumulated list
+        # Format: tag -> (confidence, count, category)
         for tag in tags:
             conf = confidence_scores.get(tag, 0.0)
+            category = tag_categories.get(tag, '')
             if tag in self.all_discovered_tags:
                 # Update if higher confidence or increment count
-                old_conf, old_count = self.all_discovered_tags[tag]
+                old_conf, old_count, old_category = self.all_discovered_tags[tag]
                 new_conf = max(old_conf, conf)
-                self.all_discovered_tags[tag] = (new_conf, old_count + 1)
+                # Keep existing category if new one is empty
+                new_category = category if category else old_category
+                self.all_discovered_tags[tag] = (new_conf, old_count + 1, new_category)
             else:
-                self.all_discovered_tags[tag] = (conf, 1)
+                self.all_discovered_tags[tag] = (conf, 1, category)
 
         # Update the discovered tags table with all accumulated tags
         self._update_discovered_tags_display()
@@ -837,6 +904,20 @@ class InterrogationTab(QWidget):
     def _update_discovered_tags_display(self):
         """Update the discovered tags table with accumulated tags."""
         self.discovered_tags_table.setRowCount(0)
+
+        # Configure columns based on model type
+        is_camie = self.current_model_type == "Camie"
+        if is_camie:
+            self.discovered_tags_table.setColumnCount(3)
+            self.discovered_tags_table.setHorizontalHeaderLabels(["Tag", "Category", "Confidence"])
+            self.discovered_tags_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            self.discovered_tags_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            self.discovered_tags_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        else:
+            self.discovered_tags_table.setColumnCount(2)
+            self.discovered_tags_table.setHorizontalHeaderLabels(["Tag", "Confidence"])
+            self.discovered_tags_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            self.discovered_tags_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
 
         # Sort tags by count (most common first), then by confidence
         sorted_tags = sorted(
@@ -846,7 +927,14 @@ class InterrogationTab(QWidget):
         )
 
         # Display top 100 tags
-        for tag, (conf, count) in sorted_tags[:100]:
+        for tag, tag_data in sorted_tags[:100]:
+            # Handle both old (conf, count) and new (conf, count, category) formats
+            if len(tag_data) == 3:
+                conf, count, category = tag_data
+            else:
+                conf, count = tag_data
+                category = ''
+
             row = self.discovered_tags_table.rowCount()
             self.discovered_tags_table.insertRow(row)
 
@@ -854,9 +942,16 @@ class InterrogationTab(QWidget):
             tag_text = f"{tag} ({count})" if count > 1 else tag
             self.discovered_tags_table.setItem(row, 0, QTableWidgetItem(tag_text))
 
-            # Confidence
-            conf_text = f"{conf:.2f}" if conf > 0 else "N/A"
-            self.discovered_tags_table.setItem(row, 1, QTableWidgetItem(conf_text))
+            if is_camie:
+                # Category column
+                self.discovered_tags_table.setItem(row, 1, QTableWidgetItem(category))
+                # Confidence
+                conf_text = f"{conf:.2f}" if conf > 0 else "N/A"
+                self.discovered_tags_table.setItem(row, 2, QTableWidgetItem(conf_text))
+            else:
+                # Confidence
+                conf_text = f"{conf:.2f}" if conf > 0 else "N/A"
+                self.discovered_tags_table.setItem(row, 1, QTableWidgetItem(conf_text))
 
     def on_interrogation_error(self, image_path: str, error: str):
         """Handle interrogation error."""

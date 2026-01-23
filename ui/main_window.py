@@ -8,7 +8,7 @@ from PyQt6.QtGui import QAction
 from pathlib import Path
 from typing import Optional, Dict
 
-from core import InterrogationDatabase, TagFilterSettings
+from core import InterrogationDatabase, TagFilterSettings, ONNXProviderSettings
 from ui.tabs import InterrogationTab, GalleryTab, SettingsTab
 from ui.dialogs_database import DatabaseBusyDialog, QueueProcessingDialog
 from ui.workers import DatabaseQueueWorker
@@ -29,6 +29,7 @@ class MainWindow(QMainWindow):
         # Core components
         self.database = InterrogationDatabase()
         self.tag_filters = TagFilterSettings()
+        self.provider_settings = ONNXProviderSettings()
         self.current_interrogator = None
         self.current_model_type = "WD"
         self.current_directory = None
@@ -55,7 +56,14 @@ class MainWindow(QMainWindow):
             'threshold': 0.35,
             'device': 'cuda'
         }
-        
+        self.camie_config = {
+            'camie_model': 'Camais03/camie-tagger-v2',
+            'threshold': 0.5,
+            'threshold_profile': 'overall',
+            'device': 'cuda',
+            'enabled_categories': ['general', 'character', 'copyright', 'artist', 'meta', 'rating', 'year']
+        }
+
         # Setup UI
         self.setup_ui()
         self.setup_menubar()
@@ -82,7 +90,9 @@ class MainWindow(QMainWindow):
             database=self.database,
             clip_config=self.clip_config,
             wd_config=self.wd_config,
+            camie_config=self.camie_config,
             tag_filters=self.tag_filters,
+            provider_settings=self.provider_settings,
             parent=self
         )
         self.gallery_tab = GalleryTab(
@@ -92,6 +102,7 @@ class MainWindow(QMainWindow):
         self.settings_tab = SettingsTab(
             database=self.database,
             tag_filters=self.tag_filters,
+            provider_settings=self.provider_settings,
             parent=self
         )
 
