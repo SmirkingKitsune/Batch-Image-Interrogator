@@ -97,11 +97,8 @@ class CamieInterrogator(BaseInterrogator):
             default_cat_thresholds = self.THRESHOLD_PROFILES['category_specific']['defaults']
             self.category_thresholds = category_thresholds or default_cat_thresholds.copy()
         else:
-            # Use profile default or user-specified threshold for all categories
-            profile_threshold = self.THRESHOLD_PROFILES.get(
-                threshold_profile, {}
-            ).get('default', threshold)
-            self.category_thresholds = {cat: profile_threshold for cat in self.CATEGORIES}
+            # Use user-specified threshold for all categories
+            self.category_thresholds = {cat: threshold for cat in self.CATEGORIES}
 
         self.config = {
             'threshold': threshold,
