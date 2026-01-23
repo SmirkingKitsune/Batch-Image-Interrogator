@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                              QSlider, QProgressBar, QMessageBox, QTextEdit,
                              QTabWidget, QListWidget, QListWidgetItem,
                              QTableWidget, QTableWidgetItem, QFrame)
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
 from typing import Dict, List, Optional
