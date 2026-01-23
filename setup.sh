@@ -353,6 +353,7 @@ import onnxruntime as ort
 print(f'  Version: {ort.__version__}')
 providers = ort.get_available_providers()
 print(f'  CUDA Provider: {"Yes" if "CUDAExecutionProvider" in providers else "No"}')
+print(f'  TensorRT Provider: {"Yes" if "TensorrtExecutionProvider" in providers else "No (install TensorRT for faster inference)"}')
 EOF
 echo ""
 echo "Critical Dependencies:"
