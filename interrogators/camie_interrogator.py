@@ -10,10 +10,18 @@ import numpy as np
 class CamieInterrogator(BaseInterrogator):
     """Camie Tagger interrogator for anime/manga image tagging."""
 
-    # Available models
+    # Available models with their file names
     MODELS = {
-        'Camais03/camie-tagger': 'v1',
-        'Camais03/camie-tagger-v2': 'v2'
+        'Camais03/camie-tagger': {
+            'version': 'v1',
+            'model_file': 'model_initial.onnx',
+            'metadata_file': 'model_initial_metadata.json'
+        },
+        'Camais03/camie-tagger-v2': {
+            'version': 'v2',
+            'model_file': 'camie-tagger-v2.onnx',
+            'metadata_file': 'camie-tagger-v2-metadata.json'
+        }
     }
 
     # Tag categories
@@ -75,7 +83,8 @@ class CamieInterrogator(BaseInterrogator):
     def load_model(self, threshold: float = 0.5, device: str = 'cuda',
                    threshold_profile: str = 'overall',
                    category_thresholds: Dict[str, float] = None,
-                   enabled_categories: List[str] = None, **kwargs):
+                   enabled_categories: List[str] = None,
+                   provider_settings=None, **kwargs):
         """
         Load Camie Tagger model.
 
@@ -86,6 +95,7 @@ class CamieInterrogator(BaseInterrogator):
                              'balanced', or 'category_specific'
             category_thresholds: Dict of category -> threshold (for category_specific profile)
             enabled_categories: List of categories to include in output
+            provider_settings: ONNXProviderSettings instance for provider configuration
             **kwargs: Additional configuration
         """
         self.threshold = threshold
@@ -113,34 +123,30 @@ class CamieInterrogator(BaseInterrogator):
             import onnxruntime as ort
             from huggingface_hub import hf_hub_download
 
+            # Get correct file names for this model
+            model_info = self.MODELS.get(self.model_name)
+            if model_info:
+                model_file = model_info['model_file']
+                metadata_file = model_info['metadata_file']
+            else:
+                # Fallback for unknown models
+                model_file = "model.onnx"
+                metadata_file = "metadata.json"
+
             # Download model and metadata
-            model_path = hf_hub_download(self.model_name, "model.onnx")
+            model_path = hf_hub_download(self.model_name, model_file)
+            metadata_path = hf_hub_download(self.model_name, metadata_file)
 
-            # Try to get metadata file (may be named differently)
-            try:
-                metadata_path = hf_hub_download(self.model_name, "metadata.json")
-                with open(metadata_path, 'r') as f:
-                    self.tags_data = json.load(f)
-            except Exception:
-                # Try alternative name
-                try:
-                    metadata_path = hf_hub_download(self.model_name, "tags.json")
-                    with open(metadata_path, 'r') as f:
-                        self.tags_data = json.load(f)
-                except Exception:
-                    # Fall back to tag_to_index.json
-                    try:
-                        metadata_path = hf_hub_download(self.model_name, "tag_to_index.json")
-                        with open(metadata_path, 'r') as f:
-                            tag_to_index = json.load(f)
-                            # Convert to expected format
-                            self.tags_data = self._convert_tag_index_format(tag_to_index)
-                    except Exception as e:
-                        raise RuntimeError(f"Failed to load tag metadata: {e}")
+            with open(metadata_path, 'r') as f:
+                self.tags_data = json.load(f)
 
-            # Load ONNX model with appropriate provider
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
-            self.model = ort.InferenceSession(model_path, providers=providers)
+            # Load ONNX model with provider settings if available
+            if provider_settings:
+                self.model = provider_settings.create_inference_session(model_path, device)
+            else:
+                # Fallback to default behavior
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+                self.model = ort.InferenceSession(model_path, providers=providers)
 
             self.is_loaded = True
 
