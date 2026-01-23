@@ -43,6 +43,13 @@ class MainWindow(QMainWindow):
             'threshold': 0.35,
             'device': 'cuda'
         }
+        self.camie_config = {
+            'camie_model': 'Camais03/camie-tagger-v2',
+            'threshold': 0.5,
+            'threshold_profile': 'overall',
+            'device': 'cuda',
+            'enabled_categories': ['general', 'character', 'copyright', 'artist', 'meta', 'rating', 'year']
+        }
         
         # Setup UI
         self.setup_ui()
@@ -66,6 +73,7 @@ class MainWindow(QMainWindow):
             database=self.database,
             clip_config=self.clip_config,
             wd_config=self.wd_config,
+            camie_config=self.camie_config,
             tag_filters=self.tag_filters,
             parent=self
         )
