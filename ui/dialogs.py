@@ -339,6 +339,180 @@ def create_wd_config_widget(wd_config: Dict, parent=None) -> tuple:
     return widget, references
 
 
+def create_camie_config_widget(camie_config: Dict, parent=None) -> tuple:
+    """
+    Create Camie Tagger configuration widget with all settings.
+
+    Args:
+        camie_config: Dictionary with Camie configuration
+        parent: Parent widget
+
+    Returns:
+        Tuple of (widget, references_dict) where references_dict contains:
+        {
+            'camie_model_combo': QComboBox,
+            'threshold_spin': QDoubleSpinBox,
+            'threshold_profile_combo': QComboBox,
+            'device_combo': QComboBox,
+            'category_checkboxes': Dict[str, QCheckBox],
+            'category_threshold_spins': Dict[str, QDoubleSpinBox],
+            'category_thresholds_group': QGroupBox
+        }
+    """
+    widget = QWidget(parent)
+    layout = QVBoxLayout(widget)
+
+    # Form layout for main settings
+    form_layout = QFormLayout()
+
+    # Camie Model selection
+    camie_model_combo = QComboBox()
+    camie_model_combo.addItems([
+        'Camais03/camie-tagger-v2',
+        'Camais03/camie-tagger'
+    ])
+    current_model = camie_config.get('camie_model', 'Camais03/camie-tagger-v2')
+    index = camie_model_combo.findText(current_model)
+    if index >= 0:
+        camie_model_combo.setCurrentIndex(index)
+    form_layout.addRow("Camie Model:", camie_model_combo)
+
+    # Threshold profile
+    threshold_profile_combo = QComboBox()
+    threshold_profile_combo.addItems([
+        'overall',
+        'micro_optimized',
+        'macro_optimized',
+        'balanced',
+        'category_specific'
+    ])
+    current_profile = camie_config.get('threshold_profile', 'overall')
+    threshold_profile_combo.setCurrentText(current_profile)
+    form_layout.addRow("Threshold Profile:", threshold_profile_combo)
+
+    # Base threshold
+    threshold_spin = QDoubleSpinBox()
+    threshold_spin.setRange(0.0, 1.0)
+    threshold_spin.setSingleStep(0.05)
+    threshold_spin.setDecimals(2)
+    threshold_spin.setValue(camie_config.get('threshold', 0.5))
+    form_layout.addRow("Base Threshold:", threshold_spin)
+
+    # Device selection
+    camie_device_combo = QComboBox()
+    camie_device_combo.addItems(['cuda', 'cpu'])
+    current_device = camie_config.get('device', 'cuda')
+    camie_device_combo.setCurrentText(current_device)
+    form_layout.addRow("Device:", camie_device_combo)
+
+    layout.addLayout(form_layout)
+
+    # Category filter group
+    category_filter_group = QGroupBox("Category Filters")
+    category_filter_layout = QVBoxLayout()
+
+    category_info = QLabel(
+        "Select which tag categories to include in output.\n"
+        "Unchecked categories will be excluded from results."
+    )
+    category_info.setWordWrap(True)
+    category_info.setStyleSheet("QLabel { font-size: 9pt; color: #666; }")
+    category_filter_layout.addWidget(category_info)
+
+    # Category checkboxes
+    categories = ['general', 'character', 'copyright', 'artist', 'meta', 'rating', 'year']
+    enabled_categories = camie_config.get('enabled_categories', categories.copy())
+    category_checkboxes = {}
+
+    category_checkbox_layout = QHBoxLayout()
+    for category in categories:
+        cb = QCheckBox(category.capitalize())
+        cb.setChecked(category in enabled_categories)
+        category_checkboxes[category] = cb
+        category_checkbox_layout.addWidget(cb)
+
+    category_filter_layout.addLayout(category_checkbox_layout)
+    category_filter_group.setLayout(category_filter_layout)
+    layout.addWidget(category_filter_group)
+
+    # Category-specific thresholds group (collapsible)
+    category_thresholds_group = QGroupBox("Category-Specific Thresholds")
+    category_thresholds_group.setCheckable(True)
+    category_thresholds_group.setChecked(current_profile == 'category_specific')
+    category_thresholds_layout = QFormLayout()
+
+    # Get default category thresholds
+    default_cat_thresholds = {
+        'artist': 0.5, 'character': 0.5, 'copyright': 0.5,
+        'general': 0.35, 'meta': 0.5, 'rating': 0.5, 'year': 0.5
+    }
+    config_cat_thresholds = camie_config.get('category_thresholds', default_cat_thresholds)
+
+    category_threshold_spins = {}
+    for category in categories:
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 1.0)
+        spin.setSingleStep(0.05)
+        spin.setDecimals(2)
+        spin.setValue(config_cat_thresholds.get(category, 0.5))
+        category_threshold_spins[category] = spin
+        category_thresholds_layout.addRow(f"{category.capitalize()}:", spin)
+
+    category_thresholds_group.setLayout(category_thresholds_layout)
+    layout.addWidget(category_thresholds_group)
+
+    # Show/hide category thresholds based on profile
+    def on_profile_changed(profile_text):
+        is_category_specific = profile_text == 'category_specific'
+        category_thresholds_group.setVisible(is_category_specific)
+
+    threshold_profile_combo.currentTextChanged.connect(on_profile_changed)
+    # Set initial visibility
+    category_thresholds_group.setVisible(current_profile == 'category_specific')
+
+    # Model descriptions
+    model_desc_group = QGroupBox("Camie Model Information")
+    model_desc_layout = QVBoxLayout()
+    model_desc_layout.addWidget(QLabel(
+        "Camie Tagger Models:\n"
+        "• camie-tagger-v2: Latest version (recommended)\n"
+        "• camie-tagger: Original version (v1)\n\n"
+        "Features ~70,527 tags across 7 categories:\n"
+        "Artist, Character, Copyright, General, Meta, Rating, Year"
+    ))
+    model_desc_group.setLayout(model_desc_layout)
+    layout.addWidget(model_desc_group)
+
+    # Threshold profile descriptions
+    profile_desc_group = QGroupBox("Threshold Profile Information")
+    profile_desc_layout = QVBoxLayout()
+    profile_desc_layout.addWidget(QLabel(
+        "Profiles determine how thresholds are applied:\n"
+        "• Overall: Single threshold for all categories (0.5)\n"
+        "• Micro Optimized: More tags, better recall (0.614)\n"
+        "• Macro Optimized: Balanced performance (0.492)\n"
+        "• Balanced: Middle ground (0.55)\n"
+        "• Category-Specific: Set different thresholds per category"
+    ))
+    profile_desc_group.setLayout(profile_desc_layout)
+    layout.addWidget(profile_desc_group)
+
+    layout.addStretch()
+
+    # Return widget and references to controls
+    references = {
+        'camie_model_combo': camie_model_combo,
+        'threshold_spin': threshold_spin,
+        'threshold_profile_combo': threshold_profile_combo,
+        'device_combo': camie_device_combo,
+        'category_checkboxes': category_checkboxes,
+        'category_threshold_spins': category_threshold_spins,
+        'category_thresholds_group': category_thresholds_group
+    }
+
+    return widget, references
+  
+
 class ModelConfigDialog(QDialog):
     """Unified configuration dialog for CLIP and WD models with tabs."""
 
