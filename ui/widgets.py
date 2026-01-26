@@ -13,8 +13,10 @@ from typing import Dict, List, Optional
 class ImageGalleryWidget(QListWidget):
     """Custom image gallery widget with thumbnail display."""
 
-    image_selected = pyqtSignal(str)  # Emits image path when selected
+    image_selected = pyqtSignal(str)  # Emits image path when selected (single selection)
+    multi_selection_changed = pyqtSignal(list)  # Emits list of image paths (multi selection)
     inspection_requested = pyqtSignal(str)  # Emits image path for advanced inspection
+    multi_inspection_requested = pyqtSignal(list)  # Emits list of paths for multi-image inspection
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -33,6 +35,17 @@ class ImageGalleryWidget(QListWidget):
         self.itemSelectionChanged.connect(self._on_selection_changed)
 
         self.image_items = {}  # path -> QListWidgetItem
+        self._multi_select_mode = False
+
+    def set_selection_mode(self, multi: bool):
+        """Toggle between single and multi-selection mode."""
+        self._multi_select_mode = multi
+        if multi:
+            self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        else:
+            self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            # Clear selection when switching back to single mode
+            self.clearSelection()
     
     def add_image(self, image_path: str, has_tags: bool = False):
         """Add an image to the gallery."""
@@ -78,9 +91,22 @@ class ImageGalleryWidget(QListWidget):
     def _on_selection_changed(self):
         """Handle selection change."""
         items = self.selectedItems()
-        if items:
+        if not items:
+            return
+
+        if len(items) == 1:
+            # Single selection - emit image_selected for backward compatibility
             image_path = items[0].data(Qt.ItemDataRole.UserRole)
             self.image_selected.emit(image_path)
+        else:
+            # Multiple selection - emit list of paths
+            image_paths = [item.data(Qt.ItemDataRole.UserRole) for item in items]
+            self.multi_selection_changed.emit(image_paths)
+
+    def get_selected_paths(self) -> List[str]:
+        """Get list of currently selected image paths."""
+        items = self.selectedItems()
+        return [item.data(Qt.ItemDataRole.UserRole) for item in items if item.data(Qt.ItemDataRole.UserRole)]
 
     def _show_context_menu(self, position):
         """Show context menu for gallery items."""
@@ -92,30 +118,52 @@ class ImageGalleryWidget(QListWidget):
         if not image_path:
             return
 
+        # Get all selected items
+        selected_items = self.selectedItems()
+        selected_paths = [i.data(Qt.ItemDataRole.UserRole) for i in selected_items if i.data(Qt.ItemDataRole.UserRole)]
+
         menu = QMenu(self)
 
-        # Advanced inspection action
-        inspect_action = menu.addAction("Advanced Inspection...")
+        # Multi-selection context menu
+        if len(selected_paths) > 1:
+            # Multi-image inspection action
+            multi_inspect_action = menu.addAction(f"Edit Selected Tags ({len(selected_paths)} images)...")
+            menu.addSeparator()
 
-        # Open folder action
-        open_folder_action = menu.addAction("Open Folder")
+            # Open folder action (opens folder of clicked item)
+            open_folder_action = menu.addAction("Open Folder")
 
-        # Show menu and handle action
-        action = menu.exec(self.mapToGlobal(position))
+            # Show menu and handle action
+            action = menu.exec(self.mapToGlobal(position))
 
-        if action == inspect_action:
-            self.inspection_requested.emit(image_path)
-        elif action == open_folder_action:
-            # Open folder in file explorer
-            import subprocess
-            import sys
-            folder_path = str(Path(image_path).parent)
-            if sys.platform == 'win32':
-                subprocess.run(['explorer', folder_path])
-            elif sys.platform == 'darwin':
-                subprocess.run(['open', folder_path])
-            else:
-                subprocess.run(['xdg-open', folder_path])
+            if action == multi_inspect_action:
+                self.multi_inspection_requested.emit(selected_paths)
+            elif action == open_folder_action:
+                self._open_folder(image_path)
+        else:
+            # Single selection context menu
+            inspect_action = menu.addAction("Advanced Inspection...")
+            open_folder_action = menu.addAction("Open Folder")
+
+            # Show menu and handle action
+            action = menu.exec(self.mapToGlobal(position))
+
+            if action == inspect_action:
+                self.inspection_requested.emit(image_path)
+            elif action == open_folder_action:
+                self._open_folder(image_path)
+
+    def _open_folder(self, image_path: str):
+        """Open the folder containing the image in the system file explorer."""
+        import subprocess
+        import sys
+        folder_path = str(Path(image_path).parent)
+        if sys.platform == 'win32':
+            subprocess.run(['explorer', folder_path])
+        elif sys.platform == 'darwin':
+            subprocess.run(['open', folder_path])
+        else:
+            subprocess.run(['xdg-open', folder_path])
 
 
 class TagEditorWidget(QWidget):
