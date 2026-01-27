@@ -823,6 +823,8 @@ class GalleryTab(QWidget):
             )
         else:
             self.image_count_label.setText(f"{len(self.filtered_images)} images")
+            # Re-enable tag editor when exiting multi-select mode
+            self.tag_editor.setEnabled(True)
 
     def _on_multi_selection_changed(self, image_paths: List[str]):
         """Handle multiple image selection."""
@@ -831,13 +833,25 @@ class GalleryTab(QWidget):
             f"{len(image_paths)} of {len(self.filtered_images)} images selected"
         )
 
-        # Clear preview when multiple images selected (show first one as hint)
+        # In multi-select mode, disable single-image editing to prevent
+        # accidental saves to a previously selected image
+        if len(image_paths) > 1:
+            self.current_image = None
+            self.tag_editor.setEnabled(False)
+            self.tag_editor.clear_tags()
+        elif len(image_paths) == 1:
+            # Single image in multi-select mode - re-enable editing
+            self.tag_editor.setEnabled(True)
+            self._on_image_selected(image_paths[0])
+
+        # Update preview (show first one as hint for multi-select)
         if image_paths:
             self.image_preview.set_image(image_paths[0])
-            self.image_preview.info_label.setText(
-                f"Selected: {len(image_paths)} images\n"
-                f"Right-click for batch tag editing"
-            )
+            if len(image_paths) > 1:
+                self.image_preview.info_label.setText(
+                    f"Selected: {len(image_paths)} images\n"
+                    f"Right-click for batch tag editing"
+                )
 
     def _open_multi_advanced_inspection(self, image_paths: List[str]):
         """Open the advanced inspection dialog for multiple images."""
