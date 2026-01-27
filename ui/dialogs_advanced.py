@@ -1198,8 +1198,10 @@ class AdvancedImageInspectionDialog(QDialog):
                 logger.error(f"Failed to save tags to {image_path}: {e}")
                 failed_paths.append(image_path)
 
-        # Update original common tags to reflect the save
-        self.original_common_tags = selected_set
+        # Only update original common tags when all saves succeed.
+        # If some failed, keep original state so retries can detect changes.
+        if not failed_paths:
+            self.original_common_tags = selected_set
 
         # Emit batch signal once (not individual signals per image)
         if saved_results:
