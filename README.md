@@ -13,7 +13,7 @@ A professional PyQt6-based application for batch image interrogation and tagging
 - **Advanced Image Inspection**: Detailed dialog with multi-model comparison, WD sensitivity ratings, and tag filtering visualization
 - **Checkbox Tag Selector**: Visual tag editor showing all model-generated tags with checkboxes for easy selection
 - **Tag Filtering System**: Remove, replace, or force-include tags with customizable rules
-- **Smart File Organization**: Organize images by tags with recursive search and directory selection to prevent re-organizing
+- **Smart File Organization**: Organize images by tags with recursive search and directory selection to prevent re-organizing  
 - **Confidence Scores**: WD Tagger provides confidence scores for each tag
 - **Gallery View**: Thumbnail-based image browser with visual indicators for tagged images
 - **GPU Acceleration**: CUDA (NVIDIA) and ROCm (AMD) support for 10-50x faster processing
@@ -858,6 +858,7 @@ FileManager.write_tags_to_file(Path("path/to/image.jpg"), results['tags'])
 
 - **CLIP Interrogator**: Uses the clip-interrogator library
 - **Waifu Diffusion Tagger**: Uses SmilingWolf's WD Tagger models
+- **Camie Tagger**: Uses Camais03's Camie Tagger models
 - **UI Framework**: PyQt6
 
 ## Support
