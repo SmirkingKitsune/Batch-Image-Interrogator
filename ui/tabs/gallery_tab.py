@@ -456,6 +456,12 @@ class GalleryTab(QWidget):
 
         controls_layout.addStretch()
 
+        # Multi-select checkbox
+        self.multi_select_checkbox = QCheckBox("Multi-Select")
+        self.multi_select_checkbox.setToolTip("Enable multi-selection mode (Ctrl+Click or Shift+Click)")
+        self.multi_select_checkbox.stateChanged.connect(self._on_multi_select_changed)
+        controls_layout.addWidget(self.multi_select_checkbox)
+
         # Organization button
         self.organize_button = QPushButton("Organize by Tags")
         self.organize_button.clicked.connect(self._open_organize_dialog)
@@ -517,6 +523,8 @@ class GalleryTab(QWidget):
         self.image_gallery.image_selected.connect(self._on_image_selected)
         self.image_gallery.itemDoubleClicked.connect(self._on_gallery_double_click)
         self.image_gallery.inspection_requested.connect(self._open_advanced_inspection)
+        self.image_gallery.multi_selection_changed.connect(self._on_multi_selection_changed)
+        self.image_gallery.multi_inspection_requested.connect(self._open_multi_advanced_inspection)
 
         # Results signals
         self.results_widget.copy_tags_button.clicked.connect(self._copy_tags_to_editor)
@@ -802,3 +810,86 @@ class GalleryTab(QWidget):
 
         # Refresh gallery after organization
         self.refresh_gallery()
+
+    def _on_multi_select_changed(self, state: int):
+        """Handle multi-select checkbox toggle."""
+        multi_mode = state == Qt.CheckState.Checked.value
+        self.image_gallery.set_selection_mode(multi_mode)
+
+        # Update UI hint
+        if multi_mode:
+            self.image_count_label.setText(
+                f"{len(self.filtered_images)} images (multi-select enabled)"
+            )
+        else:
+            self.image_count_label.setText(f"{len(self.filtered_images)} images")
+            # Re-enable tag editor when exiting multi-select mode
+            self.tag_editor.setEnabled(True)
+
+    def _on_multi_selection_changed(self, image_paths: List[str]):
+        """Handle multiple image selection."""
+        # Update count label with selection info
+        self.image_count_label.setText(
+            f"{len(image_paths)} of {len(self.filtered_images)} images selected"
+        )
+
+        # In multi-select mode, disable single-image editing to prevent
+        # accidental saves to a previously selected image
+        if len(image_paths) > 1:
+            self.current_image = None
+            self.tag_editor.setEnabled(False)
+            self.tag_editor.clear_tags()
+        elif len(image_paths) == 1:
+            # Single image in multi-select mode - re-enable editing
+            self.tag_editor.setEnabled(True)
+            self._on_image_selected(image_paths[0])
+
+        # Update preview (show first one as hint for multi-select)
+        if image_paths:
+            self.image_preview.set_image(image_paths[0])
+            if len(image_paths) > 1:
+                self.image_preview.info_label.setText(
+                    f"Selected: {len(image_paths)} images\n"
+                    f"Right-click for batch tag editing"
+                )
+
+    def _open_multi_advanced_inspection(self, image_paths: List[str]):
+        """Open the advanced inspection dialog for multiple images."""
+        if not image_paths:
+            return
+
+        try:
+            dialog = AdvancedImageInspectionDialog(
+                image_path=image_paths,  # Pass list for multi-mode
+                image_list=self.filtered_images,
+                database=self.database,
+                tag_filters=None,
+                parent=self
+            )
+            # Connect signals to refresh gallery when tags are saved
+            dialog.tags_saved.connect(self._on_advanced_dialog_tags_saved)
+            dialog.batch_tags_saved.connect(self._on_batch_tags_saved)
+            dialog.show()  # Non-modal
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open multi-image dialog:\n{str(e)}")
+
+    def _on_batch_tags_saved(self, saved_results: List[tuple]):
+        """
+        Handle batch tags saved from multi-image dialog.
+
+        Args:
+            saved_results: List of (image_path, tags) tuples
+        """
+        # Update gallery status for each image (lightweight)
+        for image_path, tags in saved_results:
+            self.image_gallery.update_image_status(image_path, len(tags) > 0)
+
+        # Update tag filter counts ONCE (expensive operation)
+        self._update_tag_filter()
+
+        # If current image was in the batch, refresh its display
+        if self.current_image:
+            for image_path, tags in saved_results:
+                if self.current_image == image_path:
+                    self.refresh_current_image()
+                    break

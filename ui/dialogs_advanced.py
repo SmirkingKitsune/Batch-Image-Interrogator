@@ -5,17 +5,109 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QComboBox, QGroupBox, QSplitter,
                              QTabWidget, QWidget, QTableWidget, QTableWidgetItem,
                              QProgressBar, QMessageBox, QMenu, QScrollArea,
-                             QCheckBox, QLineEdit)
+                             QCheckBox, QLineEdit, QGridLayout, QFrame)
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QSettings
-from PyQt6.QtGui import QKeySequence, QColor, QShortcut, QBrush
+from PyQt6.QtGui import QKeySequence, QColor, QShortcut, QBrush, QPixmap
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Union
 
 from core import FileManager, TagFilterSettings, InterrogationDatabase
 from core.hashing import hash_image_content
 from ui.widgets import TagEditorWidget, ResultsTableWidget
 
 logger = logging.getLogger(__name__)
+
+
+class ThumbnailGridWidget(QWidget):
+    """Widget displaying a grid of image thumbnails for multi-selection preview."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setup_ui()
+
+    def setup_ui(self):
+        """Setup the UI components."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        # Count label
+        self.count_label = QLabel("No images selected")
+        self.count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.count_label.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        layout.addWidget(self.count_label)
+
+        # Grid container
+        self.grid_frame = QFrame()
+        self.grid_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.grid_layout = QGridLayout(self.grid_frame)
+        self.grid_layout.setSpacing(5)
+        layout.addWidget(self.grid_frame, 1)
+
+        self.thumbnail_labels = []
+
+    def set_images(self, image_paths: List[str], max_visible: int = 9):
+        """
+        Display thumbnails for selected images.
+
+        Args:
+            image_paths: List of image paths to display
+            max_visible: Maximum number of thumbnails to show (default 9 for 3x3 grid)
+        """
+        # Clear existing thumbnails
+        for label in self.thumbnail_labels:
+            label.deleteLater()
+        self.thumbnail_labels.clear()
+
+        # Clear grid layout
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        total_images = len(image_paths)
+
+        # Update count label
+        if total_images <= max_visible:
+            self.count_label.setText(f"{total_images} images selected")
+        else:
+            self.count_label.setText(f"{total_images} images selected (showing first {max_visible})")
+
+        # Calculate grid dimensions (aim for square-ish)
+        num_to_show = min(total_images, max_visible)
+        if num_to_show == 0:
+            return
+
+        cols = 3 if num_to_show > 4 else 2 if num_to_show > 1 else 1
+        rows = (num_to_show + cols - 1) // cols
+
+        # Create thumbnails
+        thumb_size = 120
+        for i, image_path in enumerate(image_paths[:max_visible]):
+            row = i // cols
+            col = i % cols
+
+            # Create thumbnail label
+            label = QLabel()
+            label.setFixedSize(thumb_size, thumb_size)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setFrameShape(QFrame.Shape.Box)
+            label.setStyleSheet("QLabel { background-color: #f0f0f0; }")
+
+            # Load and scale image
+            pixmap = QPixmap(image_path)
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(
+                    thumb_size - 4, thumb_size - 4,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                label.setPixmap(scaled)
+                label.setToolTip(Path(image_path).name)
+            else:
+                label.setText("?")
+
+            self.grid_layout.addWidget(label, row, col)
+            self.thumbnail_labels.append(label)
 
 
 class CheckboxTagSelector(QWidget):
@@ -150,16 +242,20 @@ class AdvancedImageInspectionDialog(QDialog):
     """
     Advanced image inspection dialog with multi-model results,
     tag comparison, and editing capabilities.
+
+    Supports both single-image mode (with navigation) and multi-image mode
+    (for batch tag editing with common tag intersection).
     """
 
     # Signals
-    tags_saved = pyqtSignal(str, list)  # image_path, tags
+    tags_saved = pyqtSignal(str, list)  # image_path, tags (single image)
+    batch_tags_saved = pyqtSignal(list)  # list of (image_path, tags) tuples (multi-image)
 
     # Settings keys
     SETTINGS_KEY_LAST_TAB = "AdvancedImageInspectionDialog/lastTabIndex"
 
     def __init__(self,
-                 image_path: str,
+                 image_path: Union[str, List[str]],
                  image_list: List[str],
                  database: InterrogationDatabase,
                  tag_filters: Optional[TagFilterSettings] = None,
@@ -168,8 +264,8 @@ class AdvancedImageInspectionDialog(QDialog):
         Initialize the advanced image inspection dialog.
 
         Args:
-            image_path: Initial image to display
-            image_list: Full list of images for navigation
+            image_path: Initial image to display, OR list of images for multi-image mode
+            image_list: Full list of images for navigation (single-image mode only)
             database: Database instance for interrogation lookups
             tag_filters: Optional tag filter settings for comparison
             parent: Parent widget
@@ -180,23 +276,42 @@ class AdvancedImageInspectionDialog(QDialog):
         self.database = database
         self.tag_filters = tag_filters
         self.image_list = image_list
-        self.current_index = image_list.index(image_path) if image_path in image_list else 0
-        self.current_image = image_path
+
+        # Handle both single path (str) and multiple paths (list)
+        if isinstance(image_path, list):
+            self.selected_images = image_path
+        else:
+            self.selected_images = [image_path]
+
+        self.is_multi_mode = len(self.selected_images) > 1
+
+        # Single-image mode state
+        if not self.is_multi_mode:
+            first_image = self.selected_images[0]
+            self.current_index = image_list.index(first_image) if first_image in image_list else 0
+            self.current_image = first_image
+        else:
+            self.current_index = 0
+            self.current_image = None  # No single current image in multi-mode
 
         # Data cache
         self.current_interrogations = []  # List of dicts from database
         self.current_file_tags = []  # Tags from .txt file
         self.current_model = None  # Currently selected model name
+        self.original_common_tags = set()  # For multi-mode: tracks original common tags
 
         # UI setup
-        self.setWindowTitle("Advanced Image Inspection")
+        if self.is_multi_mode:
+            self.setWindowTitle(f"Edit Tags - {len(self.selected_images)} Images")
+        else:
+            self.setWindowTitle("Advanced Image Inspection")
         self.setModal(False)  # Non-modal so it can be moved/resized
         self.resize(1400, 900)
 
         self.setup_ui()
         self.setup_keyboard_shortcuts()
 
-        # Load initial image
+        # Load initial data
         self.load_image_data()
 
     def setup_ui(self):
@@ -251,37 +366,58 @@ class AdvancedImageInspectionDialog(QDialog):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        # Image Preview Group
-        preview_group = QGroupBox("Image Preview")
-        preview_layout = QVBoxLayout()
+        if self.is_multi_mode:
+            # Multi-image mode: show thumbnail grid
+            preview_group = QGroupBox("Selected Images")
+            preview_layout = QVBoxLayout()
 
-        # Import EnhancedImagePreview here to avoid circular import
-        from ui.tabs.gallery_tab import EnhancedImagePreview
-        self.image_preview = EnhancedImagePreview()
-        preview_layout.addWidget(self.image_preview)
+            self.thumbnail_grid = ThumbnailGridWidget()
+            preview_layout.addWidget(self.thumbnail_grid)
 
-        preview_group.setLayout(preview_layout)
-        layout.addWidget(preview_group)
+            preview_group.setLayout(preview_layout)
+            layout.addWidget(preview_group, 1)
 
-        # Image Info Group
-        info_group = QGroupBox("Image Information")
-        info_layout = QVBoxLayout()
+            # Placeholder for single-image widgets (not used in multi-mode)
+            self.image_preview = None
+            self.filename_label = None
+            self.dimensions_label = None
+            self.file_size_label = None
+            self.file_tags_status_label = None
+        else:
+            # Single-image mode: show full preview
+            preview_group = QGroupBox("Image Preview")
+            preview_layout = QVBoxLayout()
 
-        self.filename_label = QLabel()
-        self.filename_label.setWordWrap(True)
-        info_layout.addWidget(self.filename_label)
+            # Import EnhancedImagePreview here to avoid circular import
+            from ui.tabs.gallery_tab import EnhancedImagePreview
+            self.image_preview = EnhancedImagePreview()
+            preview_layout.addWidget(self.image_preview)
 
-        self.dimensions_label = QLabel()
-        info_layout.addWidget(self.dimensions_label)
+            preview_group.setLayout(preview_layout)
+            layout.addWidget(preview_group)
 
-        self.file_size_label = QLabel()
-        info_layout.addWidget(self.file_size_label)
+            # Image Info Group
+            info_group = QGroupBox("Image Information")
+            info_layout = QVBoxLayout()
 
-        self.file_tags_status_label = QLabel()
-        info_layout.addWidget(self.file_tags_status_label)
+            self.filename_label = QLabel()
+            self.filename_label.setWordWrap(True)
+            info_layout.addWidget(self.filename_label)
 
-        info_group.setLayout(info_layout)
-        layout.addWidget(info_group)
+            self.dimensions_label = QLabel()
+            info_layout.addWidget(self.dimensions_label)
+
+            self.file_size_label = QLabel()
+            info_layout.addWidget(self.file_size_label)
+
+            self.file_tags_status_label = QLabel()
+            info_layout.addWidget(self.file_tags_status_label)
+
+            info_group.setLayout(info_layout)
+            layout.addWidget(info_group)
+
+            # Placeholder for multi-mode widget (not used in single-mode)
+            self.thumbnail_grid = None
 
         return widget
 
@@ -289,26 +425,39 @@ class AdvancedImageInspectionDialog(QDialog):
         """Create the right panel with tabbed interface."""
         self.main_tabs = QTabWidget()
 
-        # Tab 1: Model Results
-        model_results_tab = self._create_model_results_tab()
-        self.main_tabs.addTab(model_results_tab, "Model Results")
+        if self.is_multi_mode:
+            # Multi-image mode: only show Tag Editor
+            editor_tab = self._create_editor_tab()
+            self.main_tabs.addTab(editor_tab, "Common Tags Editor")
 
-        # Tab 2: Database vs File Comparison
-        comparison_tab = self._create_comparison_tab()
-        self.main_tabs.addTab(comparison_tab, "Database vs File")
+            # Placeholders for single-mode tabs (not created in multi-mode)
+            self.model_selector = None
+            self.ratings_group = None
+            self.results_table = None
+            self.comparison_table = None
+            self.comparison_info_label = None
+        else:
+            # Single-image mode: show all tabs
+            # Tab 1: Model Results
+            model_results_tab = self._create_model_results_tab()
+            self.main_tabs.addTab(model_results_tab, "Model Results")
 
-        # Tab 3: Tag Editor
-        editor_tab = self._create_editor_tab()
-        self.main_tabs.addTab(editor_tab, "Tag Editor")
+            # Tab 2: Database vs File Comparison
+            comparison_tab = self._create_comparison_tab()
+            self.main_tabs.addTab(comparison_tab, "Database vs File")
 
-        # Connect tab change signal to save preference
-        self.main_tabs.currentChanged.connect(self._on_tab_changed)
+            # Tab 3: Tag Editor
+            editor_tab = self._create_editor_tab()
+            self.main_tabs.addTab(editor_tab, "Tag Editor")
 
-        # Restore last selected tab
-        settings = QSettings()
-        last_tab = settings.value(self.SETTINGS_KEY_LAST_TAB, 0, type=int)
-        if 0 <= last_tab < self.main_tabs.count():
-            self.main_tabs.setCurrentIndex(last_tab)
+            # Connect tab change signal to save preference
+            self.main_tabs.currentChanged.connect(self._on_tab_changed)
+
+            # Restore last selected tab
+            settings = QSettings()
+            last_tab = settings.value(self.SETTINGS_KEY_LAST_TAB, 0, type=int)
+            if 0 <= last_tab < self.main_tabs.count():
+                self.main_tabs.setCurrentIndex(last_tab)
 
         return self.main_tabs
 
@@ -454,13 +603,15 @@ class AdvancedImageInspectionDialog(QDialog):
 
     def setup_keyboard_shortcuts(self):
         """Setup keyboard shortcuts for dialog."""
-        # Left arrow - previous image
-        prev_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
-        prev_shortcut.activated.connect(self._navigate_previous)
+        # Only enable navigation in single-image mode
+        if not self.is_multi_mode:
+            # Left arrow - previous image
+            prev_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+            prev_shortcut.activated.connect(self._navigate_previous)
 
-        # Right arrow - next image
-        next_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
-        next_shortcut.activated.connect(self._navigate_next)
+            # Right arrow - next image
+            next_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+            next_shortcut.activated.connect(self._navigate_next)
 
         # ESC - close dialog
         close_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
@@ -472,8 +623,18 @@ class AdvancedImageInspectionDialog(QDialog):
 
     def load_image_data(self):
         """
+        Load all data for current image(s).
+        Dispatches to single or multi-image loading based on mode.
+        """
+        if self.is_multi_mode:
+            self._load_multi_image_data()
+        else:
+            self._load_single_image_data()
+
+    def _load_single_image_data(self):
+        """
         Load all data for current image: interrogations, file tags, display.
-        This is called when navigating to a new image.
+        This is called when navigating to a new image in single-image mode.
         """
         if not self.current_image:
             return
@@ -551,6 +712,72 @@ class AdvancedImageInspectionDialog(QDialog):
         # Populate tag selector with all tags from all models
         self._populate_tag_selector()
 
+    def _load_multi_image_data(self):
+        """
+        Load data for multi-image mode.
+        Computes common tags across all selected images.
+        Only displays tags that are common to ALL images.
+        """
+        # Disable navigation in multi-mode
+        self.prev_button.setEnabled(False)
+        self.next_button.setEnabled(False)
+
+        # Update counter to show selection info
+        self.image_counter.setText(f"{len(self.selected_images)} images selected")
+
+        # Display thumbnail grid
+        self.thumbnail_grid.set_images(self.selected_images)
+
+        # Compute common tags (only tags present in ALL images)
+        common_tags = self._compute_common_tags()
+
+        # Store original common tags for comparison during save
+        self.original_common_tags = set(common_tags)
+
+        # Update tag selector - only show common tags, all pre-selected
+        if common_tags:
+            sorted_common = sorted(common_tags, key=str.lower)
+            # Available tags = common tags only, all selected by default
+            self.tag_selector.set_available_tags(sorted_common, sorted_common)
+        else:
+            # No common tags found
+            self.tag_selector.set_available_tags([], [])
+
+    def _compute_common_tags(self) -> Set[str]:
+        """
+        Compute intersection of tags across all selected images.
+
+        Returns:
+            Set of tags that exist in ALL selected images (intersection)
+        """
+        tag_sets = []
+
+        for image_path in self.selected_images:
+            image_tags = set()
+
+            # Get tags from all database interrogations for this image
+            try:
+                file_hash = hash_image_content(image_path)
+                interrogations = self.database.get_all_interrogations_for_image(file_hash) or []
+                for interrog in interrogations:
+                    tags = interrog.get('tags', [])
+                    if tags:
+                        image_tags.update(tags)
+            except Exception as e:
+                logger.error(f"Error loading interrogations for {image_path}: {e}")
+
+            # Get tags from .txt file
+            file_tags = FileManager.read_tags_from_file(Path(image_path))
+            image_tags.update(file_tags)
+
+            tag_sets.append(image_tags)
+
+        # Return intersection of all sets (common tags only)
+        if tag_sets:
+            return set.intersection(*tag_sets)
+        else:
+            return set()
+
     def _populate_tag_selector(self):
         """Collect all tags from all interrogations and populate the tag selector."""
         # Collect all unique tags from all model interrogations
@@ -572,6 +799,10 @@ class AdvancedImageInspectionDialog(QDialog):
 
     def _populate_model_selector(self):
         """Populate model selector with available models."""
+        # Skip in multi-mode (no model selector)
+        if self.model_selector is None:
+            return
+
         self.model_selector.clear()
 
         if not self.current_interrogations:
@@ -843,7 +1074,14 @@ class AdvancedImageInspectionDialog(QDialog):
         self.load_image_data()
 
     def _save_edited_tags(self, tags: List[str]):
-        """Save edited tags directly to file."""
+        """Save edited tags - dispatches to single or multi-image save."""
+        if self.is_multi_mode:
+            self._save_multi_image_tags(tags)
+        else:
+            self._save_single_image_tags(tags)
+
+    def _save_single_image_tags(self, tags: List[str]):
+        """Save edited tags directly to file (single-image mode)."""
         try:
             FileManager.write_tags_to_file(
                 Path(self.current_image),
@@ -885,34 +1123,150 @@ class AdvancedImageInspectionDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save tags:\n{str(e)}")
 
+    def _save_multi_image_tags(self, selected_tags: List[str]):
+        """
+        Save tag changes to all selected images (multi-image mode).
+
+        Only affects common tags - each image's unique tags are preserved.
+        - Tags unchecked in the editor are removed from all images
+        - Tags checked in the editor are ensured to exist in all images
+        """
+        selected_set = set(selected_tags)
+        original_set = self.original_common_tags
+
+        # Calculate what changed
+        tags_to_remove = original_set - selected_set  # Were common, now unchecked
+        tags_to_add = selected_set - original_set     # Shouldn't happen (can't add non-common tags)
+
+        # Build confirmation message
+        changes = []
+        if tags_to_remove:
+            changes.append(f"Remove {len(tags_to_remove)} tag(s): {', '.join(sorted(tags_to_remove)[:5])}"
+                          + ("..." if len(tags_to_remove) > 5 else ""))
+        if tags_to_add:
+            changes.append(f"Add {len(tags_to_add)} tag(s): {', '.join(sorted(tags_to_add)[:5])}"
+                          + ("..." if len(tags_to_add) > 5 else ""))
+
+        if not changes:
+            QMessageBox.information(self, "No Changes", "No changes to save.")
+            return
+
+        # Show confirmation dialog
+        reply = QMessageBox.question(
+            self,
+            "Save Tag Changes",
+            f"Apply changes to {len(self.selected_images)} images?\n\n"
+            + "\n".join(changes) + "\n\n"
+            "Each image's unique tags will be preserved.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Track success/failure
+        success_count = 0
+        failed_paths = []
+        saved_results = []  # Collect results for batch signal
+
+        # Update each image's tags
+        for image_path in self.selected_images:
+            try:
+                # Read current tags from file
+                current_tags = FileManager.read_tags_from_file(Path(image_path))
+                current_set = set(current_tags)
+
+                # Apply changes: remove unchecked common tags, add any new ones
+                new_set = (current_set - tags_to_remove) | tags_to_add
+
+                # Preserve original order for tags that weren't changed,
+                # append any new tags at the end
+                new_tags = [t for t in current_tags if t in new_set]
+                for t in tags_to_add:
+                    if t not in new_tags:
+                        new_tags.append(t)
+
+                # Write back
+                FileManager.write_tags_to_file(
+                    Path(image_path),
+                    new_tags,
+                    overwrite=True
+                )
+                saved_results.append((image_path, new_tags))
+                success_count += 1
+            except Exception as e:
+                logger.error(f"Failed to save tags to {image_path}: {e}")
+                failed_paths.append(image_path)
+
+        # Only update original common tags when all saves succeed.
+        # If some failed, keep original state so retries can detect changes.
+        if not failed_paths:
+            self.original_common_tags = selected_set
+
+        # Emit batch signal once (not individual signals per image)
+        if saved_results:
+            self.batch_tags_saved.emit(saved_results)
+
+        # Show result message
+        if failed_paths:
+            QMessageBox.warning(
+                self,
+                "Partial Success",
+                f"Tags updated for {success_count} images.\n"
+                f"Failed to update {len(failed_paths)} images:\n"
+                + "\n".join(Path(p).name for p in failed_paths[:5])
+                + ("\n..." if len(failed_paths) > 5 else "")
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Success",
+                f"Tags updated for all {success_count} images!"
+            )
+
     def _quick_save_tags(self):
         """Quick save if on editor tab."""
-        if self.main_tabs.currentIndex() == 2:  # Editor tab
+        # In multi-mode, there's only one tab (index 0)
+        # In single-mode, editor tab is index 2
+        editor_tab_index = 0 if self.is_multi_mode else 2
+        if self.main_tabs.currentIndex() == editor_tab_index:
             tags = self.tag_selector.get_selected_tags()
             self._save_edited_tags(tags)
 
     def _show_no_interrogations_message(self):
         """Show message when image has no interrogations."""
+        # Skip in multi-mode (these widgets don't exist)
+        if self.is_multi_mode:
+            return
+
         # Disable model selector
-        self.model_selector.clear()
-        self.model_selector.setEnabled(False)
+        if self.model_selector:
+            self.model_selector.clear()
+            self.model_selector.setEnabled(False)
 
         # Hide ratings section
-        self.ratings_group.setVisible(False)
+        if self.ratings_group:
+            self.ratings_group.setVisible(False)
 
         # Show message in results table
-        self.results_table.clear_results()
+        if self.results_table:
+            self.results_table.clear_results()
 
         # Comparison tab shows message
-        self.comparison_table.setRowCount(1)
-        self.comparison_table.setColumnCount(1)
-        msg_item = QTableWidgetItem("This image has not been interrogated yet.")
-        msg_item.setFlags(msg_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.comparison_table.setItem(0, 0, msg_item)
+        if self.comparison_table:
+            self.comparison_table.setRowCount(1)
+            self.comparison_table.setColumnCount(1)
+            msg_item = QTableWidgetItem("This image has not been interrogated yet.")
+            msg_item.setFlags(msg_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.comparison_table.setItem(0, 0, msg_item)
 
-        self.comparison_info_label.setText("No interrogation data available")
+        if self.comparison_info_label:
+            self.comparison_info_label.setText("No interrogation data available")
 
     def _on_tab_changed(self, index: int):
-        """Save the currently selected tab to settings."""
+        """Save the currently selected tab to settings (single-mode only)."""
+        # Don't save tab preference in multi-mode (only one tab)
+        if self.is_multi_mode:
+            return
         settings = QSettings()
         settings.setValue(self.SETTINGS_KEY_LAST_TAB, index)
