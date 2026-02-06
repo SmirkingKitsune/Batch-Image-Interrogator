@@ -124,8 +124,9 @@ if [ "$OS_TYPE" = "Linux" ]; then
         # Detect CUDA version from nvidia-smi
         NVIDIA_SMI_OUTPUT=$(nvidia-smi 2>/dev/null | grep "CUDA Version" || echo "")
 
-        if echo "$NVIDIA_SMI_OUTPUT" | grep -q "13.0"; then
-            DETECTED_CUDA="13.0"
+        if echo "$NVIDIA_SMI_OUTPUT" | grep -q "13."; then
+            # Extract actual version for display
+            DETECTED_CUDA=$(echo "$NVIDIA_SMI_OUTPUT" | grep -o "CUDA Version: [0-9.]*" | awk '{print $3}')
             CUDA_INDEX="cu130"
         elif echo "$NVIDIA_SMI_OUTPUT" | grep -q "12.8"; then
             DETECTED_CUDA="12.8"
