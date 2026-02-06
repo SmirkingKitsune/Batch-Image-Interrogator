@@ -8,6 +8,13 @@ from typing import List, Dict, Set, Tuple
 class TagFilterSettings:
     """Manages tag filtering rules for customizing output."""
 
+    # Default emoji-style tags to skip when replacing underscores
+    DEFAULT_UNDERSCORE_SKIP_LIST = {
+        "0_0", "(o)_(o)", "+_+", "+_-", "._.", "<o>_<o>", "<|>_<|>",
+        "=_=", ">_<", "3_3", "6_9", ">_o", "@_@", "^_^", "o_o",
+        "u_u", "x_x", "|_|", "||_||"
+    }
+
     def __init__(self, settings_file: str = "tag_filters.json"):
         self.settings_file = Path(settings_file)
 
@@ -15,6 +22,13 @@ class TagFilterSettings:
         self.remove_list: Set[str] = set()  # Tags to exclude
         self.replace_dict: Dict[str, str] = {}  # tag -> replacement
         self.keep_list: Set[str] = set()  # Tags to always include (ignore confidence)
+
+        # Prefix tags (prepended to all output)
+        self.prefix_tags: List[str] = []
+
+        # Underscore replacement settings
+        self.replace_underscores: bool = False  # Toggle underscore→space
+        self.underscore_skip_list: Set[str] = set(self.DEFAULT_UNDERSCORE_SKIP_LIST)
 
         # Load saved settings
         self.load_settings()
@@ -28,6 +42,14 @@ class TagFilterSettings:
                     self.remove_list = set(data.get('remove_list', []))
                     self.replace_dict = data.get('replace_dict', {})
                     self.keep_list = set(data.get('keep_list', []))
+                    self.prefix_tags = data.get('prefix_tags', [])
+                    self.replace_underscores = data.get('replace_underscores', False)
+                    # Load custom skip list or use defaults
+                    skip_list = data.get('underscore_skip_list')
+                    if skip_list is not None:
+                        self.underscore_skip_list = set(skip_list)
+                    else:
+                        self.underscore_skip_list = set(self.DEFAULT_UNDERSCORE_SKIP_LIST)
             except Exception as e:
                 print(f"Error loading tag filter settings: {e}")
 
@@ -37,7 +59,10 @@ class TagFilterSettings:
             data = {
                 'remove_list': list(self.remove_list),
                 'replace_dict': self.replace_dict,
-                'keep_list': list(self.keep_list)
+                'keep_list': list(self.keep_list),
+                'prefix_tags': self.prefix_tags,
+                'replace_underscores': self.replace_underscores,
+                'underscore_skip_list': list(self.underscore_skip_list)
             }
             with open(self.settings_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -95,6 +120,85 @@ class TagFilterSettings:
         self.keep_list.clear()
         self.save_settings()
 
+    # === Prefix Tags Filter ===
+
+    def set_prefix_tags(self, tags: List[str]):
+        """Set the list of prefix tags."""
+        self.prefix_tags = [tag.strip() for tag in tags if tag.strip()]
+        self.save_settings()
+
+    def get_prefix_tags(self) -> List[str]:
+        """Get the list of prefix tags."""
+        return list(self.prefix_tags)
+
+    def add_prefix_tag(self, tag: str):
+        """Add a tag to the prefix list."""
+        tag = tag.strip()
+        if tag and tag not in self.prefix_tags:
+            self.prefix_tags.append(tag)
+            self.save_settings()
+
+    def remove_prefix_tag(self, tag: str):
+        """Remove a tag from the prefix list."""
+        tag = tag.strip()
+        if tag in self.prefix_tags:
+            self.prefix_tags.remove(tag)
+            self.save_settings()
+
+    def clear_prefix_tags(self):
+        """Clear all prefix tags."""
+        self.prefix_tags.clear()
+        self.save_settings()
+
+    # === Underscore Replacement ===
+
+    def set_replace_underscores(self, enabled: bool):
+        """Set whether to replace underscores with spaces."""
+        self.replace_underscores = enabled
+        self.save_settings()
+
+    def get_replace_underscores(self) -> bool:
+        """Get whether underscore replacement is enabled."""
+        return self.replace_underscores
+
+    def get_underscore_skip_list(self) -> List[str]:
+        """Get the list of tags to skip when replacing underscores."""
+        return sorted(list(self.underscore_skip_list))
+
+    def add_underscore_skip_tag(self, tag: str):
+        """Add a tag to the underscore skip list."""
+        self.underscore_skip_list.add(tag.strip())
+        self.save_settings()
+
+    def remove_underscore_skip_tag(self, tag: str):
+        """Remove a tag from the underscore skip list."""
+        self.underscore_skip_list.discard(tag.strip())
+        self.save_settings()
+
+    def reset_underscore_skip_list(self):
+        """Reset the underscore skip list to defaults."""
+        self.underscore_skip_list = set(self.DEFAULT_UNDERSCORE_SKIP_LIST)
+        self.save_settings()
+
+    def replace_underscore_in_tag(self, tag: str) -> str:
+        """
+        Replace underscores with spaces in a tag, unless it's in the skip list.
+
+        Args:
+            tag: The tag to process
+
+        Returns:
+            Tag with underscores replaced (if not in skip list)
+        """
+        if not self.replace_underscores:
+            return tag
+
+        # Check if tag should be skipped (preserve emoji-style tags)
+        if tag.lower() in {t.lower() for t in self.underscore_skip_list}:
+            return tag
+
+        return tag.replace('_', ' ')
+
     # === Filtering Logic ===
 
     def should_keep_tag(self, tag: str, confidence: float, threshold: float) -> bool:
@@ -126,7 +230,7 @@ class TagFilterSettings:
             tags: List of tags to filter
 
         Returns:
-            Filtered list of tags
+            Filtered list of tags (with prefix tags prepended)
         """
         filtered_tags = []
 
@@ -139,9 +243,18 @@ class TagFilterSettings:
 
             # Apply replacement if exists
             if tag_lower in self.replace_dict:
-                filtered_tags.append(self.replace_dict[tag_lower])
+                final_tag = self.replace_dict[tag_lower]
             else:
-                filtered_tags.append(tag)
+                final_tag = tag
+
+            # Apply underscore replacement
+            final_tag = self.replace_underscore_in_tag(final_tag)
+
+            filtered_tags.append(final_tag)
+
+        # Prepend prefix tags
+        if self.prefix_tags:
+            filtered_tags = list(self.prefix_tags) + filtered_tags
 
         return filtered_tags
 
@@ -179,8 +292,18 @@ class TagFilterSettings:
 
             # Apply replacement if exists
             final_tag = self.replace_dict.get(tag_lower, tag)
+
+            # Apply underscore replacement
+            final_tag = self.replace_underscore_in_tag(final_tag)
+
             filtered_tags.append(final_tag)
             filtered_scores[final_tag] = confidence
+
+        # Prepend prefix tags (with confidence 1.0)
+        if self.prefix_tags:
+            prefix_scores = {tag: 1.0 for tag in self.prefix_tags}
+            filtered_tags = list(self.prefix_tags) + filtered_tags
+            filtered_scores = {**prefix_scores, **filtered_scores}
 
         return filtered_tags, filtered_scores
 
@@ -203,5 +326,7 @@ class TagFilterSettings:
         return {
             'remove_count': len(self.remove_list),
             'replace_count': len(self.replace_dict),
-            'keep_count': len(self.keep_list)
+            'keep_count': len(self.keep_list),
+            'prefix_count': len(self.prefix_tags),
+            'replace_underscores': self.replace_underscores
         }
