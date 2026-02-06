@@ -171,9 +171,43 @@ class InterrogationTab(QWidget):
         tag_filter_group = QGroupBox("Tag Filters")
         tag_filter_layout = QVBoxLayout()
 
-        # Create tab widget for the three filter types
+        # Create tab widget for the filter types
         self.tag_filter_tabs = QTabWidget()
         self.tag_filter_tabs.setMaximumHeight(300)
+
+        # === Prefix Filter Tab ===
+        prefix_tab = QWidget()
+        prefix_layout = QVBoxLayout(prefix_tab)
+
+        prefix_info = QLabel(
+            "Tags in this list will be prepended to ALL generated tag files.\n"
+            "Useful for adding trigger words or consistent tags."
+        )
+        prefix_info.setWordWrap(True)
+        prefix_info.setStyleSheet("QLabel { font-size: 9pt; color: #666; }")
+        prefix_layout.addWidget(prefix_info)
+
+        self.prefix_list = QListWidget()
+        self.prefix_list.setMaximumHeight(120)
+        prefix_layout.addWidget(self.prefix_list)
+
+        prefix_controls = QHBoxLayout()
+        self.prefix_input = QLineEdit()
+        self.prefix_input.setPlaceholderText("Tag to prepend...")
+        prefix_controls.addWidget(self.prefix_input)
+
+        add_prefix_btn = QPushButton("+")
+        add_prefix_btn.setMaximumWidth(30)
+        add_prefix_btn.clicked.connect(self._add_prefix_tag)
+        prefix_controls.addWidget(add_prefix_btn)
+
+        del_prefix_btn = QPushButton("-")
+        del_prefix_btn.setMaximumWidth(30)
+        del_prefix_btn.clicked.connect(self._delete_prefix_tag)
+        prefix_controls.addWidget(del_prefix_btn)
+
+        prefix_layout.addLayout(prefix_controls)
+        self.tag_filter_tabs.addTab(prefix_tab, "Prefix")
 
         # === Remove Filter Tab ===
         remove_tab = QWidget()
@@ -1003,10 +1037,17 @@ class InterrogationTab(QWidget):
 
     def _refresh_all_filters(self):
         """Refresh all filter displays."""
+        self._refresh_prefix_list()
         self._refresh_remove_list()
         self._refresh_replace_table()
         self._refresh_keep_list()
         self._refresh_filter_stats()
+
+    def _refresh_prefix_list(self):
+        """Refresh the prefix list display."""
+        self.prefix_list.clear()
+        for tag in self.tag_filters.get_prefix_tags():
+            self.prefix_list.addItem(tag)
 
     def _refresh_remove_list(self):
         """Refresh the remove list display."""
@@ -1034,10 +1075,26 @@ class InterrogationTab(QWidget):
         """Refresh the filter statistics display."""
         stats = self.tag_filters.get_statistics()
         self.filter_stats_label.setText(
-            f"Active: {stats['remove_count']} removed | "
+            f"Active: {stats['prefix_count']} prefix | "
+            f"{stats['remove_count']} removed | "
             f"{stats['replace_count']} replaced | "
             f"{stats['keep_count']} kept"
         )
+
+    def _add_prefix_tag(self):
+        """Add a tag to the prefix list."""
+        tag = self.prefix_input.text().strip()
+        if tag:
+            self.tag_filters.add_prefix_tag(tag)
+            self.prefix_input.clear()
+            self._refresh_all_filters()
+
+    def _delete_prefix_tag(self):
+        """Delete selected tag from prefix list."""
+        current_item = self.prefix_list.currentItem()
+        if current_item:
+            self.tag_filters.remove_prefix_tag(current_item.text())
+            self._refresh_all_filters()
 
     def _add_remove_tag(self):
         """Add a tag to the remove list."""
