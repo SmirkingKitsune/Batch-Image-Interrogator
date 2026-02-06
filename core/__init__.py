@@ -6,6 +6,8 @@ from .file_manager import FileManager
 from .base_interrogator import BaseInterrogator
 from .tag_filters import TagFilterSettings
 from .db_queue import DatabaseOperationQueue, QueuedOperation
+from .onnx_providers import ONNXProviderSettings, ProviderPreference
+from .model_cache import ModelCacheManager, ModelCacheInfo
 
 __all__ = [
     'InterrogationDatabase',
@@ -18,4 +20,8 @@ __all__ = [
     'FileManager',
     'BaseInterrogator',
     'TagFilterSettings',
+    'ONNXProviderSettings',
+    'ProviderPreference',
+    'ModelCacheManager',
+    'ModelCacheInfo',
 ]
