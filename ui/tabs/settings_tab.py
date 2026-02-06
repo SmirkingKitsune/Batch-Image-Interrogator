@@ -7,7 +7,6 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                              QSlider, QProgressBar, QMessageBox, QTextEdit,
                              QTabWidget, QListWidget, QListWidgetItem,
                              QTableWidget, QTableWidgetItem, QFrame)
-
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -234,7 +233,7 @@ class QueueStatusWidget(QWidget):
 
 
 class TagFilterWidget(QWidget):
-    """Widget for managing tag filters (remove, replace, keep)."""
+    """Widget for managing tag filters (remove, replace, keep, underscore replacement)."""
 
     def __init__(self, tag_filters: TagFilterSettings, parent=None):
         super().__init__(parent)
@@ -249,8 +248,165 @@ class TagFilterWidget(QWidget):
         self.stats_label = QLabel()
         layout.addWidget(self.stats_label)
 
+        # Underscore replacement option
+        underscore_layout = QHBoxLayout()
+        self.underscore_checkbox = QCheckBox("Replace underscores with spaces")
+        self.underscore_checkbox.setChecked(self.tag_filters.get_replace_underscores())
+        self.underscore_checkbox.setToolTip(
+            "Replace underscores with spaces in tags (e.g., 'long_hair' → 'long hair').\n"
+            "Emoji-style tags like ^_^ and o_o are preserved."
+        )
+        self.underscore_checkbox.stateChanged.connect(self._on_underscore_changed)
+        underscore_layout.addWidget(self.underscore_checkbox)
+        underscore_layout.addStretch()
+        layout.addLayout(underscore_layout)
+
+        # Tab widget for different filter types
+        self.tab_widget = QTabWidget()
+        layout.addWidget(self.tab_widget)
+
+        # Create tabs (Prefix tags moved to Interrogation tab)
+        self._create_remove_tab()
+        self._create_replace_tab()
+        self._create_keep_tab()
+
         # Load current filters
         self.refresh_all()
+
+    def _create_remove_tab(self):
+        """Create the Remove Tags tab."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Description
+        desc = QLabel("Tags added here will be removed from all outputs (blacklist).")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
+        layout.addWidget(desc)
+
+        # Input row
+        input_layout = QHBoxLayout()
+        self.remove_input = QLineEdit()
+        self.remove_input.setPlaceholderText("Enter tag to remove...")
+        self.remove_input.returnPressed.connect(self._add_remove_tag)
+        input_layout.addWidget(self.remove_input)
+
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self._add_remove_tag)
+        input_layout.addWidget(add_btn)
+        layout.addLayout(input_layout)
+
+        # List widget
+        self.remove_list = QListWidget()
+        layout.addWidget(self.remove_list)
+
+        # Button row
+        btn_layout = QHBoxLayout()
+        delete_btn = QPushButton("Delete Selected")
+        delete_btn.clicked.connect(self._delete_remove_tag)
+        btn_layout.addWidget(delete_btn)
+
+        clear_btn = QPushButton("Clear All")
+        clear_btn.clicked.connect(self._clear_remove_list)
+        btn_layout.addWidget(clear_btn)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.tab_widget.addTab(tab, "Remove Tags")
+
+    def _create_replace_tab(self):
+        """Create the Replace Tags tab."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Description
+        desc = QLabel("Replace tags with custom substitutions.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
+        layout.addWidget(desc)
+
+        # Input row
+        input_layout = QHBoxLayout()
+        self.replace_original_input = QLineEdit()
+        self.replace_original_input.setPlaceholderText("Original tag...")
+        input_layout.addWidget(self.replace_original_input)
+
+        input_layout.addWidget(QLabel("→"))
+
+        self.replace_new_input = QLineEdit()
+        self.replace_new_input.setPlaceholderText("Replacement...")
+        self.replace_new_input.returnPressed.connect(self._add_replace_rule)
+        input_layout.addWidget(self.replace_new_input)
+
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self._add_replace_rule)
+        input_layout.addWidget(add_btn)
+        layout.addLayout(input_layout)
+
+        # Table widget
+        self.replace_table = QTableWidget()
+        self.replace_table.setColumnCount(2)
+        self.replace_table.setHorizontalHeaderLabels(["Original", "Replacement"])
+        self.replace_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.replace_table)
+
+        # Button row
+        btn_layout = QHBoxLayout()
+        delete_btn = QPushButton("Delete Selected")
+        delete_btn.clicked.connect(self._delete_replace_rule)
+        btn_layout.addWidget(delete_btn)
+
+        clear_btn = QPushButton("Clear All")
+        clear_btn.clicked.connect(self._clear_replace_dict)
+        btn_layout.addWidget(clear_btn)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.tab_widget.addTab(tab, "Replace Tags")
+
+    def _create_keep_tab(self):
+        """Create the Keep Tags tab."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Description
+        desc = QLabel("Tags added here will always be included, even if below confidence threshold.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
+        layout.addWidget(desc)
+
+        # Input row
+        input_layout = QHBoxLayout()
+        self.keep_input = QLineEdit()
+        self.keep_input.setPlaceholderText("Enter tag to always keep...")
+        self.keep_input.returnPressed.connect(self._add_keep_tag)
+        input_layout.addWidget(self.keep_input)
+
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self._add_keep_tag)
+        input_layout.addWidget(add_btn)
+        layout.addLayout(input_layout)
+
+        # List widget
+        self.keep_list = QListWidget()
+        layout.addWidget(self.keep_list)
+
+        # Button row
+        btn_layout = QHBoxLayout()
+        delete_btn = QPushButton("Delete Selected")
+        delete_btn.clicked.connect(self._delete_keep_tag)
+        btn_layout.addWidget(delete_btn)
+
+        clear_btn = QPushButton("Clear All")
+        clear_btn.clicked.connect(self._clear_keep_list)
+        btn_layout.addWidget(clear_btn)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.tab_widget.addTab(tab, "Keep Tags")
 
     def refresh_all(self):
         """Refresh all filter displays."""
@@ -258,6 +414,8 @@ class TagFilterWidget(QWidget):
         self._refresh_replace_table()
         self._refresh_keep_list()
         self._refresh_stats()
+        # Update underscore checkbox state
+        self.underscore_checkbox.setChecked(self.tag_filters.get_replace_underscores())
 
     def _refresh_remove_list(self):
         """Refresh the remove list display."""
@@ -284,11 +442,21 @@ class TagFilterWidget(QWidget):
     def _refresh_stats(self):
         """Refresh the statistics display."""
         stats = self.tag_filters.get_statistics()
+        underscore_status = "ON" if stats['replace_underscores'] else "OFF"
         self.stats_label.setText(
             f"Active Filters: {stats['remove_count']} removed | "
             f"{stats['replace_count']} replaced | "
-            f"{stats['keep_count']} force-included"
+            f"{stats['keep_count']} force-included | "
+            f"Underscores: {underscore_status}"
         )
+
+    # === Underscore Replacement ===
+
+    def _on_underscore_changed(self, state: int):
+        """Handle underscore replacement checkbox change."""
+        enabled = state == Qt.CheckState.Checked.value
+        self.tag_filters.set_replace_underscores(enabled)
+        self._refresh_stats()
 
     # === Remove Filter Methods ===
 
@@ -667,6 +835,14 @@ class SettingsTab(QWidget):
 
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
+
+        # === Tag Filters ===
+        tag_filter_group = QGroupBox("Tag Filters")
+        tag_filter_layout = QVBoxLayout()
+        self.tag_filter_widget = TagFilterWidget(self.tag_filters)
+        tag_filter_layout.addWidget(self.tag_filter_widget)
+        tag_filter_group.setLayout(tag_filter_layout)
+        layout.addWidget(tag_filter_group)
 
         # === Model Manager (ONNX Providers) ===
         model_mgr_group = QGroupBox("Model Manager (ONNX Execution Providers)")
