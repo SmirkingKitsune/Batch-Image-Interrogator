@@ -113,13 +113,15 @@ def _select_first_valid_clip_model(clip_model_combo: QComboBox):
     clip_model_combo.setCurrentIndex(0)
 
 
-def create_clip_config_widget(clip_config: Dict, parent=None) -> tuple:
+def create_clip_config_widget(clip_config: Dict, parent=None, populate_models: bool = False) -> tuple:
     """
     Create CLIP configuration widget with all settings.
 
     Args:
         clip_config: Dictionary with CLIP configuration
         parent: Parent widget
+        populate_models: If True, populate model list immediately.
+                        If False, combo will be empty until populated later.
 
     Returns:
         Tuple of (widget, references_dict) where references_dict contains:
@@ -138,13 +140,21 @@ def create_clip_config_widget(clip_config: Dict, parent=None) -> tuple:
 
     # CLIP Model selection
     clip_model_combo = QComboBox()
-    _populate_clip_models_combo(clip_model_combo)
-    current_clip_model = clip_config.get('clip_model', 'ViT-L-14/openai')
-    index = clip_model_combo.findText(current_clip_model)
-    if index >= 0:
-        clip_model_combo.setCurrentIndex(index)
+
+    # Only populate if explicitly requested (deferred by default)
+    if populate_models:
+        _populate_clip_models_combo(clip_model_combo)
+        current_clip_model = clip_config.get('clip_model', 'ViT-L-14/openai')
+        index = clip_model_combo.findText(current_clip_model)
+        if index >= 0:
+            clip_model_combo.setCurrentIndex(index)
+        else:
+            _select_first_valid_clip_model(clip_model_combo)
     else:
-        _select_first_valid_clip_model(clip_model_combo)
+        # Add placeholder - will be populated later
+        clip_model_combo.addItem("Loading models...")
+        clip_model_combo.setEnabled(False)
+
     form_layout.addRow("CLIP Model:", clip_model_combo)
 
     # Caption Model selection
@@ -170,12 +180,44 @@ def create_clip_config_widget(clip_config: Dict, parent=None) -> tuple:
     clip_mode_combo.setCurrentText(current_mode)
     form_layout.addRow("Interrogation Mode:", clip_mode_combo)
 
-    # Device selection
+    # Device selection with auto-detection
+    from core.device_detector import get_device_detector
+    detector = get_device_detector()
+
     clip_device_combo = QComboBox()
-    clip_device_combo.addItems(['cuda', 'cpu'])
-    current_device = clip_config.get('device', 'cuda')
-    clip_device_combo.setCurrentText(current_device)
+
+    # Build device list based on PyTorch CUDA availability
+    pytorch_device = detector.get_pytorch_device()
+    if detector.is_pytorch_cuda_available():
+        clip_device_combo.addItem("CUDA (GPU)", "cuda")
+        clip_device_combo.addItem("CPU", "cpu")
+    else:
+        clip_device_combo.addItem("CPU (CUDA not available)", "cpu")
+        # Add disabled CUDA option to show it exists
+        clip_device_combo.addItem("CUDA (not available)", "cuda")
+        clip_device_combo.model().item(1).setEnabled(False)
+
+    # Set current device
+    current_device = clip_config.get('device', pytorch_device)
+    for i in range(clip_device_combo.count()):
+        if clip_device_combo.itemData(i) == current_device:
+            clip_device_combo.setCurrentIndex(i)
+            break
+
     form_layout.addRow("Device:", clip_device_combo)
+
+    # Add device status indicator
+    if detector.is_pytorch_cuda_available():
+        device_status_label = QLabel("✓ PyTorch CUDA available")
+        device_status_label.setStyleSheet("QLabel { color: green; }")
+    else:
+        device_status_label = QLabel("⚠ CUDA not available - using CPU")
+        device_status_label.setStyleSheet("QLabel { color: orange; }")
+        if detector.get_status()['pytorch_error']:
+            device_status_label.setToolTip(
+                f"Reason: {detector.get_status()['pytorch_error']}"
+            )
+    form_layout.addRow("", device_status_label)
 
     layout.addLayout(form_layout)
 
@@ -285,12 +327,44 @@ def create_wd_config_widget(wd_config: Dict, parent=None) -> tuple:
     threshold_spin.setValue(wd_config.get('threshold', 0.35))
     form_layout.addRow("Confidence Threshold:", threshold_spin)
 
-    # Device selection
+    # Device selection with auto-detection
+    from core.device_detector import get_device_detector
+    detector = get_device_detector()
+
     wd_device_combo = QComboBox()
-    wd_device_combo.addItems(['cuda', 'cpu'])
-    current_device = wd_config.get('device', 'cuda')
-    wd_device_combo.setCurrentText(current_device)
+
+    # Build device list based on ONNX Runtime CUDA availability
+    onnx_device = detector.get_onnx_device()
+    if detector.is_onnx_cuda_available():
+        wd_device_combo.addItem("CUDA (GPU)", "cuda")
+        wd_device_combo.addItem("CPU", "cpu")
+    else:
+        wd_device_combo.addItem("CPU (CUDA not available)", "cpu")
+        # Add disabled CUDA option to show it exists
+        wd_device_combo.addItem("CUDA (not available)", "cuda")
+        wd_device_combo.model().item(1).setEnabled(False)
+
+    # Set current device
+    current_device = wd_config.get('device', onnx_device)
+    for i in range(wd_device_combo.count()):
+        if wd_device_combo.itemData(i) == current_device:
+            wd_device_combo.setCurrentIndex(i)
+            break
+
     form_layout.addRow("Device:", wd_device_combo)
+
+    # Add device status indicator
+    if detector.is_onnx_cuda_available():
+        device_status_label = QLabel("✓ ONNX Runtime CUDA available")
+        device_status_label.setStyleSheet("QLabel { color: green; }")
+    else:
+        device_status_label = QLabel("⚠ CUDA not available - using CPU")
+        device_status_label.setStyleSheet("QLabel { color: orange; }")
+        if detector.get_status()['onnx_error']:
+            device_status_label.setToolTip(
+                f"Reason: {detector.get_status()['onnx_error']}"
+            )
+    form_layout.addRow("", device_status_label)
 
     layout.addLayout(form_layout)
 
@@ -398,12 +472,44 @@ def create_camie_config_widget(camie_config: Dict, parent=None) -> tuple:
     threshold_spin.setValue(camie_config.get('threshold', 0.5))
     form_layout.addRow("Base Threshold:", threshold_spin)
 
-    # Device selection
+    # Device selection with auto-detection
+    from core.device_detector import get_device_detector
+    detector = get_device_detector()
+
     camie_device_combo = QComboBox()
-    camie_device_combo.addItems(['cuda', 'cpu'])
-    current_device = camie_config.get('device', 'cuda')
-    camie_device_combo.setCurrentText(current_device)
+
+    # Build device list based on ONNX Runtime CUDA availability
+    onnx_device = detector.get_onnx_device()
+    if detector.is_onnx_cuda_available():
+        camie_device_combo.addItem("CUDA (GPU)", "cuda")
+        camie_device_combo.addItem("CPU", "cpu")
+    else:
+        camie_device_combo.addItem("CPU (CUDA not available)", "cpu")
+        # Add disabled CUDA option to show it exists
+        camie_device_combo.addItem("CUDA (not available)", "cuda")
+        camie_device_combo.model().item(1).setEnabled(False)
+
+    # Set current device
+    current_device = camie_config.get('device', onnx_device)
+    for i in range(camie_device_combo.count()):
+        if camie_device_combo.itemData(i) == current_device:
+            camie_device_combo.setCurrentIndex(i)
+            break
+
     form_layout.addRow("Device:", camie_device_combo)
+
+    # Add device status indicator
+    if detector.is_onnx_cuda_available():
+        device_status_label = QLabel("✓ ONNX Runtime CUDA available")
+        device_status_label.setStyleSheet("QLabel { color: green; }")
+    else:
+        device_status_label = QLabel("⚠ CUDA not available - using CPU")
+        device_status_label.setStyleSheet("QLabel { color: orange; }")
+        if detector.get_status()['onnx_error']:
+            device_status_label.setToolTip(
+                f"Reason: {detector.get_status()['onnx_error']}"
+            )
+    form_layout.addRow("", device_status_label)
 
     layout.addLayout(form_layout)
 
