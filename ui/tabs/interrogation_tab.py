@@ -133,8 +133,10 @@ class InterrogationTab(QWidget):
         # Create tabbed model config
         self.model_config_tabs = QTabWidget()
 
-        # CLIP tab
-        clip_widget, self.clip_config_refs = create_clip_config_widget(self.clip_config, self)
+        # CLIP tab (defer model list population)
+        clip_widget, self.clip_config_refs = create_clip_config_widget(
+            self.clip_config, self, populate_models=False
+        )
         self.model_config_tabs.addTab(clip_widget, "CLIP")
 
         # WD tab
@@ -662,19 +664,37 @@ class InterrogationTab(QWidget):
                 clip_model = self.clip_config_refs['clip_model_combo'].currentText()
                 clip_model = clip_model.replace(' (Default)', '').replace(' (SDXL Default)', '')
 
+            # Extract device from combo box data (not text)
+            device_combo = self.clip_config_refs['device_combo']
+            device_idx = device_combo.currentIndex()
+            device = device_combo.itemData(device_idx)
+            if device is None:
+                # Fallback: parse from text
+                device_text = device_combo.currentText().lower()
+                device = 'cuda' if 'cuda' in device_text else 'cpu'
+
             return {
                 'type': 'CLIP',
                 'clip_model': clip_model,
                 'caption_model': None if caption_model == 'None' else caption_model,
                 'mode': self.clip_config_refs['mode_combo'].currentText(),
-                'device': self.clip_config_refs['device_combo'].currentText()
+                'device': device
             }
         elif current_tab_index == 1:  # WD tab
+            # Extract device from combo box data (not text)
+            device_combo = self.wd_config_refs['device_combo']
+            device_idx = device_combo.currentIndex()
+            device = device_combo.itemData(device_idx)
+            if device is None:
+                # Fallback: parse from text
+                device_text = device_combo.currentText().lower()
+                device = 'cuda' if 'cuda' in device_text else 'cpu'
+
             return {
                 'type': 'WD',
                 'wd_model': self.wd_config_refs['wd_model_combo'].currentText(),
                 'threshold': self.wd_config_refs['threshold_spin'].value(),
-                'device': self.wd_config_refs['device_combo'].currentText()
+                'device': device
             }
         else:  # Camie tab (index 2)
             # Get enabled categories from checkboxes
@@ -692,12 +712,21 @@ class InterrogationTab(QWidget):
                     for cat, spin in self.camie_config_refs['category_threshold_spins'].items()
                 }
 
+            # Extract device from combo box data (not text)
+            device_combo = self.camie_config_refs['device_combo']
+            device_idx = device_combo.currentIndex()
+            device = device_combo.itemData(device_idx)
+            if device is None:
+                # Fallback: parse from text
+                device_text = device_combo.currentText().lower()
+                device = 'cuda' if 'cuda' in device_text else 'cpu'
+
             return {
                 'type': 'Camie',
                 'camie_model': self.camie_config_refs['camie_model_combo'].currentText(),
                 'threshold': self.camie_config_refs['threshold_spin'].value(),
                 'threshold_profile': threshold_profile,
-                'device': self.camie_config_refs['device_combo'].currentText(),
+                'device': device,
                 'category_thresholds': category_thresholds,
                 'enabled_categories': enabled_categories
             }
