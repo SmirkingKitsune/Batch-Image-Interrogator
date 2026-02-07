@@ -98,6 +98,19 @@ class CamieInterrogator(BaseInterrogator):
             provider_settings: ONNXProviderSettings instance for provider configuration
             **kwargs: Additional configuration
         """
+        # Auto-detect and validate device
+        from core.device_detector import get_device_detector
+        detector = get_device_detector()
+
+        # If CUDA requested but not available, fall back to CPU
+        if device == 'cuda' and not detector.is_onnx_cuda_available():
+            import logging
+            logging.warning(
+                f"CUDA requested but ONNX Runtime CUDA not available. "
+                f"Falling back to CPU."
+            )
+            device = 'cpu'
+
         self.threshold = threshold
         self.threshold_profile = threshold_profile
         self.enabled_categories = enabled_categories or list(self.CATEGORIES)
@@ -149,6 +162,9 @@ class CamieInterrogator(BaseInterrogator):
                 self.model = ort.InferenceSession(model_path, providers=providers)
 
             self.is_loaded = True
+
+            import logging
+            logging.info(f"Camie model loaded successfully on {device}")
 
         except ImportError as e:
             raise ImportError(
