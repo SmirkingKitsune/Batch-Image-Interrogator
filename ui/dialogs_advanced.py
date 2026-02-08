@@ -1266,22 +1266,51 @@ class AdvancedImageInspectionDialog(QDialog):
         failed_paths = []
         saved_results = []  # Collect results for batch signal
 
+        # Build normalized sets for removal/addition to handle underscore variants
+        # e.g., removing canonical "long_hair" should also remove "long hair" from files
+        tags_to_remove_normalized = set()
+        tags_to_add_normalized = set()
+        for tag in tags_to_remove:
+            if self.tag_filters:
+                tags_to_remove_normalized.add(self.tag_filters.normalize_tag_for_comparison(tag))
+            else:
+                tags_to_remove_normalized.add(tag.lower())
+        for tag in tags_to_add:
+            if self.tag_filters:
+                tags_to_add_normalized.add(self.tag_filters.normalize_tag_for_comparison(tag))
+            else:
+                tags_to_add_normalized.add(tag.lower())
+
         # Update each image's tags
         for image_path in self.selected_images:
             try:
                 # Read current tags from file
                 current_tags = FileManager.read_tags_from_file(Path(image_path))
-                current_set = set(current_tags)
 
-                # Apply changes: remove unchecked common tags, add any new ones
-                new_set = (current_set - tags_to_remove) | tags_to_add
+                # Filter out tags that match removal set (using normalized comparison)
+                new_tags = []
+                current_normalized = set()
+                for tag in current_tags:
+                    if self.tag_filters:
+                        tag_normalized = self.tag_filters.normalize_tag_for_comparison(tag)
+                    else:
+                        tag_normalized = tag.lower()
 
-                # Preserve original order for tags that weren't changed,
-                # append any new tags at the end
-                new_tags = [t for t in current_tags if t in new_set]
-                for t in tags_to_add:
-                    if t not in new_tags:
-                        new_tags.append(t)
+                    # Keep tag if it's not in the removal set
+                    if tag_normalized not in tags_to_remove_normalized:
+                        new_tags.append(tag)
+                        current_normalized.add(tag_normalized)
+
+                # Add any new tags (if their normalized form isn't already present)
+                for tag in tags_to_add:
+                    if self.tag_filters:
+                        tag_normalized = self.tag_filters.normalize_tag_for_comparison(tag)
+                    else:
+                        tag_normalized = tag.lower()
+
+                    if tag_normalized not in current_normalized:
+                        new_tags.append(tag)
+                        current_normalized.add(tag_normalized)
 
                 # Write back
                 FileManager.write_tags_to_file(
