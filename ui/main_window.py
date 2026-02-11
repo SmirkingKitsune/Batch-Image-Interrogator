@@ -8,7 +8,7 @@ from PyQt6.QtGui import QAction
 from pathlib import Path
 from typing import Optional, Dict
 
-from core import InterrogationDatabase, TagFilterSettings, ONNXProviderSettings
+from core import InterrogationDatabase, FileManager, TagFilterSettings, ONNXProviderSettings
 from ui.tabs import InterrogationTab, GalleryTab, SettingsTab
 from ui.dialogs_database import DatabaseBusyDialog, QueueProcessingDialog
 from ui.workers import DatabaseQueueWorker
@@ -20,21 +20,12 @@ class MainWindow(QMainWindow):
     # Internal signal for thread-safe dialog display
     _database_busy = pyqtSignal(str, dict, int)  # operation, params, retry_count
 
-    def __init__(self, device_status: Optional[Dict] = None):
+    def __init__(self):
         super().__init__()
         self.setWindowTitle("Image Interrogator - Batch Tagging Tool")
         self.setGeometry(100, 100, 1600, 900)
         self.setMinimumSize(1024, 600)
-
-        # Store device status
-        self.device_status = device_status or {}
-
-        # Auto-detect default device based on availability
-        from core.device_detector import get_device_detector
-        detector = get_device_detector()
-        default_pytorch_device = detector.get_pytorch_device()
-        default_onnx_device = detector.get_onnx_device()
-
+        
         # Core components
         self.database = InterrogationDatabase()
         self.tag_filters = TagFilterSettings()
@@ -53,23 +44,23 @@ class MainWindow(QMainWindow):
         self._busy_response_event = threading.Event()
         self._busy_response_value = "abort"
 
-        # Model configs with AUTO-DETECTED device
+        # Model configs
         self.clip_config = {
             'clip_model': 'ViT-L-14/openai',
             'caption_model': None,
             'mode': 'best',
-            'device': default_pytorch_device  # AUTO-DETECTED
+            'device': 'cuda'
         }
         self.wd_config = {
             'wd_model': 'SmilingWolf/wd-v1-4-moat-tagger-v2',
             'threshold': 0.35,
-            'device': default_onnx_device  # AUTO-DETECTED
+            'device': 'cuda'
         }
         self.camie_config = {
             'camie_model': 'Camais03/camie-tagger-v2',
             'threshold': 0.5,
             'threshold_profile': 'overall',
-            'device': default_onnx_device,  # AUTO-DETECTED
+            'device': 'cuda',
             'enabled_categories': ['general', 'character', 'copyright', 'artist', 'meta', 'rating', 'year']
         }
 
@@ -83,70 +74,7 @@ class MainWindow(QMainWindow):
 
         # Check for pending queue operations after UI is ready
         QTimer.singleShot(1000, self._check_startup_queue)
-
-    def populate_model_lists(self):
-        """
-        Populate model dropdown lists with available models.
-
-        This is called AFTER the window is shown to avoid blocking UI initialization
-        and to prevent CUDA initialization conflicts.
-
-        Called via QTimer.singleShot() from main.py after window.show().
-        """
-        try:
-            self.statusBar().showMessage("Loading model lists...")
-
-            # Get reference to CLIP model combo box
-            clip_combo = self.interrogation_tab.clip_config_refs['clip_model_combo']
-
-            # Clear placeholder
-            clip_combo.clear()
-            clip_combo.addItem("Loading...")
-            clip_combo.setEnabled(False)
-
-            # Force UI update to show loading state
-            from PyQt6.QtWidgets import QApplication as QApp
-            QApp.processEvents()
-
-            # Populate CLIP models (this triggers open_clip import)
-            from ui.dialogs import _populate_clip_models_combo
-            clip_combo.clear()
-            _populate_clip_models_combo(clip_combo)
-
-            # Restore selected CLIP model
-            current_clip_model = self.clip_config.get('clip_model', 'ViT-L-14/openai')
-            index = clip_combo.findText(current_clip_model)
-            if index >= 0:
-                clip_combo.setCurrentIndex(index)
-            else:
-                # Select first valid model
-                from ui.dialogs import _select_first_valid_clip_model
-                _select_first_valid_clip_model(clip_combo)
-
-            # Enable combo box
-            clip_combo.setEnabled(True)
-            self.statusBar().showMessage("✓ Model lists loaded successfully", 3000)
-
-        except Exception as e:
-            import logging
-            logging.error(f"Error populating model lists: {e}")
-
-            # Show error in status bar
-            self.statusBar().showMessage(
-                f"⚠ Warning: Could not load CLIP models - {str(e)}",
-                10000
-            )
-
-            # Re-enable combo box with fallback list
-            clip_combo.setEnabled(True)
-            if clip_combo.count() == 0:
-                # Add minimal fallback list
-                clip_combo.addItems([
-                    'ViT-L-14/openai',
-                    'ViT-H-14/laion2b_s32b_b79k',
-                    'ViT-B-32/openai'
-                ])
-
+    
     def setup_ui(self):
         """Setup the main UI with tabs."""
         # Central widget
@@ -375,6 +303,9 @@ class MainWindow(QMainWindow):
             lambda: self._on_interrogation_finished()
         )
 
+        # Per-image gallery update during batch
+        self.interrogation_tab.image_result_ready.connect(self._on_image_interrogated)
+
         # === Tag Editing ===
         # Update stats when tags are saved in gallery
         self.gallery_tab.tags_saved.connect(
@@ -394,6 +325,11 @@ class MainWindow(QMainWindow):
         self.background_indicator.setText("⏳ Interrogating...")
         self.statusBar().showMessage("Batch interrogation started...")
 
+    def _on_image_interrogated(self, image_path: str):
+        """Handle per-image gallery update during batch interrogation."""
+        has_tags = FileManager.has_text_file(Path(image_path))
+        self.gallery_tab.image_gallery.update_image_status(image_path, has_tags)
+
     def _on_interrogation_finished(self):
         """Handle interrogation completion across tabs."""
         # Hide background process indicator
@@ -402,8 +338,9 @@ class MainWindow(QMainWindow):
         # Update database stats in Settings tab
         self.settings_tab.update_stats()
 
-        # Refresh gallery to show updated tag status
-        self.gallery_tab.refresh_gallery()
+        # Refresh tag filter sidebar (skip full gallery re-scan since individual
+        # images were already updated during the batch via _on_image_interrogated)
+        self.gallery_tab._update_tag_filter()
 
         # Update status bar
         self.statusBar().showMessage("Batch interrogation complete", 5000)
