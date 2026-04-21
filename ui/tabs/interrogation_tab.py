@@ -29,6 +29,7 @@ class InterrogationTab(QWidget):
     model_unloaded = pyqtSignal()
     interrogation_started = pyqtSignal()
     interrogation_finished = pyqtSignal()
+    image_result_ready = pyqtSignal(str)  # image_path - emitted after each result for gallery updates
 
     def __init__(self, database, clip_config: Dict, wd_config: Dict,
                  camie_config: Dict, tag_filters, provider_settings=None, parent=None):
@@ -64,6 +65,13 @@ class InterrogationTab(QWidget):
 
         # Track all discovered tags during batch interrogation
         self.all_discovered_tags = {}  # tag -> (confidence, count)
+
+        # Throttle discovered tags table rebuild (250ms debounce)
+        self._tags_display_dirty = False
+        self._tags_display_timer = QTimer(self)
+        self._tags_display_timer.setSingleShot(True)
+        self._tags_display_timer.setInterval(250)
+        self._tags_display_timer.timeout.connect(self._flush_discovered_tags_display)
 
         # Widget references (will be set in setup_ui)
         self.clip_config_refs = None
@@ -844,6 +852,12 @@ class InterrogationTab(QWidget):
         self.cancel_button.setEnabled(True)
         self.progress_bar.setMaximum(len(images))
 
+        # Build path-to-index lookup for O(1) queue item updates
+        self._queue_path_to_index = {
+            self.image_queue.item(i).data(Qt.ItemDataRole.UserRole): i
+            for i in range(self.image_queue.count())
+        }
+
         # Emit signal
         self.interrogation_started.emit()
 
@@ -887,12 +901,12 @@ class InterrogationTab(QWidget):
         """Handle interrogation result."""
         import json as json_module
 
-        # Update queue status
-        for i in range(self.image_queue.count()):
-            item = self.image_queue.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == image_path:
+        # Update queue status via O(1) dict lookup
+        idx = self._queue_path_to_index.get(image_path)
+        if idx is not None:
+            item = self.image_queue.item(idx)
+            if item:
                 item.setText(f"✓ {Path(image_path).name}")
-                break
 
         # Accumulate discovered tags from all images
         tags = results.get('tags', [])
@@ -932,8 +946,13 @@ class InterrogationTab(QWidget):
             else:
                 self.all_discovered_tags[tag] = (conf, 1, category)
 
-        # Update the discovered tags table with all accumulated tags
-        self._update_discovered_tags_display()
+        # Schedule throttled update of the discovered tags table
+        self._tags_display_dirty = True
+        if not self._tags_display_timer.isActive():
+            self._tags_display_timer.start()
+
+        # Notify gallery of completed result
+        self.image_result_ready.emit(image_path)
 
     def _update_discovered_tags_display(self):
         """Update the discovered tags table with accumulated tags."""
@@ -987,17 +1006,28 @@ class InterrogationTab(QWidget):
                 conf_text = f"{conf:.2f}" if conf > 0 else "N/A"
                 self.discovered_tags_table.setItem(row, 1, QTableWidgetItem(conf_text))
 
+    def _flush_discovered_tags_display(self):
+        """Flush pending discovered tags display update (called by throttle timer)."""
+        if self._tags_display_dirty:
+            self._tags_display_dirty = False
+            self._update_discovered_tags_display()
+
     def on_interrogation_error(self, image_path: str, error: str):
         """Handle interrogation error."""
-        # Update queue status
-        for i in range(self.image_queue.count()):
-            item = self.image_queue.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == image_path:
+        # Update queue status via O(1) dict lookup
+        idx = self._queue_path_to_index.get(image_path)
+        if idx is not None:
+            item = self.image_queue.item(idx)
+            if item:
                 item.setText(f"✗ {Path(image_path).name}")
-                break
 
     def on_interrogation_finished(self):
         """Handle interrogation completion."""
+        # Flush any pending discovered tags update
+        self._tags_display_timer.stop()
+        self._tags_display_dirty = False
+        self._update_discovered_tags_display()
+
         self.progress_label.setText("Batch interrogation complete")
         self.batch_interrogate_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
