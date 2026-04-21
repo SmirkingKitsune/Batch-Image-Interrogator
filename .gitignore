@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+
+# Test/cache artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local runtime/generated data
+cache/
+interrogations.db
+*.log
+1.16.0
+onnx_provider_settings.json
+tag_filters.json
+
+# Local tooling/editor state
+.claude/
+
+# OS noise
+.DS_Store
+Thumbs.db

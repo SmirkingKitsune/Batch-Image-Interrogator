@@ -774,11 +774,13 @@ class GalleryTab(QWidget):
     def _open_advanced_inspection(self, image_path: str):
         """Open the advanced image inspection dialog."""
         try:
+            llama_config = self._get_llama_config()
             dialog = AdvancedImageInspectionDialog(
                 image_path=image_path,
                 image_list=self.filtered_images,  # For navigation
                 database=self.database,
                 tag_filters=None,  # Optional - not passed from gallery
+                llama_config=llama_config,
                 parent=self
             )
             # Connect signal to refresh gallery when tags are saved
@@ -859,11 +861,13 @@ class GalleryTab(QWidget):
             return
 
         try:
+            llama_config = self._get_llama_config()
             dialog = AdvancedImageInspectionDialog(
                 image_path=image_paths,  # Pass list for multi-mode
                 image_list=self.filtered_images,
                 database=self.database,
                 tag_filters=None,
+                llama_config=llama_config,
                 parent=self
             )
             # Connect signals to refresh gallery when tags are saved
@@ -893,3 +897,14 @@ class GalleryTab(QWidget):
                 if self.current_image == image_path:
                     self.refresh_current_image()
                     break
+
+    def _get_llama_config(self) -> Optional[Dict]:
+        """Resolve latest llama.cpp config from parent window when available."""
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "inquiry_tab") and hasattr(parent.inquiry_tab, "get_llama_config"):
+                return parent.inquiry_tab.get_llama_config()
+            if hasattr(parent, "interrogation_tab") and hasattr(parent.interrogation_tab, "_get_llama_config_from_parent"):
+                return parent.interrogation_tab._get_llama_config_from_parent()
+            parent = parent.parent()
+        return None

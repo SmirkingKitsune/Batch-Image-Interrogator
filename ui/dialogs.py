@@ -5,7 +5,8 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QComboBox, QDoubleSpinBox, QPushButton,
                              QFormLayout, QGroupBox, QCheckBox, QLineEdit,
                              QTabWidget, QWidget, QProgressBar, QMessageBox,
-                             QListWidget, QListWidgetItem, QScrollArea)
+                             QListWidget, QListWidgetItem, QScrollArea,
+                             QFileDialog, QSpinBox)
 from PyQt6.QtCore import Qt
 from typing import Dict
 from pathlib import Path
@@ -113,13 +114,15 @@ def _select_first_valid_clip_model(clip_model_combo: QComboBox):
     clip_model_combo.setCurrentIndex(0)
 
 
-def create_clip_config_widget(clip_config: Dict, parent=None) -> tuple:
+def create_clip_config_widget(clip_config: Dict, parent=None, populate_models: bool = False) -> tuple:
     """
     Create CLIP configuration widget with all settings.
 
     Args:
         clip_config: Dictionary with CLIP configuration
         parent: Parent widget
+        populate_models: If True, populate model list immediately.
+                        If False, combo will be empty until populated later.
 
     Returns:
         Tuple of (widget, references_dict) where references_dict contains:
@@ -138,13 +141,21 @@ def create_clip_config_widget(clip_config: Dict, parent=None) -> tuple:
 
     # CLIP Model selection
     clip_model_combo = QComboBox()
-    _populate_clip_models_combo(clip_model_combo)
-    current_clip_model = clip_config.get('clip_model', 'ViT-L-14/openai')
-    index = clip_model_combo.findText(current_clip_model)
-    if index >= 0:
-        clip_model_combo.setCurrentIndex(index)
+
+    # Only populate if explicitly requested (deferred by default)
+    if populate_models:
+        _populate_clip_models_combo(clip_model_combo)
+        current_clip_model = clip_config.get('clip_model', 'ViT-L-14/openai')
+        index = clip_model_combo.findText(current_clip_model)
+        if index >= 0:
+            clip_model_combo.setCurrentIndex(index)
+        else:
+            _select_first_valid_clip_model(clip_model_combo)
     else:
-        _select_first_valid_clip_model(clip_model_combo)
+        # Add placeholder - will be populated later
+        clip_model_combo.addItem("Loading models...")
+        clip_model_combo.setEnabled(False)
+
     form_layout.addRow("CLIP Model:", clip_model_combo)
 
     # Caption Model selection
@@ -170,12 +181,44 @@ def create_clip_config_widget(clip_config: Dict, parent=None) -> tuple:
     clip_mode_combo.setCurrentText(current_mode)
     form_layout.addRow("Interrogation Mode:", clip_mode_combo)
 
-    # Device selection
+    # Device selection with auto-detection
+    from core.device_detector import get_device_detector
+    detector = get_device_detector()
+
     clip_device_combo = QComboBox()
-    clip_device_combo.addItems(['cuda', 'cpu'])
-    current_device = clip_config.get('device', 'cuda')
-    clip_device_combo.setCurrentText(current_device)
+
+    # Build device list based on PyTorch CUDA availability
+    pytorch_device = detector.get_pytorch_device()
+    if detector.is_pytorch_cuda_available():
+        clip_device_combo.addItem("CUDA (GPU)", "cuda")
+        clip_device_combo.addItem("CPU", "cpu")
+    else:
+        clip_device_combo.addItem("CPU (CUDA not available)", "cpu")
+        # Add disabled CUDA option to show it exists
+        clip_device_combo.addItem("CUDA (not available)", "cuda")
+        clip_device_combo.model().item(1).setEnabled(False)
+
+    # Set current device
+    current_device = clip_config.get('device', pytorch_device)
+    for i in range(clip_device_combo.count()):
+        if clip_device_combo.itemData(i) == current_device:
+            clip_device_combo.setCurrentIndex(i)
+            break
+
     form_layout.addRow("Device:", clip_device_combo)
+
+    # Add device status indicator
+    if detector.is_pytorch_cuda_available():
+        device_status_label = QLabel("✓ PyTorch CUDA available")
+        device_status_label.setStyleSheet("QLabel { color: green; }")
+    else:
+        device_status_label = QLabel("⚠ CUDA not available - using CPU")
+        device_status_label.setStyleSheet("QLabel { color: orange; }")
+        if detector.get_status()['pytorch_error']:
+            device_status_label.setToolTip(
+                f"Reason: {detector.get_status()['pytorch_error']}"
+            )
+    form_layout.addRow("", device_status_label)
 
     layout.addLayout(form_layout)
 
@@ -285,12 +328,44 @@ def create_wd_config_widget(wd_config: Dict, parent=None) -> tuple:
     threshold_spin.setValue(wd_config.get('threshold', 0.35))
     form_layout.addRow("Confidence Threshold:", threshold_spin)
 
-    # Device selection
+    # Device selection with auto-detection
+    from core.device_detector import get_device_detector
+    detector = get_device_detector()
+
     wd_device_combo = QComboBox()
-    wd_device_combo.addItems(['cuda', 'cpu'])
-    current_device = wd_config.get('device', 'cuda')
-    wd_device_combo.setCurrentText(current_device)
+
+    # Build device list based on ONNX Runtime CUDA availability
+    onnx_device = detector.get_onnx_device()
+    if detector.is_onnx_cuda_available():
+        wd_device_combo.addItem("CUDA (GPU)", "cuda")
+        wd_device_combo.addItem("CPU", "cpu")
+    else:
+        wd_device_combo.addItem("CPU (CUDA not available)", "cpu")
+        # Add disabled CUDA option to show it exists
+        wd_device_combo.addItem("CUDA (not available)", "cuda")
+        wd_device_combo.model().item(1).setEnabled(False)
+
+    # Set current device
+    current_device = wd_config.get('device', onnx_device)
+    for i in range(wd_device_combo.count()):
+        if wd_device_combo.itemData(i) == current_device:
+            wd_device_combo.setCurrentIndex(i)
+            break
+
     form_layout.addRow("Device:", wd_device_combo)
+
+    # Add device status indicator
+    if detector.is_onnx_cuda_available():
+        device_status_label = QLabel("✓ ONNX Runtime CUDA available")
+        device_status_label.setStyleSheet("QLabel { color: green; }")
+    else:
+        device_status_label = QLabel("⚠ CUDA not available - using CPU")
+        device_status_label.setStyleSheet("QLabel { color: orange; }")
+        if detector.get_status()['onnx_error']:
+            device_status_label.setToolTip(
+                f"Reason: {detector.get_status()['onnx_error']}"
+            )
+    form_layout.addRow("", device_status_label)
 
     layout.addLayout(form_layout)
 
@@ -398,12 +473,44 @@ def create_camie_config_widget(camie_config: Dict, parent=None) -> tuple:
     threshold_spin.setValue(camie_config.get('threshold', 0.5))
     form_layout.addRow("Base Threshold:", threshold_spin)
 
-    # Device selection
+    # Device selection with auto-detection
+    from core.device_detector import get_device_detector
+    detector = get_device_detector()
+
     camie_device_combo = QComboBox()
-    camie_device_combo.addItems(['cuda', 'cpu'])
-    current_device = camie_config.get('device', 'cuda')
-    camie_device_combo.setCurrentText(current_device)
+
+    # Build device list based on ONNX Runtime CUDA availability
+    onnx_device = detector.get_onnx_device()
+    if detector.is_onnx_cuda_available():
+        camie_device_combo.addItem("CUDA (GPU)", "cuda")
+        camie_device_combo.addItem("CPU", "cpu")
+    else:
+        camie_device_combo.addItem("CPU (CUDA not available)", "cpu")
+        # Add disabled CUDA option to show it exists
+        camie_device_combo.addItem("CUDA (not available)", "cuda")
+        camie_device_combo.model().item(1).setEnabled(False)
+
+    # Set current device
+    current_device = camie_config.get('device', onnx_device)
+    for i in range(camie_device_combo.count()):
+        if camie_device_combo.itemData(i) == current_device:
+            camie_device_combo.setCurrentIndex(i)
+            break
+
     form_layout.addRow("Device:", camie_device_combo)
+
+    # Add device status indicator
+    if detector.is_onnx_cuda_available():
+        device_status_label = QLabel("✓ ONNX Runtime CUDA available")
+        device_status_label.setStyleSheet("QLabel { color: green; }")
+    else:
+        device_status_label = QLabel("⚠ CUDA not available - using CPU")
+        device_status_label.setStyleSheet("QLabel { color: orange; }")
+        if detector.get_status()['onnx_error']:
+            device_status_label.setToolTip(
+                f"Reason: {detector.get_status()['onnx_error']}"
+            )
+    form_layout.addRow("", device_status_label)
 
     layout.addLayout(form_layout)
 
@@ -510,6 +617,167 @@ def create_camie_config_widget(camie_config: Dict, parent=None) -> tuple:
         'category_thresholds_group': category_thresholds_group
     }
 
+    return widget, references
+
+
+def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
+    """
+    Create llama.cpp multimodal configuration widget.
+
+    Returns:
+        Tuple of (widget, references_dict) where references_dict contains:
+        {
+            'binary_path_edit': QLineEdit,
+            'model_path_edit': QLineEdit,
+            'mmproj_path_edit': QLineEdit,
+            'ctx_size_spin': QSpinBox,
+            'gpu_layers_spin': QSpinBox,
+            'temperature_spin': QDoubleSpinBox,
+            'max_tokens_spin': QSpinBox,
+            'server_port_spin': QSpinBox,
+            'include_prior_tables_check': QCheckBox,
+            'carry_batch_context_check': QCheckBox,
+            'include_clip_check': QCheckBox,
+            'include_wd_check': QCheckBox,
+            'include_camie_check': QCheckBox
+        }
+    """
+    widget = QWidget(parent)
+    layout = QVBoxLayout(widget)
+    form_layout = QFormLayout()
+
+    def _browse_path(line_edit: QLineEdit, title: str):
+        path, _ = QFileDialog.getOpenFileName(parent, title, str(Path.home()))
+        if path:
+            line_edit.setText(path)
+
+    binary_path_edit = QLineEdit(llama_config.get("llama_binary_path", ""))
+    binary_layout = QHBoxLayout()
+    binary_layout.addWidget(binary_path_edit)
+    binary_btn = QPushButton("Browse...")
+    binary_btn.clicked.connect(
+        lambda: _browse_path(binary_path_edit, "Select llama-server binary")
+    )
+    binary_layout.addWidget(binary_btn)
+    binary_widget = QWidget()
+    binary_widget.setLayout(binary_layout)
+    form_layout.addRow("llama-server Path:", binary_widget)
+
+    model_path_edit = QLineEdit(llama_config.get("llama_model_path", ""))
+    model_layout = QHBoxLayout()
+    model_layout.addWidget(model_path_edit)
+    model_btn = QPushButton("Browse...")
+    model_btn.clicked.connect(
+        lambda: _browse_path(model_path_edit, "Select multimodal GGUF model")
+    )
+    model_layout.addWidget(model_btn)
+    model_widget = QWidget()
+    model_widget.setLayout(model_layout)
+    form_layout.addRow("Model Path (required):", model_widget)
+
+    mmproj_path_edit = QLineEdit(llama_config.get("llama_mmproj_path", "") or "")
+    mmproj_layout = QHBoxLayout()
+    mmproj_layout.addWidget(mmproj_path_edit)
+    mmproj_btn = QPushButton("Browse...")
+    mmproj_btn.clicked.connect(
+        lambda: _browse_path(mmproj_path_edit, "Select multimodal projector (optional)")
+    )
+    mmproj_layout.addWidget(mmproj_btn)
+    mmproj_widget = QWidget()
+    mmproj_widget.setLayout(mmproj_layout)
+    form_layout.addRow("MMProj Path (optional):", mmproj_widget)
+
+    ctx_size_spin = QSpinBox()
+    ctx_size_spin.setRange(256, 131072)
+    ctx_size_spin.setSingleStep(512)
+    ctx_size_spin.setValue(int(llama_config.get("ctx_size", 8192)))
+    form_layout.addRow("Context Size:", ctx_size_spin)
+
+    gpu_layers_spin = QSpinBox()
+    gpu_layers_spin.setRange(-1, 999)
+    gpu_layers_spin.setValue(int(llama_config.get("gpu_layers", -1)))
+    form_layout.addRow("GPU Layers:", gpu_layers_spin)
+
+    temperature_spin = QDoubleSpinBox()
+    temperature_spin.setRange(0.0, 2.0)
+    temperature_spin.setSingleStep(0.05)
+    temperature_spin.setDecimals(2)
+    temperature_spin.setValue(float(llama_config.get("temperature", 0.2)))
+    form_layout.addRow("Temperature:", temperature_spin)
+
+    max_tokens_spin = QSpinBox()
+    max_tokens_spin.setRange(16, 8192)
+    max_tokens_spin.setSingleStep(32)
+    max_tokens_spin.setValue(int(llama_config.get("max_tokens", 512)))
+    form_layout.addRow("Max Tokens:", max_tokens_spin)
+
+    server_port_spin = QSpinBox()
+    server_port_spin.setRange(1024, 65535)
+    server_port_spin.setValue(int(llama_config.get("server_port", 8080)))
+    form_layout.addRow("Server Port:", server_port_spin)
+
+    layout.addLayout(form_layout)
+
+    options_group = QGroupBox("Batch Context Options")
+    options_layout = QVBoxLayout()
+
+    include_prior_tables_check = QCheckBox("Include prior interrogation tables in submissions")
+    include_prior_tables_check.setChecked(bool(llama_config.get("include_prior_tables", False)))
+    options_layout.addWidget(include_prior_tables_check)
+
+    carry_batch_context_check = QCheckBox("Carry context across batch images (off by default)")
+    carry_batch_context_check.setChecked(bool(llama_config.get("carry_batch_context", False)))
+    options_layout.addWidget(carry_batch_context_check)
+
+    include_types_label = QLabel("Manual inclusion by prior model type:")
+    options_layout.addWidget(include_types_label)
+
+    include_clip_check = QCheckBox("CLIP")
+    include_wd_check = QCheckBox("WD")
+    include_camie_check = QCheckBox("Camie")
+    included_types = set(llama_config.get("included_model_types", ["CLIP", "WD", "Camie"]))
+    include_clip_check.setChecked("CLIP" in included_types)
+    include_wd_check.setChecked("WD" in included_types)
+    include_camie_check.setChecked("Camie" in included_types)
+
+    type_row = QHBoxLayout()
+    type_row.addWidget(include_clip_check)
+    type_row.addWidget(include_wd_check)
+    type_row.addWidget(include_camie_check)
+    type_row.addStretch()
+    options_layout.addLayout(type_row)
+
+    options_group.setLayout(options_layout)
+    layout.addWidget(options_group)
+
+    desc_group = QGroupBox("llama.cpp Notes")
+    desc_layout = QVBoxLayout()
+    desc_layout.addWidget(QLabel(
+        "Use CUDA-capable binaries from ggml-org/llama.cpp GitHub releases.\n"
+        "Package manager builds (brew/nix/winget) may not include CUDA support.\n"
+        "setup.sh/setup.bat auto-downloads llama-server to cache/llama_cpp/bin when missing.\n"
+        "Model path is required; mmproj path is optional and model-dependent."
+    ))
+    desc_group.setLayout(desc_layout)
+    layout.addWidget(desc_group)
+
+    layout.addStretch()
+
+    references = {
+        "binary_path_edit": binary_path_edit,
+        "model_path_edit": model_path_edit,
+        "mmproj_path_edit": mmproj_path_edit,
+        "ctx_size_spin": ctx_size_spin,
+        "gpu_layers_spin": gpu_layers_spin,
+        "temperature_spin": temperature_spin,
+        "max_tokens_spin": max_tokens_spin,
+        "server_port_spin": server_port_spin,
+        "include_prior_tables_check": include_prior_tables_check,
+        "carry_batch_context_check": carry_batch_context_check,
+        "include_clip_check": include_clip_check,
+        "include_wd_check": include_wd_check,
+        "include_camie_check": include_camie_check,
+    }
     return widget, references
   
 

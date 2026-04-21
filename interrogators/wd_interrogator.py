@@ -18,38 +18,54 @@ class WDInterrogator(BaseInterrogator):
     
     def load_model(self, threshold: float = 0.35, device: str = 'cuda', **kwargs):
         """
-        Load WD Tagger model.
-        
+        Load WD Tagger model with automatic CPU fallback.
+
         Args:
             threshold: Confidence threshold for tag inclusion (0.0-1.0)
-            device: Device to use ('cuda' or 'cpu')
+            device: Requested device ('cuda' or 'cpu')
             **kwargs: Additional configuration
         """
+        # Auto-detect and validate device
+        from core.device_detector import get_device_detector
+        detector = get_device_detector()
+
+        # If CUDA requested but not available, fall back to CPU
+        if device == 'cuda' and not detector.is_onnx_cuda_available():
+            import logging
+            logging.warning(
+                f"CUDA requested but ONNX Runtime CUDA not available. "
+                f"Falling back to CPU."
+            )
+            device = 'cpu'
+
         self.threshold = threshold
         self.config = {
             'threshold': threshold,
             'device': device,
             **kwargs
         }
-        
+
         try:
             import onnxruntime as ort
             from huggingface_hub import hf_hub_download
             import pandas as pd
-            
+
             # Download model and tags
             model_path = hf_hub_download(self.model_name, "model.onnx")
             tags_path = hf_hub_download(self.model_name, "selected_tags.csv")
-            
+
             # Load tags
             self.tags = pd.read_csv(tags_path)
-            
+
             # Load ONNX model
             providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
             self.model = ort.InferenceSession(model_path, providers=providers)
-            
+
             self.is_loaded = True
-            
+
+            import logging
+            logging.info(f"WD model loaded successfully on {device}")
+
         except ImportError as e:
             raise ImportError(
                 f"Required packages not installed: {e}\n"

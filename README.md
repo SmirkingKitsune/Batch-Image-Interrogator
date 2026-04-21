@@ -4,9 +4,10 @@ A professional PyQt6-based application for batch image interrogation and tagging
 
 ## Features
 
-- **Multiple Model Support**: Use CLIP or Waifu Diffusion (WD) Tagger models
+- **Multiple Model Support**: Use CLIP, Waifu Diffusion (WD), Camie, or llama.cpp multimodal models
   - **12 WD Tagger Models**: V1.4 (stable) and V3 (latest) variants including EVA-02, ViT, ConvNeXt, and Swin transformers
   - **5 CLIP Models**: Multiple CLIP architectures with optional caption models
+  - **llama.cpp Multimodal**: Single-image inquiry (persistent context) and batch image inquiry
 - **Intelligent Caching**: SQLite database stores previous interrogations to avoid reprocessing
 - **Batch Processing**: Interrogate entire directories efficiently with optional recursive subdirectory search
 - **Tag Management**: Edit, save, and organize tags with an intuitive UI
@@ -49,6 +50,9 @@ image_interrogator/
 
 - **NVIDIA GPU**: CUDA-capable GPU with drivers installed (recommended for optimal performance)
 - **AMD GPU (Linux only)**: ROCm-capable GPU with ROCm installed (see ROCm Support section)
+- **llama.cpp runtime (for multimodal)**: `setup.sh`/`setup.bat` auto-downloads `llama-server` from [ggml-org/llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) when missing
+
+> For CUDA-enabled llama.cpp inference, use official GitHub release binaries. Package-manager installs (brew/nix/winget) commonly omit CUDA-enabled builds.
 
 ### Quick Start (Recommended)
 
@@ -68,12 +72,15 @@ chmod +x setup.sh
 The setup script will:
 1. Check Python installation and version
 2. Create a virtual environment
-3. Detect your NVIDIA GPU and CUDA version automatically
+3. Detect your NVIDIA/AMD GPU toolkit versions automatically (CUDA/ROCm)
 4. Install PyTorch with the correct CUDA support for your system
 5. Install all other dependencies
-6. Verify the installation
+6. Provision `llama-server` from official GitHub releases (if missing), selecting the best GPU build for your toolkit
+7. Verify the installation
 
 **If you have an NVIDIA GPU**, the script will automatically detect your CUDA version and ask for permission to install PyTorch with GPU support. Just answer 'y' when prompted!
+
+Optional override: set `LLAMA_CPP_VERSION` before running setup to pin a specific llama.cpp release tag.
 
 ### Manual Installation (Advanced)
 
@@ -140,6 +147,37 @@ pip install -r requirements.txt
 - ONNX Runtime GPU package is CUDA-only (AMD users get CPU version)
 - Check your NVIDIA driver supports the CUDA version you're installing
 
+### Llama.cpp Multimodal Setup
+
+Multimodal support requires a local `llama-server` runtime and a user-supplied multimodal model path.
+
+1. Run `setup.sh` or `setup.bat` to auto-download `llama-server` from [ggml-org/llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) when missing.
+   - Build selection policy:
+     - Prefer highest exact CUDA/ROCm toolkit version match.
+     - If exact match is unavailable, use the highest `llama.cpp` GPU build lower than the installed toolkit version.
+     - If no compatible GPU build exists (for example, toolkit older than the minimum published CUDA build), fall back to CPU and emit a warning.
+2. Optional: set `LLAMA_CPP_VERSION=<release-tag>` before setup to pin a specific release (default is latest).
+3. Download a multimodal GGUF model (and optional `mmproj` file if the model requires it).
+4. Open the **Inquiry** tab and set:
+   - `llama-server` executable path (required)
+   - multimodal model path (required)
+   - mmproj path (optional)
+   - runtime options (`ctx_size`, `gpu_layers`, `temperature`, `max_tokens`, `server_port`)
+5. Load the LlamaCpp model and run:
+   - batch inquiry in the Inquiry tab, or
+   - single-image inquiry in the Inquiry tab (or **Advanced Image Inspection -> Multimodal Inquiry**).
+
+Default setup install path:
+- Windows: `cache/llama_cpp/bin/llama-server.exe`
+- Linux/macOS: `cache/llama_cpp/bin/llama-server`
+
+The app auto-prefills the cached `llama-server` path when present. GGUF/mmproj model files remain user-supplied.
+
+Optional provisioning flags (advanced/manual):
+- `--cuda-versions "13.1,12.4"`: provide multiple detected CUDA toolkits
+- `--rocm-versions "6.2,6.0"`: provide multiple detected ROCm toolkits
+- `--cuda-version` / `--rocm-version`: legacy single-version inputs (still supported)
+
 ## Usage
 
 ### Starting the Application
@@ -171,12 +209,13 @@ python main.py
 1. **Select Directory**: Click "Select Directory" to choose a folder containing images
    - Optional: Check "Include subdirectories (recursive)" to process images in all subdirectories
 2. **Configure Model**:
-   - Choose model type (WD Tagger or CLIP)
-   - Click "Configure Model" to set parameters
+   - In **Interrogation**, choose model type (CLIP, WD Tagger, or Camie)
+   - In **Inquiry**, configure llama.cpp multimodal options
    - Click "Load Model" to load into memory
 3. **Interrogate Images**:
-   - **Batch**: Click "Start Batch" to process all images
-   - **Single**: Select an image and click "Interrogate Selected"
+   - **Batch interrogation (CLIP/WD/Camie)**: Use Interrogation -> Start Batch
+   - **Batch inquiry (llama.cpp)**: Use Inquiry -> Start Batch Inquiry
+   - **Single-image multimodal**: Use Inquiry tab (or Advanced Inspection -> Multimodal Inquiry)
    - Recursive mode will process images from all selected subdirectories
 4. **Review Results**: View tags in the results table with confidence scores (WD only)
 5. **Edit Tags**: Use the checkbox tag selector to enable/disable tags from all models
@@ -203,6 +242,22 @@ python main.py
   - Medium (0.35-0.5): Balanced (recommended: 0.35)
   - Higher (0.5-0.8): Fewer tags, more confident
 - **Device**: `cuda` (GPU) or `cpu`
+
+#### LlamaCpp Multimodal Configuration
+- **Runtime**: Managed local `llama-server` process on `127.0.0.1:<port>`
+- **Required paths**:
+  - `llama-server` binary path
+  - multimodal model path
+- **Optional path**:
+  - `mmproj` path (model-dependent)
+- **Task modes**:
+  - `describe`: generate visual description + tags
+  - `ocr`: extract text + tags
+  - `vqa`: answer visual question + tags
+  - `custom`: freeform instruction + tags
+- **Batch context controls**:
+  - include selected prior interrogation tables
+  - optional carry-context across batch (disabled by default)
 
 **Recommended Models:**
 - Best Quality: `SmilingWolf/wd-eva02-large-tagger-v3`
@@ -280,6 +335,13 @@ Access detailed image analysis by:
   - Search filter for finding specific tags
 - **Save Tags to File**: Green button applies checkbox selections to .txt file
 - **Saves bypass all filters** - complete user control over which tags to keep
+
+**Multimodal Inquiry Tab:**
+- Single-image multimodal chat using llama.cpp
+- Task selector (`describe`, `ocr`, `vqa`, `custom`)
+- Prompt input plus manual selection of prior interrogation tables
+- Persistent per-image transcript backed by SQLite session/turn history
+- `Reset Image Context` clears in-memory and persisted conversation for the current image
 
 **Navigation:**
 - Browse through images with Prev/Next buttons
@@ -370,7 +432,7 @@ landscape, sunset, mountains, scenic, nature, beautiful sky
 ### Models Table
 - `id`: Primary key
 - `model_name`: Model identifier
-- `model_type`: CLIP or WD
+- `model_type`: CLIP, WD, Camie, or LlamaCpp
 - `version`: Model version
 - `config`: JSON configuration
 
@@ -382,6 +444,26 @@ landscape, sunset, mountains, scenic, nature, beautiful sky
 - `confidence_scores`: JSON object of tag:score pairs
 - `raw_output`: Raw model output
 - `interrogated_at`: Timestamp
+
+### Multimodal Sessions Table
+- `id`: Primary key
+- `image_id`: Foreign key to images
+- `model_id`: Foreign key to models
+- `mode`: `single` or `batch`
+- `session_key`: Stable session key for conversation scope
+- `created_at`, `updated_at`: Timestamps
+
+### Multimodal Turns Table
+- `id`: Primary key
+- `session_id`: Foreign key to multimodal_sessions
+- `turn_index`: Monotonic turn number within a session
+- `prompt_type`: `describe`, `ocr`, `vqa`, or `custom`
+- `prompt_text`: User prompt text
+- `included_tables_json`: Prior interrogation tables included in prompt context
+- `response_json`: Structured JSON response from model
+- `tags_json`: Tags extracted from response
+- `reasoning_summary`: Concise rationale text
+- `created_at`: Timestamp
 
 ## Performance Tips
 

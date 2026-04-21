@@ -1,5 +1,6 @@
 """Main application window for Image Interrogator."""
 
+import sys
 import threading
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTabWidget,
                              QFileDialog, QMessageBox, QStatusBar, QLabel)
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Optional, Dict
 
 from core import InterrogationDatabase, TagFilterSettings, ONNXProviderSettings
-from ui.tabs import InterrogationTab, GalleryTab, SettingsTab
+from ui.tabs import InterrogationTab, InquiryTab, GalleryTab, SettingsTab
 from ui.dialogs_database import DatabaseBusyDialog, QueueProcessingDialog
 from ui.workers import DatabaseQueueWorker
 
@@ -20,12 +21,21 @@ class MainWindow(QMainWindow):
     # Internal signal for thread-safe dialog display
     _database_busy = pyqtSignal(str, dict, int)  # operation, params, retry_count
 
-    def __init__(self):
+    def __init__(self, device_status: Optional[Dict] = None):
         super().__init__()
         self.setWindowTitle("Image Interrogator - Batch Tagging Tool")
         self.setGeometry(100, 100, 1600, 900)
         self.setMinimumSize(1024, 600)
-        
+
+        # Store device status
+        self.device_status = device_status or {}
+
+        # Auto-detect default device based on availability
+        from core.device_detector import get_device_detector
+        detector = get_device_detector()
+        default_pytorch_device = detector.get_pytorch_device()
+        default_onnx_device = detector.get_onnx_device()
+
         # Core components
         self.database = InterrogationDatabase()
         self.tag_filters = TagFilterSettings()
@@ -44,24 +54,38 @@ class MainWindow(QMainWindow):
         self._busy_response_event = threading.Event()
         self._busy_response_value = "abort"
 
-        # Model configs
+        # Model configs with AUTO-DETECTED device
         self.clip_config = {
             'clip_model': 'ViT-L-14/openai',
             'caption_model': None,
             'mode': 'best',
-            'device': 'cuda'
+            'device': default_pytorch_device  # AUTO-DETECTED
         }
         self.wd_config = {
             'wd_model': 'SmilingWolf/wd-v1-4-moat-tagger-v2',
             'threshold': 0.35,
-            'device': 'cuda'
+            'device': default_onnx_device  # AUTO-DETECTED
         }
         self.camie_config = {
             'camie_model': 'Camais03/camie-tagger-v2',
             'threshold': 0.5,
             'threshold_profile': 'overall',
-            'device': 'cuda',
+            'device': default_onnx_device,  # AUTO-DETECTED
             'enabled_categories': ['general', 'character', 'copyright', 'artist', 'meta', 'rating', 'year']
+        }
+        default_llama_binary = self._detect_default_llama_binary()
+        self.llama_config = {
+            'llama_binary_path': default_llama_binary,
+            'llama_model_path': '',
+            'llama_mmproj_path': '',
+            'ctx_size': 8192,
+            'gpu_layers': -1,
+            'temperature': 0.2,
+            'max_tokens': 512,
+            'server_port': 8080,
+            'include_prior_tables': False,
+            'carry_batch_context': False,
+            'included_model_types': ['CLIP', 'WD', 'Camie'],
         }
 
         # Setup UI
@@ -74,7 +98,78 @@ class MainWindow(QMainWindow):
 
         # Check for pending queue operations after UI is ready
         QTimer.singleShot(1000, self._check_startup_queue)
-    
+
+    def _detect_default_llama_binary(self) -> str:
+        """Return cached llama-server path when setup downloaded it."""
+        binary_name = "llama-server.exe" if sys.platform.startswith("win") else "llama-server"
+        candidate = Path(__file__).resolve().parents[1] / "cache" / "llama_cpp" / "bin" / binary_name
+        if candidate.exists():
+            return str(candidate)
+        return ""
+
+    def populate_model_lists(self):
+        """
+        Populate model dropdown lists with available models.
+
+        This is called AFTER the window is shown to avoid blocking UI initialization
+        and to prevent CUDA initialization conflicts.
+
+        Called via QTimer.singleShot() from main.py after window.show().
+        """
+        try:
+            self.statusBar().showMessage("Loading model lists...")
+
+            # Get reference to CLIP model combo box
+            clip_combo = self.interrogation_tab.clip_config_refs['clip_model_combo']
+
+            # Clear placeholder
+            clip_combo.clear()
+            clip_combo.addItem("Loading...")
+            clip_combo.setEnabled(False)
+
+            # Force UI update to show loading state
+            from PyQt6.QtWidgets import QApplication as QApp
+            QApp.processEvents()
+
+            # Populate CLIP models (this triggers open_clip import)
+            from ui.dialogs import _populate_clip_models_combo
+            clip_combo.clear()
+            _populate_clip_models_combo(clip_combo)
+
+            # Restore selected CLIP model
+            current_clip_model = self.clip_config.get('clip_model', 'ViT-L-14/openai')
+            index = clip_combo.findText(current_clip_model)
+            if index >= 0:
+                clip_combo.setCurrentIndex(index)
+            else:
+                # Select first valid model
+                from ui.dialogs import _select_first_valid_clip_model
+                _select_first_valid_clip_model(clip_combo)
+
+            # Enable combo box
+            clip_combo.setEnabled(True)
+            self.statusBar().showMessage("Model lists loaded successfully", 3000)
+
+        except Exception as e:
+            import logging
+            logging.error(f"Error populating model lists: {e}")
+
+            # Show error in status bar
+            self.statusBar().showMessage(
+                f"Warning: Could not load CLIP models - {str(e)}",
+                10000
+            )
+
+            # Re-enable combo box with fallback list
+            clip_combo.setEnabled(True)
+            if clip_combo.count() == 0:
+                # Add minimal fallback list
+                clip_combo.addItems([
+                    'ViT-L-14/openai',
+                    'ViT-H-14/laion2b_s32b_b79k',
+                    'ViT-B-32/openai'
+                ])
+
     def setup_ui(self):
         """Setup the main UI with tabs."""
         # Central widget
@@ -95,6 +190,12 @@ class MainWindow(QMainWindow):
             provider_settings=self.provider_settings,
             parent=self
         )
+        self.inquiry_tab = InquiryTab(
+            database=self.database,
+            llama_config=self.llama_config,
+            tag_filters=self.tag_filters,
+            parent=self
+        )
         self.gallery_tab = GalleryTab(
             database=self.database,
             parent=self
@@ -108,6 +209,7 @@ class MainWindow(QMainWindow):
 
         # Add tabs
         self.tabs.addTab(self.interrogation_tab, "Interrogation")
+        self.tabs.addTab(self.inquiry_tab, "Inquiry")
         self.tabs.addTab(self.gallery_tab, "Gallery")
         self.tabs.addTab(self.settings_tab, "Database/Settings")
 
@@ -284,6 +386,12 @@ class MainWindow(QMainWindow):
         self.interrogation_tab.directory_loading_finished.connect(
             self.gallery_tab.set_images_direct
         )
+        self.interrogation_tab.directory_loading_finished.connect(
+            self.inquiry_tab.set_images_from_interrogation
+        )
+        self.interrogation_tab.directory_changed.connect(
+            self.inquiry_tab.set_directory_context
+        )
 
         # === Model Loading ===
         # Update status bar when model is loaded/unloaded
@@ -293,6 +401,12 @@ class MainWindow(QMainWindow):
         self.interrogation_tab.model_unloaded.connect(
             lambda: self.statusBar().showMessage("Model unloaded", 3000)
         )
+        self.inquiry_tab.model_loaded.connect(
+            lambda info: self.statusBar().showMessage(f"Inquiry model loaded: {info}", 5000)
+        )
+        self.inquiry_tab.model_unloaded.connect(
+            lambda: self.statusBar().showMessage("Inquiry model unloaded", 3000)
+        )
 
         # === Interrogation Process ===
         # Update status bar and indicator when interrogation starts/finishes
@@ -300,6 +414,12 @@ class MainWindow(QMainWindow):
             lambda: self._on_interrogation_started()
         )
         self.interrogation_tab.interrogation_finished.connect(
+            lambda: self._on_interrogation_finished()
+        )
+        self.inquiry_tab.inquiry_started.connect(
+            lambda: self._on_interrogation_started()
+        )
+        self.inquiry_tab.inquiry_finished.connect(
             lambda: self._on_interrogation_finished()
         )
 
@@ -319,8 +439,8 @@ class MainWindow(QMainWindow):
     def _on_interrogation_started(self):
         """Handle interrogation start across tabs."""
         # Show background process indicator
-        self.background_indicator.setText("⏳ Interrogating...")
-        self.statusBar().showMessage("Batch interrogation started...")
+        self.background_indicator.setText("Interrogating...")
+        self.statusBar().showMessage("Batch processing started...")
 
     def _on_interrogation_finished(self):
         """Handle interrogation completion across tabs."""
@@ -334,7 +454,13 @@ class MainWindow(QMainWindow):
         self.gallery_tab.refresh_gallery()
 
         # Update status bar
-        self.statusBar().showMessage("Batch interrogation complete", 5000)
+        self.statusBar().showMessage("Batch processing complete", 5000)
+
+    def get_llama_config(self) -> Dict:
+        """Expose Inquiry-tab llama configuration for child dialogs."""
+        if hasattr(self, "inquiry_tab"):
+            return self.inquiry_tab.get_llama_config()
+        return dict(self.llama_config)
 
     def show_about(self):
         """Show about dialog."""
@@ -353,6 +479,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Handle application close."""
         # Cleanup
+        if self.interrogation_tab and getattr(self.interrogation_tab, "current_interrogator", None):
+            self.interrogation_tab.current_interrogator.unload_model()
+        if hasattr(self, "inquiry_tab") and getattr(self.inquiry_tab, "current_interrogator", None):
+            self.inquiry_tab.current_interrogator.unload_model()
         if self.current_interrogator:
             self.current_interrogator.unload_model()
         
@@ -360,3 +490,4 @@ class MainWindow(QMainWindow):
             self.database.close()
         
         event.accept()
+
