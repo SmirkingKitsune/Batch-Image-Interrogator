@@ -9,7 +9,7 @@ from PyQt6.QtGui import QAction
 from pathlib import Path
 from typing import Optional, Dict
 
-from core import InterrogationDatabase, TagFilterSettings, ONNXProviderSettings
+from core import InterrogationDatabase, FileManager, TagFilterSettings, ONNXProviderSettings
 from ui.tabs import InterrogationTab, InquiryTab, GalleryTab, SettingsTab
 from ui.dialogs_database import DatabaseBusyDialog, QueueProcessingDialog
 from ui.workers import DatabaseQueueWorker
@@ -423,6 +423,9 @@ class MainWindow(QMainWindow):
             lambda: self._on_interrogation_finished()
         )
 
+        # Per-image gallery update during batch
+        self.interrogation_tab.image_result_ready.connect(self._on_image_interrogated)
+
         # === Tag Editing ===
         # Update stats when tags are saved in gallery
         self.gallery_tab.tags_saved.connect(
@@ -442,6 +445,11 @@ class MainWindow(QMainWindow):
         self.background_indicator.setText("Interrogating...")
         self.statusBar().showMessage("Batch processing started...")
 
+    def _on_image_interrogated(self, image_path: str):
+        """Handle per-image gallery update during batch interrogation."""
+        has_tags = FileManager.has_text_file(Path(image_path))
+        self.gallery_tab.image_gallery.update_image_status(image_path, has_tags)
+
     def _on_interrogation_finished(self):
         """Handle interrogation completion across tabs."""
         # Hide background process indicator
@@ -450,8 +458,9 @@ class MainWindow(QMainWindow):
         # Update database stats in Settings tab
         self.settings_tab.update_stats()
 
-        # Refresh gallery to show updated tag status
-        self.gallery_tab.refresh_gallery()
+        # Refresh tag filter sidebar (skip full gallery re-scan since individual
+        # images were already updated during the batch via _on_image_interrogated)
+        self.gallery_tab._update_tag_filter()
 
         # Update status bar
         self.statusBar().showMessage("Batch processing complete", 5000)
@@ -490,4 +499,3 @@ class MainWindow(QMainWindow):
             self.database.close()
         
         event.accept()
-
