@@ -199,6 +199,24 @@ class TagFilterSettings:
 
         return tag.replace('_', ' ')
 
+    def normalize_tag_for_comparison(self, tag: str) -> str:
+        """
+        Normalize a tag for comparison purposes.
+        Applies underscore replacement if enabled, and lowercases.
+
+        Args:
+            tag: The tag to normalize
+
+        Returns:
+            Normalized tag for comparison (lowercase, underscores replaced if enabled)
+        """
+        normalized = tag.lower()
+        if self.replace_underscores:
+            # Check if tag should be skipped (preserve emoji-style tags)
+            if normalized not in {t.lower() for t in self.underscore_skip_list}:
+                normalized = normalized.replace('_', ' ')
+        return normalized
+
     # === Filtering Logic ===
 
     def should_keep_tag(self, tag: str, confidence: float, threshold: float) -> bool:

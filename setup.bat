@@ -100,9 +100,10 @@ if errorlevel 1 (
     set CUDA_INDEX=cu126
 
     REM Check for different CUDA versions by searching the file
-    findstr /C:"CUDA Version: 13.0" "%TEMP%\nvidia_smi_output.txt" >nul 2>&1
+    findstr /C:"CUDA Version: 13." "%TEMP%\nvidia_smi_output.txt" >nul 2>&1
     if not errorlevel 1 (
-        set DETECTED_CUDA=13.0
+        REM Extract the actual version number for display
+        for /f "tokens=4" %%v in ('findstr /C:"CUDA Version:" "%TEMP%\nvidia_smi_output.txt"') do set DETECTED_CUDA=%%v
         set CUDA_INDEX=cu130
         goto :cuda_found
     )
