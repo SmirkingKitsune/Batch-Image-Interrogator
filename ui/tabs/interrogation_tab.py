@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
                              QListWidgetItem, QFileDialog, QMessageBox,
                              QTableWidget, QTableWidgetItem, QHeaderView,
                              QRadioButton, QButtonGroup, QScrollArea,
-                             QLineEdit)
+                             QLineEdit, QTextEdit)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon, QPixmap
 from pathlib import Path
@@ -14,11 +14,7 @@ from typing import Dict, Optional, List
 
 from core import InterrogationDatabase, FileManager, TagFilterSettings, ONNXProviderSettings
 from interrogators import CLIPInterrogator, WDInterrogator, CamieInterrogator
-from ui.dialogs import (
-    create_clip_config_widget,
-    create_wd_config_widget,
-    create_camie_config_widget,
-)
+from ui.dialogs import create_clip_config_widget, create_wd_config_widget, create_camie_config_widget
 from ui.dialogs_advanced import AdvancedImageInspectionDialog
 from ui.workers import InterrogationWorker, DirectoryLoadWorker
 
@@ -33,17 +29,10 @@ class InterrogationTab(QWidget):
     model_unloaded = pyqtSignal()
     interrogation_started = pyqtSignal()
     interrogation_finished = pyqtSignal()
+    image_result_ready = pyqtSignal(str)  # image_path - emitted after each result for gallery updates
 
-    def __init__(
-        self,
-        database,
-        clip_config: Dict,
-        wd_config: Dict,
-        camie_config: Dict,
-        tag_filters,
-        provider_settings=None,
-        parent=None,
-    ):
+    def __init__(self, database, clip_config: Dict, wd_config: Dict,
+                 camie_config: Dict, tag_filters, provider_settings=None, parent=None):
         """
         Initialize the Interrogation Tab.
 
@@ -76,6 +65,13 @@ class InterrogationTab(QWidget):
 
         # Track all discovered tags during batch interrogation
         self.all_discovered_tags = {}  # tag -> (confidence, count)
+
+        # Throttle discovered tags table rebuild (250ms debounce)
+        self._tags_display_dirty = False
+        self._tags_display_timer = QTimer(self)
+        self._tags_display_timer.setSingleShot(True)
+        self._tags_display_timer.setInterval(250)
+        self._tags_display_timer.timeout.connect(self._flush_discovered_tags_display)
 
         # Widget references (will be set in setup_ui)
         self.clip_config_refs = None
@@ -138,17 +134,15 @@ class InterrogationTab(QWidget):
         dir_group.setLayout(dir_layout)
         layout.addWidget(dir_group)
 
-        # Model Configuration (inline, using tabs for CLIP/WD/Camie)
+        # Model Configuration (inline, using tabs for CLIP/WD)
         model_config_group = QGroupBox("Model Configuration")
         model_config_layout = QVBoxLayout()
 
         # Create tabbed model config
         self.model_config_tabs = QTabWidget()
 
-        # CLIP tab (defer model list population)
-        clip_widget, self.clip_config_refs = create_clip_config_widget(
-            self.clip_config, self, populate_models=False
-        )
+        # CLIP tab
+        clip_widget, self.clip_config_refs = create_clip_config_widget(self.clip_config, self)
         self.model_config_tabs.addTab(clip_widget, "CLIP")
 
         # WD tab
@@ -508,7 +502,7 @@ class InterrogationTab(QWidget):
             else:
                 display_name = Path(image_path).name
 
-            item = QListWidgetItem(f"[ ] {display_name}")
+            item = QListWidgetItem(f"☐ {display_name}")
             item.setData(Qt.ItemDataRole.UserRole, image_path)
             self.image_queue.addItem(item)
 
@@ -615,7 +609,7 @@ class InterrogationTab(QWidget):
             else:
                 display_name = Path(image_path).name
 
-            item = QListWidgetItem(f"[ ] {display_name}")
+            item = QListWidgetItem(f"☐ {display_name}")
             item.setData(Qt.ItemDataRole.UserRole, image_path)
             self.image_queue.addItem(item)
 
@@ -676,39 +670,21 @@ class InterrogationTab(QWidget):
                 clip_model = self.clip_config_refs['clip_model_combo'].currentText()
                 clip_model = clip_model.replace(' (Default)', '').replace(' (SDXL Default)', '')
 
-            # Extract device from combo box data (not text)
-            device_combo = self.clip_config_refs['device_combo']
-            device_idx = device_combo.currentIndex()
-            device = device_combo.itemData(device_idx)
-            if device is None:
-                # Fallback: parse from text
-                device_text = device_combo.currentText().lower()
-                device = 'cuda' if 'cuda' in device_text else 'cpu'
-
             return {
                 'type': 'CLIP',
                 'clip_model': clip_model,
                 'caption_model': None if caption_model == 'None' else caption_model,
                 'mode': self.clip_config_refs['mode_combo'].currentText(),
-                'device': device
+                'device': self.clip_config_refs['device_combo'].currentText()
             }
         elif current_tab_index == 1:  # WD tab
-            # Extract device from combo box data (not text)
-            device_combo = self.wd_config_refs['device_combo']
-            device_idx = device_combo.currentIndex()
-            device = device_combo.itemData(device_idx)
-            if device is None:
-                # Fallback: parse from text
-                device_text = device_combo.currentText().lower()
-                device = 'cuda' if 'cuda' in device_text else 'cpu'
-
             return {
                 'type': 'WD',
                 'wd_model': self.wd_config_refs['wd_model_combo'].currentText(),
                 'threshold': self.wd_config_refs['threshold_spin'].value(),
-                'device': device
+                'device': self.wd_config_refs['device_combo'].currentText()
             }
-        elif current_tab_index == 2:  # Camie tab (index 2)
+        else:  # Camie tab (index 2)
             # Get enabled categories from checkboxes
             enabled_categories = [
                 cat for cat, cb in self.camie_config_refs['category_checkboxes'].items()
@@ -724,25 +700,15 @@ class InterrogationTab(QWidget):
                     for cat, spin in self.camie_config_refs['category_threshold_spins'].items()
                 }
 
-            # Extract device from combo box data (not text)
-            device_combo = self.camie_config_refs['device_combo']
-            device_idx = device_combo.currentIndex()
-            device = device_combo.itemData(device_idx)
-            if device is None:
-                # Fallback: parse from text
-                device_text = device_combo.currentText().lower()
-                device = 'cuda' if 'cuda' in device_text else 'cpu'
-
             return {
                 'type': 'Camie',
                 'camie_model': self.camie_config_refs['camie_model_combo'].currentText(),
                 'threshold': self.camie_config_refs['threshold_spin'].value(),
                 'threshold_profile': threshold_profile,
-                'device': device,
+                'device': self.camie_config_refs['device_combo'].currentText(),
                 'category_thresholds': category_thresholds,
                 'enabled_categories': enabled_categories
             }
-        raise ValueError(f"Unsupported model configuration tab index: {current_tab_index}")
 
     def load_model(self):
         """Load the selected model."""
@@ -776,7 +742,7 @@ class InterrogationTab(QWidget):
                     provider_settings=self.provider_settings
                 )
                 model_info = f"WD - {config['wd_model']}"
-            elif config['type'] == 'Camie':
+            else:  # Camie
                 self.current_interrogator = CamieInterrogator(model_name=config['camie_model'])
                 self.current_interrogator.load_model(
                     threshold=config['threshold'],
@@ -787,12 +753,10 @@ class InterrogationTab(QWidget):
                     provider_settings=self.provider_settings
                 )
                 model_info = f"Camie - {config['camie_model']}"
-            else:
-                raise ValueError(f"Unsupported model type: {config['type']}")
 
             # Update status
             self.current_model_type = config['type']
-            self.model_status_label.setText(f"Model: {model_info}\nLoaded")
+            self.model_status_label.setText(f"Model: {model_info}\nLoaded ✓")
             self.progress_label.setText("Model loaded successfully")
 
             # Enable buttons
@@ -888,6 +852,12 @@ class InterrogationTab(QWidget):
         self.cancel_button.setEnabled(True)
         self.progress_bar.setMaximum(len(images))
 
+        # Build path-to-index lookup for O(1) queue item updates
+        self._queue_path_to_index = {
+            self.image_queue.item(i).data(Qt.ItemDataRole.UserRole): i
+            for i in range(self.image_queue.count())
+        }
+
         # Emit signal
         self.interrogation_started.emit()
 
@@ -911,7 +881,7 @@ class InterrogationTab(QWidget):
             item = self.image_queue.item(current - 1)
             if item:
                 image_path = item.data(Qt.ItemDataRole.UserRole)
-                item.setText(f"[~] {Path(image_path).name}")
+                item.setText(f"☑ {Path(image_path).name}")
 
         # Show current image preview
         if image_path:
@@ -931,12 +901,12 @@ class InterrogationTab(QWidget):
         """Handle interrogation result."""
         import json as json_module
 
-        # Update queue status
-        for i in range(self.image_queue.count()):
-            item = self.image_queue.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == image_path:
-                item.setText(f"[OK] {Path(image_path).name}")
-                break
+        # Update queue status via O(1) dict lookup
+        idx = self._queue_path_to_index.get(image_path)
+        if idx is not None:
+            item = self.image_queue.item(idx)
+            if item:
+                item.setText(f"✓ {Path(image_path).name}")
 
         # Accumulate discovered tags from all images
         tags = results.get('tags', [])
@@ -976,8 +946,13 @@ class InterrogationTab(QWidget):
             else:
                 self.all_discovered_tags[tag] = (conf, 1, category)
 
-        # Update the discovered tags table with all accumulated tags
-        self._update_discovered_tags_display()
+        # Schedule throttled update of the discovered tags table
+        self._tags_display_dirty = True
+        if not self._tags_display_timer.isActive():
+            self._tags_display_timer.start()
+
+        # Notify gallery of completed result
+        self.image_result_ready.emit(image_path)
 
     def _update_discovered_tags_display(self):
         """Update the discovered tags table with accumulated tags."""
@@ -1031,17 +1006,28 @@ class InterrogationTab(QWidget):
                 conf_text = f"{conf:.2f}" if conf > 0 else "N/A"
                 self.discovered_tags_table.setItem(row, 1, QTableWidgetItem(conf_text))
 
+    def _flush_discovered_tags_display(self):
+        """Flush pending discovered tags display update (called by throttle timer)."""
+        if self._tags_display_dirty:
+            self._tags_display_dirty = False
+            self._update_discovered_tags_display()
+
     def on_interrogation_error(self, image_path: str, error: str):
         """Handle interrogation error."""
-        # Update queue status
-        for i in range(self.image_queue.count()):
-            item = self.image_queue.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == image_path:
-                item.setText(f"[ERR] {Path(image_path).name}")
-                break
+        # Update queue status via O(1) dict lookup
+        idx = self._queue_path_to_index.get(image_path)
+        if idx is not None:
+            item = self.image_queue.item(idx)
+            if item:
+                item.setText(f"✗ {Path(image_path).name}")
 
     def on_interrogation_finished(self):
         """Handle interrogation completion."""
+        # Flush any pending discovered tags update
+        self._tags_display_timer.stop()
+        self._tags_display_dirty = False
+        self._update_discovered_tags_display()
+
         self.progress_label.setText("Batch interrogation complete")
         self.batch_interrogate_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
@@ -1076,19 +1062,6 @@ class InterrogationTab(QWidget):
         """Handle interrogation result from external source."""
         # This method is called by MainWindow for cross-tab communication
         self.on_interrogation_result(image_path, results)
-
-    def get_loaded_image_paths(self) -> List[str]:
-        """Return a copy of the currently loaded image paths."""
-        return list(self.loaded_image_paths)
-
-    def get_queue_image_paths(self) -> List[str]:
-        """Return queue image paths in current display order."""
-        image_list: List[str] = []
-        for i in range(self.image_queue.count()):
-            path = self.image_queue.item(i).data(Qt.ItemDataRole.UserRole)
-            if path:
-                image_list.append(path)
-        return image_list
 
     # === Tag Filter Methods ===
 
@@ -1214,25 +1187,20 @@ class InterrogationTab(QWidget):
             return
 
         try:
+            # Build image list from queue
+            image_list = []
+            for i in range(self.image_queue.count()):
+                path = self.image_queue.item(i).data(Qt.ItemDataRole.UserRole)
+                if path:
+                    image_list.append(path)
+
             dialog = AdvancedImageInspectionDialog(
                 image_path=image_path,
-                image_list=self.get_queue_image_paths(),
+                image_list=image_list,
                 database=self.database,
                 tag_filters=self.tag_filters,
-                llama_config=self._get_llama_config_from_parent(),
                 parent=self
             )
             dialog.show()  # Non-modal
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open inspection dialog:\n{str(e)}")
-
-    def _get_llama_config_from_parent(self) -> Optional[Dict]:
-        """Resolve llama config from Inquiry tab through parent chain."""
-        parent = self.parent()
-        while parent:
-            if hasattr(parent, "inquiry_tab") and hasattr(parent.inquiry_tab, "get_llama_config"):
-                return parent.inquiry_tab.get_llama_config()
-            parent = parent.parent()
-        return None
-
-
