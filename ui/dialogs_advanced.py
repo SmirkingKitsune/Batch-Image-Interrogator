@@ -1,6 +1,7 @@
 """Advanced dialogs for detailed image inspection and analysis."""
 
 import logging
+import json
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QComboBox, QGroupBox, QSplitter,
                              QTabWidget, QWidget, QTableWidget, QTableWidgetItem,
@@ -9,10 +10,11 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QSettings
 from PyQt6.QtGui import QKeySequence, QColor, QShortcut, QBrush, QPixmap
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
-from core import FileManager, TagFilterSettings, InterrogationDatabase
+from core import FileManager, TagFilterSettings, InterrogationDatabase, get_image_metadata
 from core.hashing import hash_image_content
+from interrogators import LlamaCppInterrogator
 from ui.widgets import TagEditorWidget, ResultsTableWidget
 
 logger = logging.getLogger(__name__)
@@ -259,6 +261,7 @@ class AdvancedImageInspectionDialog(QDialog):
                  image_list: List[str],
                  database: InterrogationDatabase,
                  tag_filters: Optional[TagFilterSettings] = None,
+                 llama_config: Optional[Dict] = None,
                  parent=None):
         """
         Initialize the advanced image inspection dialog.
@@ -268,6 +271,7 @@ class AdvancedImageInspectionDialog(QDialog):
             image_list: Full list of images for navigation (single-image mode only)
             database: Database instance for interrogation lookups
             tag_filters: Optional tag filter settings for comparison
+            llama_config: Optional llama.cpp multimodal settings
             parent: Parent widget
         """
         super().__init__(parent)
@@ -276,6 +280,7 @@ class AdvancedImageInspectionDialog(QDialog):
         self.database = database
         self.tag_filters = tag_filters
         self.image_list = image_list
+        self.llama_config = llama_config or {}
 
         # Handle both single path (str) and multiple paths (list)
         if isinstance(image_path, list):
@@ -299,6 +304,9 @@ class AdvancedImageInspectionDialog(QDialog):
         self.current_file_tags = []  # Tags from .txt file
         self.current_model = None  # Currently selected model name
         self.original_common_tags = set()  # For multi-mode: tracks original common tags
+        self.current_image_hash = None
+        self.current_multimodal_session_key = None
+        self.multimodal_interrogator: Optional[LlamaCppInterrogator] = None
 
         # UI setup
         if self.is_multi_mode:
@@ -436,6 +444,7 @@ class AdvancedImageInspectionDialog(QDialog):
             self.results_table = None
             self.comparison_table = None
             self.comparison_info_label = None
+            self.multimodal_tab = None
         else:
             # Single-image mode: show all tabs
             # Tab 1: Model Results
@@ -449,6 +458,10 @@ class AdvancedImageInspectionDialog(QDialog):
             # Tab 3: Tag Editor
             editor_tab = self._create_editor_tab()
             self.main_tabs.addTab(editor_tab, "Tag Editor")
+
+            # Tab 4: Multimodal Inquiry
+            self.multimodal_tab = self._create_multimodal_tab()
+            self.main_tabs.addTab(self.multimodal_tab, "Multimodal Inquiry")
 
             # Connect tab change signal to save preference
             self.main_tabs.currentChanged.connect(self._on_tab_changed)
@@ -601,6 +614,68 @@ class AdvancedImageInspectionDialog(QDialog):
 
         return widget
 
+    def _create_multimodal_tab(self) -> QWidget:
+        """Create single-image multimodal inquiry tab."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        self.mm_status_label = QLabel(
+            "Configure llama.cpp model paths in Inquiry tab, then use this panel for image Q&A/OCR."
+        )
+        self.mm_status_label.setWordWrap(True)
+        self.mm_status_label.setStyleSheet("color: #666;")
+        layout.addWidget(self.mm_status_label)
+
+        task_row = QHBoxLayout()
+        task_row.addWidget(QLabel("Task:"))
+        self.mm_task_combo = QComboBox()
+        self.mm_task_combo.addItems(["describe", "ocr", "vqa", "custom"])
+        task_row.addWidget(self.mm_task_combo)
+        task_row.addStretch()
+        layout.addLayout(task_row)
+
+        layout.addWidget(QLabel("Prompt / Question:"))
+        self.mm_prompt_input = QLineEdit()
+        self.mm_prompt_input.setPlaceholderText("Ask a visual question or add instructions...")
+        layout.addWidget(self.mm_prompt_input)
+
+        prior_group = QGroupBox("Include Prior Interrogation Tables")
+        prior_layout = QVBoxLayout()
+        self.mm_prior_tables = QTableWidget()
+        self.mm_prior_tables.setColumnCount(2)
+        self.mm_prior_tables.setHorizontalHeaderLabels(["Include", "Model"])
+        self.mm_prior_tables.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.mm_prior_tables.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.mm_prior_tables.setMinimumHeight(120)
+        prior_layout.addWidget(self.mm_prior_tables)
+        prior_group.setLayout(prior_layout)
+        layout.addWidget(prior_group)
+
+        button_row = QHBoxLayout()
+        self.mm_send_button = QPushButton("Send Inquiry")
+        self.mm_send_button.clicked.connect(self._on_send_multimodal)
+        button_row.addWidget(self.mm_send_button)
+
+        self.mm_reset_button = QPushButton("Reset Image Context")
+        self.mm_reset_button.clicked.connect(self._on_reset_multimodal_context)
+        button_row.addWidget(self.mm_reset_button)
+        button_row.addStretch()
+        layout.addLayout(button_row)
+
+        transcript_group = QGroupBox("Transcript")
+        transcript_layout = QVBoxLayout()
+        self.mm_transcript = QTableWidget()
+        self.mm_transcript.setColumnCount(3)
+        self.mm_transcript.setHorizontalHeaderLabels(["Turn", "Prompt", "Response Summary"])
+        self.mm_transcript.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.mm_transcript.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.mm_transcript.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        transcript_layout.addWidget(self.mm_transcript)
+        transcript_group.setLayout(transcript_layout)
+        layout.addWidget(transcript_group, 1)
+
+        return widget
+
     def setup_keyboard_shortcuts(self):
         """Setup keyboard shortcuts for dialog."""
         # Only enable navigation in single-image mode
@@ -673,9 +748,13 @@ class AdvancedImageInspectionDialog(QDialog):
         # Load interrogations from database
         try:
             file_hash = hash_image_content(self.current_image)
+            self.current_image_hash = file_hash
+            self.current_multimodal_session_key = f"single:{file_hash}"
             self.current_interrogations = self.database.get_all_interrogations_for_image(file_hash) or []
         except Exception as e:
             logger.error(f"Error loading interrogations: {e}")
+            self.current_image_hash = None
+            self.current_multimodal_session_key = None
             self.current_interrogations = []
 
         # Load tags from .txt file
@@ -711,6 +790,8 @@ class AdvancedImageInspectionDialog(QDialog):
 
         # Populate tag selector with all tags from all models
         self._populate_tag_selector()
+        self._refresh_multimodal_prior_tables()
+        self._load_multimodal_history()
 
     def _load_multi_image_data(self):
         """
@@ -796,6 +877,277 @@ class AdvancedImageInspectionDialog(QDialog):
 
         # Set available tags and selected tags in the selector
         self.tag_selector.set_available_tags(all_tags_list, self.current_file_tags)
+
+    def _refresh_multimodal_prior_tables(self):
+        """Refresh selectable prior interrogation tables for multimodal prompt context."""
+        if self.is_multi_mode or self.multimodal_tab is None:
+            return
+
+        self.mm_prior_tables.setRowCount(0)
+        for interrog in self.current_interrogations:
+            row = self.mm_prior_tables.rowCount()
+            self.mm_prior_tables.insertRow(row)
+
+            include_item = QTableWidgetItem()
+            include_item.setFlags(
+                include_item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsEnabled
+            )
+            include_item.setCheckState(Qt.CheckState.Unchecked)
+            include_item.setData(Qt.ItemDataRole.UserRole, interrog)
+            self.mm_prior_tables.setItem(row, 0, include_item)
+
+            model_label = f"{interrog.get('model_name', 'Unknown')} ({interrog.get('model_type', '')})"
+            self.mm_prior_tables.setItem(row, 1, QTableWidgetItem(model_label))
+
+    def _resolve_llama_config(self) -> Dict[str, Any]:
+        """Resolve latest llama.cpp config from parent contexts and cached dialog config."""
+        config = dict(self.llama_config or {})
+
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "inquiry_tab") and hasattr(parent.inquiry_tab, "get_llama_config"):
+                try:
+                    parent_cfg = parent.inquiry_tab.get_llama_config()
+                    if isinstance(parent_cfg, dict):
+                        config.update(parent_cfg)
+                except Exception:
+                    pass
+            if hasattr(parent, "get_llama_config"):
+                try:
+                    parent_cfg = parent.get_llama_config()
+                    if isinstance(parent_cfg, dict):
+                        config.update(parent_cfg)
+                except Exception:
+                    pass
+            elif hasattr(parent, "interrogation_tab") and hasattr(parent.interrogation_tab, "_get_llama_config_from_parent"):
+                try:
+                    parent_cfg = parent.interrogation_tab._get_llama_config_from_parent()
+                    if isinstance(parent_cfg, dict):
+                        config.update(parent_cfg)
+                except Exception:
+                    pass
+            parent = parent.parent()
+
+        self.llama_config = config
+        return config
+
+    def _ensure_multimodal_ready(self) -> bool:
+        """Ensure llama.cpp interrogator exists and is loaded with valid config."""
+        if self.is_multi_mode:
+            return False
+
+        config = self._resolve_llama_config()
+        binary_path = (config.get("llama_binary_path") or "").strip()
+        model_path = (config.get("llama_model_path") or "").strip()
+        if not binary_path or not model_path:
+            self.mm_status_label.setText(
+                "Set llama-server and model paths in Inquiry tab before sending inquiries."
+            )
+            self.mm_status_label.setStyleSheet("color: orange;")
+            return False
+
+        mmproj_path = (config.get("llama_mmproj_path") or "").strip() or None
+        signature = (
+            binary_path,
+            model_path,
+            mmproj_path or "",
+            int(config.get("ctx_size", 8192)),
+            int(config.get("gpu_layers", -1)),
+            float(config.get("temperature", 0.2)),
+            int(config.get("max_tokens", 512)),
+            int(config.get("server_port", 8080)),
+        )
+
+        needs_reload = True
+        if self.multimodal_interrogator and self.multimodal_interrogator.is_loaded:
+            existing_cfg = self.multimodal_interrogator.get_config()
+            existing_sig = (
+                existing_cfg.get("llama_binary_path", ""),
+                existing_cfg.get("llama_model_path", ""),
+                existing_cfg.get("llama_mmproj_path", "") or "",
+                int(existing_cfg.get("ctx_size", 8192)),
+                int(existing_cfg.get("gpu_layers", -1)),
+                float(existing_cfg.get("temperature", 0.2)),
+                int(existing_cfg.get("max_tokens", 512)),
+                int(existing_cfg.get("server_port", 8080)),
+            )
+            needs_reload = existing_sig != signature
+
+        if needs_reload:
+            if self.multimodal_interrogator:
+                self.multimodal_interrogator.unload_model()
+            self.multimodal_interrogator = LlamaCppInterrogator(model_name="LlamaCpp")
+            self.multimodal_interrogator.load_model(
+                llama_binary_path=binary_path,
+                llama_model_path=model_path,
+                llama_mmproj_path=mmproj_path,
+                ctx_size=int(config.get("ctx_size", 8192)),
+                gpu_layers=int(config.get("gpu_layers", -1)),
+                temperature=float(config.get("temperature", 0.2)),
+                max_tokens=int(config.get("max_tokens", 512)),
+                server_port=int(config.get("server_port", 8080)),
+                server_host="127.0.0.1",
+            )
+
+        # Prime in-memory context from persisted history for current image session.
+        if self.current_multimodal_session_key and self.current_image_hash:
+            history = self.database.get_multimodal_history(
+                session_key=self.current_multimodal_session_key,
+                mode="single",
+                image_hash=self.current_image_hash,
+                model_name=self.multimodal_interrogator.model_name,
+            )
+            self.multimodal_interrogator.set_session_history(self.current_multimodal_session_key, history)
+
+        self.mm_status_label.setText(
+            f"Connected: {Path(model_path).name} on 127.0.0.1:{int(config.get('server_port', 8080))}"
+        )
+        self.mm_status_label.setStyleSheet("color: green;")
+        return True
+
+    def _build_selected_prior_tables(self) -> List[Dict[str, Any]]:
+        """Build selected prior interrogation rows for multimodal prompt context."""
+        selected: List[Dict[str, Any]] = []
+        for row in range(self.mm_prior_tables.rowCount()):
+            include_item = self.mm_prior_tables.item(row, 0)
+            if not include_item or include_item.checkState() != Qt.CheckState.Checked:
+                continue
+            interrog = include_item.data(Qt.ItemDataRole.UserRole) or {}
+            selected.append(
+                {
+                    "model_name": interrog.get("model_name"),
+                    "model_type": interrog.get("model_type"),
+                    "tags": interrog.get("tags", []),
+                    "confidence_scores": interrog.get("confidence_scores"),
+                    "raw_output_summary": (interrog.get("raw_output") or "")[:1500],
+                    "interrogated_at": interrog.get("interrogated_at"),
+                }
+            )
+        return selected
+
+    def _load_multimodal_history(self):
+        """Load persisted multimodal transcript for the current single-image session."""
+        if self.is_multi_mode or self.multimodal_tab is None:
+            return
+
+        self.mm_transcript.setRowCount(0)
+        if not self.current_multimodal_session_key or not self.current_image_hash:
+            return
+
+        history = self.database.get_multimodal_history(
+            session_key=self.current_multimodal_session_key,
+            mode="single",
+            image_hash=self.current_image_hash,
+        )
+        for turn in history:
+            row = self.mm_transcript.rowCount()
+            self.mm_transcript.insertRow(row)
+            self.mm_transcript.setItem(row, 0, QTableWidgetItem(str(turn.get("turn_index", row))))
+            self.mm_transcript.setItem(row, 1, QTableWidgetItem(turn.get("prompt_text", "")))
+            response = turn.get("response_json", {}) or {}
+            summary = response.get("reasoning_summary", "") if isinstance(response, dict) else ""
+            self.mm_transcript.setItem(row, 2, QTableWidgetItem(summary))
+
+    def _on_send_multimodal(self):
+        """Run one multimodal inquiry turn and persist session history."""
+        if self.is_multi_mode:
+            return
+        if not self.current_image:
+            QMessageBox.warning(self, "No Image", "No image selected for multimodal inquiry.")
+            return
+
+        try:
+            if not self._ensure_multimodal_ready():
+                return
+
+            task = self.mm_task_combo.currentText()
+            prompt_text = self.mm_prompt_input.text().strip()
+            included_tables = self._build_selected_prior_tables()
+
+            self.mm_send_button.setEnabled(False)
+            results = self.multimodal_interrogator.interrogate(
+                self.current_image,
+                task=task,
+                prompt=prompt_text,
+                session_key=self.current_multimodal_session_key,
+                keep_context=True,
+                included_tables=included_tables,
+            )
+
+            file_hash = self.current_image_hash or hash_image_content(self.current_image)
+            metadata = get_image_metadata(self.current_image)
+            image_id = self.database.register_image(
+                self.current_image,
+                file_hash,
+                metadata["width"],
+                metadata["height"],
+                metadata["file_size"],
+            )
+            model_id = self.database.register_model(
+                self.multimodal_interrogator.model_name,
+                self.multimodal_interrogator.get_model_type(),
+                config=self.multimodal_interrogator.get_config(),
+            )
+            self.database.save_interrogation(
+                image_id,
+                model_id,
+                results["tags"],
+                results.get("confidence_scores"),
+                results.get("raw_output"),
+            )
+
+            session_id = self.database.create_or_get_multimodal_session(
+                image_id=image_id,
+                model_id=model_id,
+                mode="single",
+                session_key=self.current_multimodal_session_key,
+            )
+            response_json = results.get("multimodal_response", {})
+            self.database.append_multimodal_turn(
+                session_id=session_id,
+                prompt_type=task,
+                prompt_text=prompt_text,
+                included_tables=included_tables,
+                response_json=response_json,
+                tags=results["tags"],
+                reasoning_summary=response_json.get("reasoning_summary", ""),
+            )
+
+            self.current_interrogations = self.database.get_all_interrogations_for_image(file_hash) or []
+            self._populate_model_selector()
+            self._refresh_multimodal_prior_tables()
+            self._load_multimodal_history()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Multimodal Error", f"Multimodal inquiry failed:\n{str(e)}")
+        finally:
+            self.mm_send_button.setEnabled(True)
+
+    def _on_reset_multimodal_context(self):
+        """Reset single-image multimodal context and clear persisted turns for current session."""
+        if self.is_multi_mode:
+            return
+        if not self.current_multimodal_session_key or not self.current_image_hash:
+            return
+
+        try:
+            model_name = None
+            if self.multimodal_interrogator:
+                model_name = self.multimodal_interrogator.model_name
+                self.multimodal_interrogator.reset_session(self.current_multimodal_session_key)
+
+            self.database.clear_multimodal_session(
+                session_key=self.current_multimodal_session_key,
+                model_name=model_name,
+                mode="single",
+                image_hash=self.current_image_hash,
+            )
+            self.mm_transcript.setRowCount(0)
+            QMessageBox.information(self, "Context Reset", "Multimodal context was reset for this image.")
+        except Exception as e:
+            QMessageBox.critical(self, "Reset Failed", f"Could not reset context:\n{str(e)}")
 
     def _populate_model_selector(self):
         """Populate model selector with available models."""
@@ -1270,3 +1622,12 @@ class AdvancedImageInspectionDialog(QDialog):
             return
         settings = QSettings()
         settings.setValue(self.SETTINGS_KEY_LAST_TAB, index)
+
+    def closeEvent(self, event):
+        """Cleanup multimodal resources on dialog close."""
+        try:
+            if self.multimodal_interrogator:
+                self.multimodal_interrogator.unload_model()
+        except Exception:
+            pass
+        super().closeEvent(event)

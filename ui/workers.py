@@ -1,6 +1,7 @@
 """Worker threads for background processing in PyQt6."""
 
 import os
+import uuid
 from PyQt6.QtCore import QThread, pyqtSignal
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -145,9 +146,191 @@ class InterrogationWorker(QThread):
                 self.result.emit(image_path_str, results)
                 
             except Exception as e:
-                self.error.emit(str(image_path), str(e))
+                message = str(e).strip() or repr(e)
+                self.error.emit(str(image_path), message)
         
         self.finished.emit()
+
+
+class MultimodalInterrogationWorker(QThread):
+    """Worker thread for llama.cpp multimodal batch interrogation."""
+
+    # Signals
+    progress = pyqtSignal(int, int, str)  # current, total, message
+    result = pyqtSignal(str, dict)  # image_path, results
+    error = pyqtSignal(str, str)  # image_path, error_message
+    finished = pyqtSignal()
+
+    def __init__(
+        self,
+        image_paths: List[Path],
+        interrogator: BaseInterrogator,
+        database: InterrogationDatabase,
+        task: str,
+        prompt: str,
+        write_files: bool = True,
+        overwrite_files: bool = False,
+        tag_filters: Optional[TagFilterSettings] = None,
+        include_prior_tables: bool = False,
+        included_model_types: Optional[List[str]] = None,
+        carry_context_across_batch: bool = False,
+    ):
+        super().__init__()
+        self.image_paths = image_paths
+        self.interrogator = interrogator
+        self.database = database
+        self.task = task
+        self.prompt = prompt
+        self.write_files = write_files
+        self.overwrite_files = overwrite_files
+        self.tag_filters = tag_filters
+        self.include_prior_tables = include_prior_tables
+        self.included_model_types = set(included_model_types or [])
+        self.carry_context_across_batch = carry_context_across_batch
+        self.is_cancelled = False
+
+    def cancel(self):
+        """Cancel the operation."""
+        self.is_cancelled = True
+
+    def run(self):
+        """Execute multimodal batch interrogation."""
+        total = len(self.image_paths)
+        model_id = None
+
+        try:
+            model_id = self.database.register_model(
+                self.interrogator.model_name,
+                self.interrogator.get_model_type(),
+                config=self.interrogator.get_config(),
+            )
+        except Exception as e:
+            self.error.emit("", f"Failed to register model: {e}")
+            self.finished.emit()
+            return
+
+        batch_run_id = str(uuid.uuid4())
+        shared_session_key = f"batch:{batch_run_id}" if self.carry_context_across_batch else None
+
+        for idx, image_path in enumerate(self.image_paths):
+            if self.is_cancelled:
+                break
+
+            image_path_str = str(image_path)
+            try:
+                self.progress.emit(idx + 1, total, f"Processing: {image_path.name}")
+                file_hash = hash_image_content(image_path_str)
+
+                metadata = get_image_metadata(image_path_str)
+                image_id = self.database.register_image(
+                    image_path_str,
+                    file_hash,
+                    metadata["width"],
+                    metadata["height"],
+                    metadata["file_size"],
+                )
+
+                included_tables = self._build_included_tables(file_hash)
+
+                if shared_session_key:
+                    session_key = shared_session_key
+                else:
+                    session_key = f"batch:{batch_run_id}:{file_hash}"
+
+                results = self.interrogator.interrogate(
+                    image_path_str,
+                    task=self.task,
+                    prompt=self.prompt,
+                    session_key=session_key,
+                    keep_context=bool(self.carry_context_across_batch),
+                    included_tables=included_tables,
+                )
+
+                # Keep latest multimodal result in main interrogations table.
+                self.database.save_interrogation(
+                    image_id,
+                    model_id,
+                    results["tags"],
+                    results.get("confidence_scores"),
+                    results.get("raw_output"),
+                )
+
+                response_json = results.get("multimodal_response", {})
+                session_id = self.database.create_or_get_multimodal_session(
+                    image_id=image_id,
+                    model_id=model_id,
+                    mode="batch",
+                    session_key=session_key,
+                )
+                self.database.append_multimodal_turn(
+                    session_id=session_id,
+                    prompt_type=self.task,
+                    prompt_text=self.prompt,
+                    included_tables=included_tables,
+                    response_json=response_json,
+                    tags=results["tags"],
+                    reasoning_summary=response_json.get("reasoning_summary", ""),
+                )
+
+                if self.write_files:
+                    tags_to_write = results["tags"]
+                    if self.tag_filters:
+                        confidence_scores = results.get("confidence_scores")
+                        if confidence_scores is not None:
+                            threshold = self.interrogator.get_config().get("threshold", 0.35)
+                            tags_to_write, _ = self.tag_filters.filter_tags_with_confidence(
+                                tags_to_write,
+                                confidence_scores,
+                                threshold,
+                            )
+                        else:
+                            tags_to_write = self.tag_filters.apply_filters(tags_to_write)
+
+                    txt_path = FileManager.get_text_file_path(image_path)
+                    if not txt_path.exists() or self.overwrite_files:
+                        FileManager.write_tags_to_file(
+                            image_path,
+                            tags_to_write,
+                            overwrite=self.overwrite_files,
+                        )
+
+                self.result.emit(image_path_str, results)
+
+            except DatabaseQueuedError:
+                # Continue even if DB operation queued.
+                continue
+            except DatabaseBusyError as e:
+                self.error.emit(image_path_str, f"Database busy: {e}")
+            except Exception as e:
+                message = str(e).strip() or repr(e)
+                self.error.emit(image_path_str, message)
+
+        self.finished.emit()
+
+    def _build_included_tables(self, file_hash: str) -> List[Dict[str, Any]]:
+        """Build prior interrogation context tables for a single image."""
+        if not self.include_prior_tables:
+            return []
+
+        tables = self.database.get_all_interrogations_for_image(file_hash)
+        filtered: List[Dict[str, Any]] = []
+        for row in tables:
+            if row.get("model_name") == self.interrogator.model_name:
+                continue
+            if self.included_model_types and row.get("model_type") not in self.included_model_types:
+                continue
+
+            filtered.append(
+                {
+                    "model_name": row.get("model_name"),
+                    "model_type": row.get("model_type"),
+                    "tags": row.get("tags", []),
+                    "confidence_scores": row.get("confidence_scores"),
+                    "raw_output_summary": (row.get("raw_output") or "")[:1500],
+                    "interrogated_at": row.get("interrogated_at"),
+                }
+            )
+        return filtered
 
 
 class OrganizationWorker(QThread):

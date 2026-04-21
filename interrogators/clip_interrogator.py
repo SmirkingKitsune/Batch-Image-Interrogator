@@ -19,11 +19,11 @@ class CLIPInterrogator(BaseInterrogator):
     
     def load_model(self, mode: str = 'best', device: str = 'cuda', caption_model: Optional[str] = None, **kwargs):
         """
-        Load CLIP Interrogator model.
+        Load CLIP Interrogator model with automatic CPU fallback.
 
         Args:
             mode: Interrogation mode ('best', 'fast', 'classic', 'negative')
-            device: Device to use ('cuda' or 'cpu')
+            device: Requested device ('cuda' or 'cpu')
             caption_model: Caption model to use (optional). Options: 'blip-base', 'blip-large',
                           'blip2-2.7b', 'blip2-flan-t5-xl', 'git-large-coco'.
                           BLIP2 models require clip-interrogator >= 0.6.0
@@ -34,6 +34,20 @@ class CLIPInterrogator(BaseInterrogator):
 
         if caption_model and caption_model not in self.CAPTION_MODELS:
             raise ValueError(f"Invalid caption_model '{caption_model}'. Choose from {self.CAPTION_MODELS}")
+
+        # Auto-detect and validate device
+        from core.device_detector import get_device_detector
+        detector = get_device_detector()
+
+        # If CUDA requested but not available, fall back to CPU
+        if device == 'cuda' and not detector.is_pytorch_cuda_available():
+            import logging
+            logging.warning(
+                f"CUDA requested but PyTorch CUDA not available. "
+                f"Falling back to CPU. "
+                f"Reason: {detector.get_status()['pytorch_error']}"
+            )
+            device = 'cpu'
 
         self.mode = mode
         self.caption_model = caption_model
@@ -60,13 +74,33 @@ class CLIPInterrogator(BaseInterrogator):
             self.ci = Interrogator(config)
             self.is_loaded = True
 
+            import logging
+            logging.info(f"CLIP model loaded successfully on {device}")
+
         except ImportError:
             raise ImportError(
                 "clip-interrogator package not installed. "
                 "Install with: pip install clip-interrogator torch torchvision"
             )
+        except RuntimeError as e:
+            # Handle CUDA initialization errors
+            if 'CUDA' in str(e) or 'c10' in str(e):
+                if device == 'cuda':
+                    import logging
+                    logging.error(f"CUDA initialization failed: {e}")
+                    logging.info("Attempting to fall back to CPU...")
+
+                    # Retry with CPU
+                    return self.load_model(
+                        mode=mode, device='cpu',
+                        caption_model=caption_model, **kwargs
+                    )
+                else:
+                    raise RuntimeError(f"Failed to load CLIP model on CPU: {e}")
+            else:
+                raise RuntimeError(f"Failed to load CLIP model: {e}")
         except Exception as e:
-            raise RuntimeError(f"Failed to load CLIP model: {e}")
+            raise RuntimeError(f"Unexpected error loading CLIP model: {e}")
     
     def interrogate(self, image_path: str, mode: Optional[str] = None) -> Dict[str, Any]:
         """

@@ -165,10 +165,48 @@ class InterrogationDatabase:
                 )
             """)
 
+            # Multimodal sessions table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS multimodal_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    image_id INTEGER NOT NULL,
+                    model_id INTEGER NOT NULL,
+                    mode TEXT NOT NULL CHECK(mode IN ('single', 'batch')),
+                    session_key TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (image_id) REFERENCES images(id),
+                    FOREIGN KEY (model_id) REFERENCES models(id),
+                    UNIQUE(image_id, model_id, mode, session_key)
+                )
+            """)
+
+            # Multimodal turns table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS multimodal_turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    turn_index INTEGER NOT NULL,
+                    prompt_type TEXT NOT NULL,
+                    prompt_text TEXT,
+                    included_tables_json TEXT,
+                    response_json TEXT NOT NULL,
+                    tags_json TEXT NOT NULL,
+                    reasoning_summary TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (session_id) REFERENCES multimodal_sessions(id),
+                    UNIQUE(session_id, turn_index)
+                )
+            """)
+
             # Create indices
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_hash ON images(file_hash)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_image_interrogations ON interrogations(image_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_model_interrogations ON interrogations(model_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_sessions_image ON multimodal_sessions(image_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_sessions_model ON multimodal_sessions(model_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_turns_session ON multimodal_turns(session_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_turns_created_at ON multimodal_turns(created_at)")
     
     @_retry_on_busy()
     def register_image(self, file_path: str, file_hash: str,
@@ -272,7 +310,7 @@ class InterrogationDatabase:
             cursor = conn.cursor()
 
             cursor.execute("""
-                SELECT m.model_name, m.model_type, i.tags, i.confidence_scores, i.interrogated_at
+                SELECT m.model_name, m.model_type, i.tags, i.confidence_scores, i.raw_output, i.interrogated_at
                 FROM interrogations i
                 JOIN images img ON i.image_id = img.id
                 JOIN models m ON i.model_id = m.id
@@ -287,9 +325,250 @@ class InterrogationDatabase:
                     'model_type': row['model_type'],
                     'tags': json.loads(row['tags']),
                     'confidence_scores': json.loads(row['confidence_scores']) if row['confidence_scores'] else None,
+                    'raw_output': row['raw_output'],
                     'interrogated_at': row['interrogated_at']
                 })
             return results
+
+    @_retry_on_busy()
+    def create_or_get_multimodal_session(
+        self,
+        image_id: int,
+        model_id: int,
+        mode: str,
+        session_key: str,
+    ) -> int:
+        """Create or retrieve a multimodal session row."""
+        if mode not in ("single", "batch"):
+            raise ValueError("mode must be 'single' or 'batch'")
+        if not session_key:
+            raise ValueError("session_key is required")
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO multimodal_sessions (image_id, model_id, mode, session_key)
+                VALUES (?, ?, ?, ?)
+                """,
+                (image_id, model_id, mode, session_key),
+            )
+            cursor.execute(
+                """
+                UPDATE multimodal_sessions
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE image_id = ? AND model_id = ? AND mode = ? AND session_key = ?
+                """,
+                (image_id, model_id, mode, session_key),
+            )
+            cursor.execute(
+                """
+                SELECT id
+                FROM multimodal_sessions
+                WHERE image_id = ? AND model_id = ? AND mode = ? AND session_key = ?
+                """,
+                (image_id, model_id, mode, session_key),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise RuntimeError("Failed to create multimodal session")
+            return row["id"]
+
+    @_retry_on_busy()
+    def append_multimodal_turn(
+        self,
+        session_id: int,
+        prompt_type: str,
+        prompt_text: str,
+        included_tables: Optional[List[Dict[str, Any]]],
+        response_json: Dict[str, Any],
+        tags: List[str],
+        reasoning_summary: str,
+    ) -> int:
+        """Append a turn to multimodal conversation history."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "SELECT COALESCE(MAX(turn_index), -1) + 1 AS next_idx FROM multimodal_turns WHERE session_id = ?",
+                (session_id,),
+            )
+            next_index = int(cursor.fetchone()["next_idx"])
+
+            cursor.execute(
+                """
+                INSERT INTO multimodal_turns (
+                    session_id, turn_index, prompt_type, prompt_text,
+                    included_tables_json, response_json, tags_json, reasoning_summary
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    next_index,
+                    prompt_type,
+                    prompt_text,
+                    json.dumps(included_tables or [], ensure_ascii=False),
+                    json.dumps(response_json, ensure_ascii=False),
+                    json.dumps(tags, ensure_ascii=False),
+                    reasoning_summary,
+                ),
+            )
+
+            cursor.execute(
+                """
+                UPDATE multimodal_sessions
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (session_id,),
+            )
+
+            return cursor.lastrowid
+
+    @_retry_on_busy()
+    def get_multimodal_history(
+        self,
+        session_id: Optional[int] = None,
+        session_key: Optional[str] = None,
+        model_name: Optional[str] = None,
+        mode: Optional[str] = None,
+        image_hash: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve multimodal turn history ordered by turn index."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            query = [
+                """
+                SELECT
+                    s.id AS session_id,
+                    s.session_key,
+                    s.mode,
+                    m.model_name,
+                    img.file_hash,
+                    t.turn_index,
+                    t.prompt_type,
+                    t.prompt_text,
+                    t.included_tables_json,
+                    t.response_json,
+                    t.tags_json,
+                    t.reasoning_summary,
+                    t.created_at
+                FROM multimodal_sessions s
+                JOIN models m ON s.model_id = m.id
+                JOIN images img ON s.image_id = img.id
+                LEFT JOIN multimodal_turns t ON t.session_id = s.id
+                WHERE 1 = 1
+                """
+            ]
+            params: List[Any] = []
+
+            if session_id is not None:
+                query.append("AND s.id = ?")
+                params.append(session_id)
+            if session_key:
+                query.append("AND s.session_key = ?")
+                params.append(session_key)
+            if model_name:
+                query.append("AND m.model_name = ?")
+                params.append(model_name)
+            if mode:
+                query.append("AND s.mode = ?")
+                params.append(mode)
+            if image_hash:
+                query.append("AND img.file_hash = ?")
+                params.append(image_hash)
+
+            query.append("ORDER BY s.id ASC, t.turn_index ASC")
+            cursor.execute("\n".join(query), tuple(params))
+
+            history: List[Dict[str, Any]] = []
+            for row in cursor.fetchall():
+                if row["turn_index"] is None:
+                    continue
+                history.append(
+                    {
+                        "session_id": row["session_id"],
+                        "session_key": row["session_key"],
+                        "mode": row["mode"],
+                        "model_name": row["model_name"],
+                        "file_hash": row["file_hash"],
+                        "turn_index": row["turn_index"],
+                        "prompt_type": row["prompt_type"],
+                        "prompt_text": row["prompt_text"] or "",
+                        "included_tables": (
+                            json.loads(row["included_tables_json"])
+                            if row["included_tables_json"]
+                            else []
+                        ),
+                        "response_json": json.loads(row["response_json"]),
+                        "tags": json.loads(row["tags_json"]) if row["tags_json"] else [],
+                        "reasoning_summary": row["reasoning_summary"] or "",
+                        "created_at": row["created_at"],
+                    }
+                )
+            return history
+
+    @_retry_on_busy()
+    def clear_multimodal_session(
+        self,
+        session_id: Optional[int] = None,
+        session_key: Optional[str] = None,
+        model_name: Optional[str] = None,
+        mode: Optional[str] = None,
+        image_hash: Optional[str] = None,
+    ) -> int:
+        """Delete multimodal session(s) and associated turns."""
+        if session_id is None and not session_key:
+            raise ValueError("Either session_id or session_key must be provided")
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            query = [
+                """
+                SELECT s.id
+                FROM multimodal_sessions s
+                JOIN models m ON s.model_id = m.id
+                JOIN images img ON s.image_id = img.id
+                WHERE 1 = 1
+                """
+            ]
+            params: List[Any] = []
+
+            if session_id is not None:
+                query.append("AND s.id = ?")
+                params.append(session_id)
+            if session_key:
+                query.append("AND s.session_key = ?")
+                params.append(session_key)
+            if model_name:
+                query.append("AND m.model_name = ?")
+                params.append(model_name)
+            if mode:
+                query.append("AND s.mode = ?")
+                params.append(mode)
+            if image_hash:
+                query.append("AND img.file_hash = ?")
+                params.append(image_hash)
+
+            cursor.execute("\n".join(query), tuple(params))
+            session_ids = [row["id"] for row in cursor.fetchall()]
+            if not session_ids:
+                return 0
+
+            placeholders = ",".join("?" for _ in session_ids)
+            cursor.execute(
+                f"DELETE FROM multimodal_turns WHERE session_id IN ({placeholders})",
+                tuple(session_ids),
+            )
+            cursor.execute(
+                f"DELETE FROM multimodal_sessions WHERE id IN ({placeholders})",
+                tuple(session_ids),
+            )
+            return len(session_ids)
     
     @_retry_on_busy()
     def get_statistics(self) -> Dict:

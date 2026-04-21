@@ -8,10 +8,18 @@ REM - Create/activate virtual environment
 REM - Detect NVIDIA GPU and CUDA support
 REM - Install PyTorch with appropriate CUDA version
 REM - Install all dependencies
+REM - Provision llama.cpp llama-server from GitHub releases
 REM - Verify the setup
 REM ============================================================
 
 setlocal enabledelayedexpansion
+set "SCRIPT_DIR=%~dp0"
+cd /d "%SCRIPT_DIR%"
+set "DEFAULT_LLAMA_BIN=%SCRIPT_DIR%cache\llama_cpp\bin\llama-server.exe"
+set "LLAMA_BINARY_PATH=%DEFAULT_LLAMA_BIN%"
+set "LLAMA_STATUS=not_checked"
+set "LLAMA_VERSION="
+set "LLAMA_MESSAGE="
 
 echo.
 echo ============================================================
@@ -28,7 +36,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [1/7] Checking Python installation...
+echo [1/8] Checking Python installation...
 for /f "tokens=2" %%i in ('python --version 2^>^&1') do set PYTHON_VERSION=%%i
 echo       Found Python %PYTHON_VERSION%
 
@@ -44,7 +52,7 @@ echo       Version check: OK
 echo.
 
 REM Create virtual environment if it doesn't exist
-echo [2/7] Setting up virtual environment...
+echo [2/8] Setting up virtual environment...
 if not exist "venv\" (
     echo       Creating new virtual environment...
     python -m venv venv
@@ -60,7 +68,7 @@ if not exist "venv\" (
 echo.
 
 REM Activate virtual environment
-echo [3/7] Activating virtual environment...
+echo [3/8] Activating virtual environment...
 call venv\Scripts\activate.bat
 if errorlevel 1 (
     echo [ERROR] Failed to activate virtual environment!
@@ -75,7 +83,7 @@ echo       Upgrading pip...
 python -m pip install --upgrade pip >nul 2>&1
 
 REM Check for NVIDIA GPU
-echo [4/7] Detecting GPU and CUDA support...
+echo [4/8] Detecting GPU and CUDA support...
 echo.
 nvidia-smi >nul 2>&1
 if errorlevel 1 (
@@ -100,9 +108,10 @@ if errorlevel 1 (
     set CUDA_INDEX=cu126
 
     REM Check for different CUDA versions by searching the file
-    findstr /C:"CUDA Version: 13.0" "%TEMP%\nvidia_smi_output.txt" >nul 2>&1
+    findstr /C:"CUDA Version: 13." "%TEMP%\nvidia_smi_output.txt" >nul 2>&1
     if not errorlevel 1 (
-        set DETECTED_CUDA=13.0
+        REM Extract the actual version number for display
+        for /f "tokens=4" %%v in ('findstr /C:"CUDA Version:" "%TEMP%\nvidia_smi_output.txt"') do set DETECTED_CUDA=%%v
         set CUDA_INDEX=cu130
         goto :cuda_found
     )
@@ -157,7 +166,7 @@ if errorlevel 1 (
 echo.
 
 REM Check current PyTorch installation
-echo [5/7] Checking PyTorch installation...
+echo [5/8] Checking PyTorch installation...
 python -c "import torch; print(f'      Current: PyTorch {torch.__version__}')" 2>nul
 if errorlevel 1 (
     echo       PyTorch is not installed
@@ -211,7 +220,7 @@ echo.
 
 REM Install or update PyTorch
 if "!NEED_PYTORCH!"=="y" (
-    echo [6/7] Installing PyTorch...
+    echo [6/8] Installing PyTorch...
     echo.
 
     REM Uninstall existing PyTorch
@@ -260,13 +269,13 @@ if "!NEED_PYTORCH!"=="y" (
     echo.
     echo       PyTorch installed successfully!
 ) else (
-    echo [6/7] PyTorch installation...
+    echo [6/8] PyTorch installation...
     echo       Skipping PyTorch installation
 )
 echo.
 
 REM Install other requirements
-echo [7/7] Installing remaining dependencies...
+echo [7/8] Installing remaining dependencies...
 echo.
 
 REM Install ONNX Runtime based on GPU availability
@@ -305,6 +314,55 @@ echo.
 echo       All dependencies installed successfully!
 echo.
 
+echo [8/8] Provisioning llama.cpp llama-server...
+echo.
+set "NEED_LLAMA_PROVISION=y"
+if exist "!DEFAULT_LLAMA_BIN!" if not defined LLAMA_CPP_VERSION (
+    set "NEED_LLAMA_PROVISION=n"
+    set "LLAMA_STATUS=existing"
+    set "LLAMA_MESSAGE=Existing llama-server binary found; skipping download."
+    if exist "%SCRIPT_DIR%cache\llama_cpp\bin\llama-server.version" (
+        set /p LLAMA_VERSION=<"%SCRIPT_DIR%cache\llama_cpp\bin\llama-server.version"
+    )
+)
+
+if /i "!NEED_LLAMA_PROVISION!"=="y" (
+    set "LLAMA_OUT_FILE=%TEMP%\llama_provision_%RANDOM%%RANDOM%.txt"
+
+    if "!INSTALL_CUDA!"=="y" (
+        if defined LLAMA_CPP_VERSION (
+            python "%SCRIPT_DIR%provision_llama_server.py" --cache-dir "%SCRIPT_DIR%cache\llama_cpp" --prefer-cuda --cuda-version "!DETECTED_CUDA!" --tag "!LLAMA_CPP_VERSION!" > "!LLAMA_OUT_FILE!"
+        ) else (
+            python "%SCRIPT_DIR%provision_llama_server.py" --cache-dir "%SCRIPT_DIR%cache\llama_cpp" --prefer-cuda --cuda-version "!DETECTED_CUDA!" > "!LLAMA_OUT_FILE!"
+        )
+    ) else (
+        if defined LLAMA_CPP_VERSION (
+            python "%SCRIPT_DIR%provision_llama_server.py" --cache-dir "%SCRIPT_DIR%cache\llama_cpp" --tag "!LLAMA_CPP_VERSION!" > "!LLAMA_OUT_FILE!"
+        ) else (
+            python "%SCRIPT_DIR%provision_llama_server.py" --cache-dir "%SCRIPT_DIR%cache\llama_cpp" > "!LLAMA_OUT_FILE!"
+        )
+    )
+
+    for /f "tokens=1,* delims==" %%A in (!LLAMA_OUT_FILE!) do (
+        if /i "%%A"=="LLAMA_STATUS" set "LLAMA_STATUS=%%B"
+        if /i "%%A"=="LLAMA_BINARY_PATH" set "LLAMA_BINARY_PATH=%%B"
+        if /i "%%A"=="LLAMA_VERSION" set "LLAMA_VERSION=%%B"
+        if /i "%%A"=="LLAMA_MESSAGE" set "LLAMA_MESSAGE=%%B"
+    )
+    if exist "!LLAMA_OUT_FILE!" del "!LLAMA_OUT_FILE!" >nul 2>&1
+)
+
+if /i "!LLAMA_STATUS!"=="installed" (
+    echo       llama-server installed: !LLAMA_BINARY_PATH!
+) else if /i "!LLAMA_STATUS!"=="existing" (
+    echo       llama-server ready: !LLAMA_BINARY_PATH!
+) else (
+    echo       [WARNING] Failed to provision llama-server automatically.
+    if not "!LLAMA_MESSAGE!"=="" echo       !LLAMA_MESSAGE!
+    echo       Manual fallback: https://github.com/ggml-org/llama.cpp/releases
+)
+echo.
+
 REM Verify installation
 echo ============================================================
 echo VERIFYING INSTALLATION
@@ -320,6 +378,15 @@ echo Critical Dependencies:
 python -c "import PyQt6; print('  PyQt6: Installed')" 2>nul || echo   [ERROR] PyQt6: NOT INSTALLED
 python -c "from clip_interrogator import Interrogator; print('  CLIP Interrogator: Installed')" 2>nul || echo   [ERROR] CLIP Interrogator: NOT INSTALLED
 python -c "import PIL; print('  Pillow: Installed')" 2>nul || echo   [ERROR] Pillow: NOT INSTALLED
+echo.
+echo llama.cpp runtime:
+if exist "!LLAMA_BINARY_PATH!" (
+    echo   Binary: !LLAMA_BINARY_PATH!
+    if not "!LLAMA_VERSION!"=="" echo   Release: !LLAMA_VERSION!
+) else (
+    echo   Binary: NOT INSTALLED ^(set manually in LlamaCpp MM config^)
+    if not "!LLAMA_MESSAGE!"=="" echo   Note: !LLAMA_MESSAGE!
+)
 echo.
 
 if "!INSTALL_CUDA!"=="y" (
