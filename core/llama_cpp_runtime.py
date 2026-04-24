@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import subprocess
 import threading
 import time
@@ -14,6 +16,42 @@ from urllib import request, error
 
 class LlamaCppRuntimeError(RuntimeError):
     """Raised when llama.cpp runtime operations fail."""
+
+
+def is_llama_timeout_error(value: Any) -> bool:
+    """Return True when error content indicates a request timeout."""
+    stack: List[Any] = [value]
+    seen: set[int] = set()
+
+    while stack:
+        current = stack.pop()
+        if current is None:
+            continue
+
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+
+        if isinstance(current, (TimeoutError, socket.timeout)):
+            return True
+
+        if isinstance(current, str):
+            lower = current.lower()
+            if "timed out" in lower or "timeout" in lower:
+                return True
+            continue
+
+        lower = str(current).lower()
+        if "timed out" in lower or "timeout" in lower:
+            return True
+
+        for attr in ("reason", "__cause__", "__context__"):
+            related = getattr(current, attr, None)
+            if related is not None and related is not current:
+                stack.append(related)
+
+    return False
 
 
 class LlamaCppRuntimeManager:
@@ -110,10 +148,14 @@ class LlamaCppRuntimeManager:
                 log_dir.mkdir(parents=True, exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 log_path = log_dir / f"llama-server-{port}-{timestamp}.log"
+                process_env = self._build_process_env(binary.parent)
                 self._log_handle = log_path.open("w", encoding="utf-8", errors="replace")
                 self._log_handle.write(f"# Started at {datetime.now().isoformat()}\n")
                 self._log_handle.write("# Command:\n")
                 self._log_handle.write(" ".join(cmd) + "\n\n")
+                if "LD_LIBRARY_PATH" in process_env:
+                    self._log_handle.write("# LD_LIBRARY_PATH:\n")
+                    self._log_handle.write(f"{process_env['LD_LIBRARY_PATH']}\n\n")
                 self._log_handle.flush()
                 self._log_file_path = str(log_path)
 
@@ -122,6 +164,7 @@ class LlamaCppRuntimeManager:
                     stdout=self._log_handle,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
+                    env=process_env,
                 )
             except OSError as exc:
                 raise LlamaCppRuntimeError(f"Failed to start llama-server: {exc}") from exc
@@ -132,7 +175,7 @@ class LlamaCppRuntimeManager:
             deadline = time.time() + startup_timeout
             while time.time() < deadline:
                 if not self._is_process_running():
-                    logs = self.get_recent_logs(max_lines=80)
+                    logs = self._read_recent_logs_from_path(self._log_file_path, max_lines=80)
                     details = f"\nRecent logs:\n{logs}" if logs else ""
                     raise LlamaCppRuntimeError(f"llama-server exited during startup{details}")
                 if self._check_health(base_url):
@@ -141,7 +184,7 @@ class LlamaCppRuntimeManager:
                 time.sleep(0.5)
 
             self._stop_locked()
-            logs = self.get_recent_logs(max_lines=80)
+            logs = self._read_recent_logs_from_path(self._log_file_path, max_lines=80)
             details = f"\nRecent logs:\n{logs}" if logs else ""
             raise LlamaCppRuntimeError(f"Timed out waiting for llama-server to become healthy{details}")
 
@@ -174,6 +217,11 @@ class LlamaCppRuntimeManager:
         with self._lock:
             log_path = self._log_file_path
 
+        return self._read_recent_logs_from_path(log_path, max_lines=max_lines)
+
+    @staticmethod
+    def _read_recent_logs_from_path(log_path: Optional[str], max_lines: int = 120) -> str:
+        """Read recent runtime logs from a specific path without runtime lock access."""
         if not log_path:
             return ""
 
@@ -187,6 +235,29 @@ class LlamaCppRuntimeManager:
             return "\n".join(lines[-max_lines:])
         except Exception:
             return ""
+
+    @staticmethod
+    def _build_process_env(binary_dir: Path) -> Dict[str, str]:
+        """Build process environment with runtime library search path hints."""
+        env = dict(os.environ)
+        dir_text = str(binary_dir)
+        path_sep = os.pathsep or ":"
+
+        if os.name == "nt":
+            current_path = env.get("PATH", "")
+            env["PATH"] = f"{dir_text}{path_sep}{current_path}" if current_path else dir_text
+            return env
+
+        current_ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{dir_text}{path_sep}{current_ld}" if current_ld else dir_text
+
+        current_dyld = env.get("DYLD_LIBRARY_PATH", "")
+        if current_dyld:
+            env["DYLD_LIBRARY_PATH"] = f"{dir_text}{path_sep}{current_dyld}"
+        else:
+            env["DYLD_LIBRARY_PATH"] = dir_text
+
+        return env
 
     def chat_completion(
         self,

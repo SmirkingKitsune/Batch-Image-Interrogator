@@ -156,6 +156,11 @@ Multimodal support requires a local `llama-server` runtime and a user-supplied m
      - Prefer highest exact CUDA/ROCm toolkit version match.
      - If exact match is unavailable, use the highest `llama.cpp` GPU build lower than the installed toolkit version.
      - If no compatible GPU build exists (for example, toolkit older than the minimum published CUDA build), fall back to CPU and emit a warning.
+   - On NVIDIA ARM64 systems (for example DGX Spark), you can also compile llama.cpp from source with:
+     ```bash
+     chmod +x build_llama_cpp_arm64.sh
+     ./build_llama_cpp_arm64.sh
+     ```
 2. Optional: set `LLAMA_CPP_VERSION=<release-tag>` before setup to pin a specific release (default is latest).
 3. Download a multimodal GGUF model (and optional `mmproj` file if the model requires it).
 4. Open the **Inquiry** tab and set:
@@ -166,12 +171,14 @@ Multimodal support requires a local `llama-server` runtime and a user-supplied m
 5. Load the LlamaCpp model and run:
    - batch inquiry in the Inquiry tab, or
    - single-image inquiry in the Inquiry tab (or **Advanced Image Inspection -> Multimodal Inquiry**).
+   - Timeout policy: each llama multimodal request uses a `120s` attempt, then one timeout-only retry at `300s`.
 
 Default setup install path:
 - Windows: `cache/llama_cpp/bin/llama-server.exe`
 - Linux/macOS: `cache/llama_cpp/bin/llama-server`
 
 The app auto-prefills the cached `llama-server` path when present. GGUF/mmproj model files remain user-supplied.
+On NVIDIA ARM64 systems (for example DGX Spark), if you see repeated multimodal timeouts, build `llama.cpp` from source with CUDA support and point Inquiry -> `llama-server` Path to that compiled binary.
 
 Optional provisioning flags (advanced/manual):
 - `--cuda-versions "13.1,12.4"`: provide multiple detected CUDA toolkits
@@ -693,6 +700,22 @@ The build script will:
 3. Build with CUDA support for ARM64
 4. Install the wheel into your virtual environment
 
+#### Building llama.cpp from Source for ARM64 (DGX Spark Path)
+
+For NVIDIA ARM64 systems where prebuilt `llama-server` binaries are unstable or slow, build llama.cpp locally:
+This helper is based on NVIDIA's DGX Spark walkthrough: https://build.nvidia.com/spark/llama-cpp/instructions
+
+```bash
+chmod +x build_llama_cpp_arm64.sh
+./build_llama_cpp_arm64.sh
+```
+
+The script follows NVIDIA’s DGX Spark flow (`GGML_CUDA=ON`, CUDA architecture targeting, source build), then installs the runtime to:
+
+- `cache/llama_cpp/bin/llama-server`
+
+After the build completes, use that path in **Inquiry -> llama-server Path**.
+
 #### Verification
 
 After setup (without building ONNX Runtime):
@@ -845,6 +868,11 @@ cat /opt/rocm/.info/version
 # Should match PyTorch ROCm version
 python -c "import torch; print(torch.__version__)"
 ```
+
+### llama.cpp Multimodal Timeouts
+- The app retries timeout failures once automatically (`120s`, then `300s`).
+- If errors continue on NVIDIA ARM64 platforms (for example DGX Spark), compile `llama.cpp` from source with CUDA enabled and use that binary in Inquiry -> `llama-server` Path.
+- Keep `ctx_size`/`max_tokens` reasonable for available VRAM; very large settings can increase timeout risk.
 
 ### Model Loading Fails
 - Ensure CUDA is properly configured (see above)

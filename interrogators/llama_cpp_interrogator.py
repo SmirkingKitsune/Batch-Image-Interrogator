@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.base_interrogator import BaseInterrogator
-from core.llama_cpp_runtime import LlamaCppRuntimeManager, LlamaCppRuntimeError
+from core.llama_cpp_runtime import (
+    LlamaCppRuntimeManager,
+    LlamaCppRuntimeError,
+    is_llama_timeout_error,
+)
 
 
 class LlamaCppInterrogator(BaseInterrogator):
@@ -17,6 +21,8 @@ class LlamaCppInterrogator(BaseInterrogator):
     TASK_MODES = ["describe", "ocr", "vqa", "custom"]
     REQUIRED_FIELDS = ["comment"]
     RESPONSE_TOOL_NAME = "submit_multimodal_response"
+    REQUEST_TIMEOUT_SECONDS = 120.0
+    REQUEST_TIMEOUT_RETRY_SECONDS = 300.0
 
     def __init__(self, model_name: str = "LlamaCpp"):
         super().__init__(model_name)
@@ -122,7 +128,7 @@ class LlamaCppInterrogator(BaseInterrogator):
         messages.append(user_message)
 
         try:
-            response = self.runtime.chat_completion(
+            response = self._chat_completion_with_timeout_retry(
                 messages=messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
@@ -170,7 +176,7 @@ class LlamaCppInterrogator(BaseInterrogator):
                         ],
                     }
                 )
-                retry_response = self.runtime.chat_completion(
+                retry_response = self._chat_completion_with_timeout_retry(
                     messages=retry_messages,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
@@ -192,7 +198,7 @@ class LlamaCppInterrogator(BaseInterrogator):
             # Fallback: retry without response_format for servers/models that ignore or mishandle it.
             try:
                 fallback_messages = retry_messages if retry_messages else messages
-                fallback_response = self.runtime.chat_completion(
+                fallback_response = self._chat_completion_with_timeout_retry(
                     messages=fallback_messages,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
@@ -291,6 +297,49 @@ class LlamaCppInterrogator(BaseInterrogator):
             self._owns_runtime = False
         self.is_loaded = False
         self.server_url = None
+
+    def _chat_completion_with_timeout_retry(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+        response_format: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Run completion with one timeout-specific retry at a longer timeout."""
+        try:
+            return self.runtime.chat_completion(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
+                timeout=self.REQUEST_TIMEOUT_SECONDS,
+            )
+        except LlamaCppRuntimeError as exc:
+            if not is_llama_timeout_error(exc):
+                raise
+
+        try:
+            return self.runtime.chat_completion(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
+                timeout=self.REQUEST_TIMEOUT_RETRY_SECONDS,
+            )
+        except LlamaCppRuntimeError as retry_exc:
+            if is_llama_timeout_error(retry_exc):
+                raise LlamaCppRuntimeError(
+                    "llama-server request failed after timeout retry "
+                    f"({int(self.REQUEST_TIMEOUT_SECONDS)}s then "
+                    f"{int(self.REQUEST_TIMEOUT_RETRY_SECONDS)}s): {retry_exc}"
+                ) from retry_exc
+            raise
 
     @classmethod
     def _build_system_prompt(cls) -> str:
@@ -607,7 +656,7 @@ class LlamaCppInterrogator(BaseInterrogator):
                 ),
             },
         ]
-        repair_resp = self.runtime.chat_completion(
+        repair_resp = self._chat_completion_with_timeout_retry(
             messages=repair_messages,
             temperature=0.0,
             max_tokens=max(256, min(1024, self.max_tokens)),

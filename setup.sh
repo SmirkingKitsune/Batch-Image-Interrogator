@@ -29,6 +29,89 @@ LLAMA_STATUS="not_checked"
 LLAMA_VERSION=""
 LLAMA_MESSAGE=""
 
+detect_cuda_version() {
+    local detected=""
+    local source="unknown"
+    local nvcc_output=""
+    local smi_output=""
+    local cuda_root=""
+    local version_json=""
+
+    nvcc_output="$(nvcc --version 2>/dev/null || true)"
+    if [ -n "$nvcc_output" ]; then
+        detected="$(echo "$nvcc_output" | grep -oE 'release[[:space:]]+[0-9]+(\.[0-9]+)?' | awk '{print $2}' | head -n1)"
+        if [ -n "$detected" ]; then
+            source="nvcc"
+        fi
+    fi
+
+    if [ -z "$detected" ]; then
+        for cuda_root in "${CUDA_HOME:-}" "${CUDA_PATH:-}" /usr/local/cuda /opt/cuda; do
+            [ -n "$cuda_root" ] || continue
+            version_json="${cuda_root}/version.json"
+            if [ -f "$version_json" ]; then
+                detected="$(grep -oE '"cuda"[[:space:]]*:[[:space:]]*"[0-9]+(\.[0-9]+)?' "$version_json" | head -n1 | grep -oE '[0-9]+(\.[0-9]+)?')"
+                if [ -n "$detected" ]; then
+                    source="version.json"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    if [ -z "$detected" ]; then
+        smi_output="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version:[[:space:]]*[0-9]+(\.[0-9]+)?' || true)"
+        if [ -n "$smi_output" ]; then
+            detected="$(echo "$smi_output" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)"
+            if [ -n "$detected" ]; then
+                source="nvidia-smi"
+            fi
+        fi
+    fi
+
+    echo "${detected}|${source}"
+}
+
+cuda_index_for_version() {
+    local version="$1"
+    local major="0"
+    local minor="0"
+
+    if [[ "$version" =~ ^([0-9]+)(\.([0-9]+))?$ ]]; then
+        major="${BASH_REMATCH[1]}"
+        if [ -n "${BASH_REMATCH[3]}" ]; then
+            minor="${BASH_REMATCH[3]}"
+        fi
+    fi
+
+    if [ "$major" -ge 13 ]; then
+        echo "cu130"
+    elif [ "$major" -eq 12 ] && [ "$minor" -ge 8 ]; then
+        echo "cu128"
+    elif [ "$major" -eq 12 ]; then
+        echo "cu126"
+    elif [ "$major" -eq 11 ] && [ "$minor" -ge 8 ]; then
+        echo "cu118"
+    else
+        echo "cu126"
+    fi
+}
+
+build_cuda_candidates() {
+    local preferred="$1"
+    local all_candidates=("$preferred" "cu130" "cu128" "cu126" "cu118")
+    local item=""
+    local result=()
+
+    for item in "${all_candidates[@]}"; do
+        if [[ " ${result[*]} " != *" $item "* ]]; then
+            result+=("$item")
+        fi
+    done
+
+    echo "${result[*]}"
+}
+
 echo ""
 echo "============================================================"
 echo "IMAGE INTERROGATOR - SETUP WIZARD"
@@ -84,6 +167,10 @@ INSTALL_CUDA="n"
 INSTALL_ROCM="n"
 GPU_TYPE="cpu"
 CUDA_VERSION="cpu"
+DETECTED_CUDA="unknown"
+CUDA_INDEX="cu126"
+CUDA_DETECTION_SOURCE="unknown"
+CUDA_CANDIDATES=()
 
 # Check for AMD GPU with ROCm (Linux only)
 if [ "$OS_TYPE" = "Linux" ]; then
@@ -127,36 +214,22 @@ if [ "$OS_TYPE" = "Linux" ]; then
         nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
         echo ""
 
-        # Detect CUDA version from nvidia-smi
-        NVIDIA_SMI_OUTPUT=$(nvidia-smi 2>/dev/null | grep "CUDA Version" || echo "")
-
-        if echo "$NVIDIA_SMI_OUTPUT" | grep -q "13."; then
-            # Extract actual version for display
-            DETECTED_CUDA=$(echo "$NVIDIA_SMI_OUTPUT" | grep -o "CUDA Version: [0-9.]*" | awk '{print $3}')
+        # Detect CUDA toolkit version (nvcc/version.json first, nvidia-smi fallback)
+        CUDA_DETECTION_RESULT="$(detect_cuda_version)"
+        DETECTED_CUDA="${CUDA_DETECTION_RESULT%%|*}"
+        CUDA_DETECTION_SOURCE="${CUDA_DETECTION_RESULT##*|}"
+        if [ -z "$DETECTED_CUDA" ]; then
+            DETECTED_CUDA="unknown"
             CUDA_INDEX="cu130"
-        elif echo "$NVIDIA_SMI_OUTPUT" | grep -q "12.8"; then
-            DETECTED_CUDA="12.8"
-            CUDA_INDEX="cu128"
-        elif echo "$NVIDIA_SMI_OUTPUT" | grep -q "12.6"; then
-            DETECTED_CUDA="12.6"
-            CUDA_INDEX="cu126"
-        elif echo "$NVIDIA_SMI_OUTPUT" | grep -q "12.4"; then
-            DETECTED_CUDA="12.4"
-            CUDA_INDEX="cu126"
-        elif echo "$NVIDIA_SMI_OUTPUT" | grep -q "12."; then
-            DETECTED_CUDA="12.x"
-            CUDA_INDEX="cu126"
-        elif echo "$NVIDIA_SMI_OUTPUT" | grep -q "11.8"; then
-            DETECTED_CUDA="11.8"
-            CUDA_INDEX="cu118"
         else
-            # Default to 12.6 if we can't detect
-            DETECTED_CUDA="12.x"
-            CUDA_INDEX="cu126"
+            CUDA_INDEX="$(cuda_index_for_version "$DETECTED_CUDA")"
         fi
+        read -r -a CUDA_CANDIDATES <<< "$(build_cuda_candidates "$CUDA_INDEX")"
 
         echo -e "      Detected CUDA Version: ${DETECTED_CUDA}"
+        echo -e "      Detection Source: ${CUDA_DETECTION_SOURCE}"
         echo -e "      Recommended PyTorch CUDA Version: ${CUDA_INDEX}"
+        echo -e "      Fallback PyTorch CUDA Versions: ${CUDA_CANDIDATES[*]}"
         echo ""
         INSTALL_CUDA="y"
         GPU_TYPE="cuda"
@@ -214,24 +287,40 @@ if python3 -c "import torch" 2>/dev/null; then
                 NEED_PYTORCH="n"
             fi
         else
-            # Check if CUDA version matches
-            CURRENT_CUDA=$(python3 -c "import torch; v=torch.__version__; print('cu130' if 'cu130' in v else 'cu128' if 'cu128' in v else 'cu126' if 'cu126' in v else 'cu118' if 'cu118' in v else 'cpu')")
+            if [ "$INSTALL_CUDA" = "y" ]; then
+                # Check whether installed torch CUDA build matches detected toolkit level
+                CURRENT_CUDA=$(python3 -c "import re, torch; v=getattr(torch.version, 'cuda', None) or ''; m=re.match(r'^(\d+)(?:\.(\d+))?', v); major=int(m.group(1)) if m else 0; minor=int(m.group(2) or 0) if m else 0; print('cu130' if major >= 13 else 'cu128' if major == 12 and minor >= 8 else 'cu126' if major == 12 else 'cu118' if major == 11 and minor >= 8 else 'cpu')")
 
-            if [ "$CURRENT_CUDA" != "$CUDA_INDEX" ]; then
-                echo ""
-                echo -e "${YELLOW}      [INFO] PyTorch CUDA version (${CURRENT_CUDA}) doesn't match system CUDA (${CUDA_INDEX})${NC}"
-                echo "      Current installation will work, but may not be optimal."
-                echo ""
-                read -p "      Reinstall PyTorch with CUDA ${DETECTED_CUDA} for optimal performance? (y/n): " REINSTALL
-                if [ "$REINSTALL" = "y" ] || [ "$REINSTALL" = "Y" ]; then
-                    NEED_PYTORCH="y"
+                if [ "$CURRENT_CUDA" != "$CUDA_INDEX" ]; then
+                    echo ""
+                    echo -e "${YELLOW}      [INFO] PyTorch CUDA version (${CURRENT_CUDA}) doesn't match system CUDA (${CUDA_INDEX})${NC}"
+                    echo "      Current installation will work, but may not be optimal."
+                    echo ""
+                    read -p "      Reinstall PyTorch with CUDA ${DETECTED_CUDA} for optimal performance? (y/n): " REINSTALL
+                    if [ "$REINSTALL" = "y" ] || [ "$REINSTALL" = "Y" ]; then
+                        NEED_PYTORCH="y"
+                    else
+                        echo "      Keeping current PyTorch installation."
+                        NEED_PYTORCH="n"
+                    fi
                 else
-                    echo "      Keeping current PyTorch installation."
+                    echo -e "${GREEN}      PyTorch with CUDA support is correctly installed${NC}"
                     NEED_PYTORCH="n"
                 fi
             else
-                echo -e "${GREEN}      PyTorch with CUDA support is correctly installed${NC}"
-                NEED_PYTORCH="n"
+                CURRENT_ROCM=$(python3 -c "import torch; print('rocm' if getattr(torch.version, 'hip', None) else 'unknown')")
+                if [ "$CURRENT_ROCM" = "rocm" ]; then
+                    echo -e "${GREEN}      PyTorch with ROCm support is correctly installed${NC}"
+                    NEED_PYTORCH="n"
+                else
+                    echo -e "${YELLOW}      [WARNING] PyTorch is installed but ROCm metadata is missing.${NC}"
+                    read -p "      Reinstall PyTorch with ROCm ${ROCM_VERSION} support? (y/n): " REINSTALL
+                    if [ "$REINSTALL" = "y" ] || [ "$REINSTALL" = "Y" ]; then
+                        NEED_PYTORCH="y"
+                    else
+                        NEED_PYTORCH="n"
+                    fi
+                fi
             fi
         fi
     else
@@ -262,7 +351,29 @@ if [ "$NEED_PYTORCH" = "y" ]; then
         echo "      Installing PyTorch with CUDA ${DETECTED_CUDA} support..."
         echo "      This may take several minutes (downloading ~2GB)..."
         echo ""
-        pip install torch torchvision --index-url https://download.pytorch.org/whl/${CUDA_VERSION}
+        if [ ${#CUDA_CANDIDATES[@]} -eq 0 ]; then
+            read -r -a CUDA_CANDIDATES <<< "$(build_cuda_candidates "$CUDA_VERSION")"
+        fi
+
+        PYTORCH_INSTALLED=false
+        for CANDIDATE_INDEX in "${CUDA_CANDIDATES[@]}"; do
+            echo "      Trying PyTorch index: ${CANDIDATE_INDEX}"
+            if pip install torch torchvision --index-url "https://download.pytorch.org/whl/${CANDIDATE_INDEX}"; then
+                CUDA_VERSION="${CANDIDATE_INDEX}"
+                PYTORCH_INSTALLED=true
+                break
+            fi
+            echo -e "${YELLOW}      [WARNING] PyTorch install failed for ${CANDIDATE_INDEX}.${NC}"
+        done
+
+        if [ "$PYTORCH_INSTALLED" = false ]; then
+            echo ""
+            echo -e "${RED}      [ERROR] Failed to install any CUDA-enabled PyTorch build.${NC}"
+            echo "      Tried indices: ${CUDA_CANDIDATES[*]}"
+            echo "      On DGX Spark, verify network access and consider using NVIDIA NGC containers for pre-validated stacks."
+            exit 1
+        fi
+        echo "      Installed PyTorch from index: ${CUDA_VERSION}"
     else
         echo "      Installing PyTorch (CPU-only version)..."
         pip install torch torchvision
@@ -292,10 +403,14 @@ if [ "$INSTALL_CUDA" = "y" ]; then
 
     # Check if ARM64 - onnxruntime-gpu doesn't provide ARM wheels on PyPI
     if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-        echo -e "${YELLOW}      [INFO] ARM64 detected - onnxruntime-gpu wheels not available on PyPI${NC}"
-        echo "      Installing CPU-only ONNX Runtime (WD Tagger will run on CPU)..."
-        echo "      Tip: Run ./build_onnx_arm64.sh to build ONNX Runtime with GPU support."
-        pip install "onnxruntime>=1.16.0" || echo -e "${YELLOW}      [WARNING] Failed to install ONNX Runtime. Continuing anyway...${NC}"
+        if python3 -c "import onnxruntime as ort; exit(0 if 'CUDAExecutionProvider' in ort.get_available_providers() else 1)" 2>/dev/null; then
+            echo -e "${GREEN}      Existing ONNX Runtime CUDA provider detected on ARM64; keeping current install.${NC}"
+        else
+            echo -e "${YELLOW}      [INFO] ARM64 detected - onnxruntime-gpu wheels not available on PyPI${NC}"
+            echo "      Installing CPU-only ONNX Runtime (WD Tagger will run on CPU)..."
+            echo "      Tip: Run ./build_onnx_arm64.sh to build ONNX Runtime with GPU support."
+            pip install "onnxruntime>=1.16.0" || echo -e "${YELLOW}      [WARNING] Failed to install ONNX Runtime. Continuing anyway...${NC}"
+        fi
     else
         # For x86_64, try GPU version
         ONNX_INSTALLED=false
@@ -380,6 +495,9 @@ else
         echo -e "${YELLOW}      $LLAMA_MESSAGE${NC}"
     fi
     echo "      Manual fallback: https://github.com/ggml-org/llama.cpp/releases"
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        echo "      Tip: Run ./build_llama_cpp_arm64.sh to compile llama.cpp with CUDA from source."
+    fi
 fi
 echo ""
 
@@ -463,7 +581,12 @@ elif [ "$INSTALL_CUDA" = "y" ]; then
 
     # Handle ARM64 vs x86_64 differently for success messages
     if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-        if [ "$PYTORCH_OK" = true ]; then
+        if [ "$PYTORCH_OK" = true ] && [ "$ONNX_OK" = true ]; then
+            echo -e "${GREEN}[SUCCESS] GPU acceleration is fully enabled!${NC}"
+            echo "  - PyTorch: CUDA enabled (for CLIP models)"
+            echo "  - ONNX Runtime: CUDA enabled (for WD Tagger models)"
+            echo ""
+        elif [ "$PYTORCH_OK" = true ]; then
             echo -e "${GREEN}[SUCCESS] GPU acceleration is enabled!${NC}"
             echo "  - PyTorch: CUDA enabled (for CLIP models)"
             echo "  - ONNX Runtime: CPU mode (no ARM64 GPU wheels on PyPI)"

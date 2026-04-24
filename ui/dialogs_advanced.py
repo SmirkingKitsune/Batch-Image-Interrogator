@@ -2,6 +2,7 @@
 
 import logging
 import json
+import platform
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QComboBox, QGroupBox, QSplitter,
                              QTabWidget, QWidget, QTableWidget, QTableWidgetItem,
@@ -14,6 +15,8 @@ from typing import Any, Dict, List, Optional, Set, Union
 
 from core import FileManager, TagFilterSettings, InterrogationDatabase, get_image_metadata
 from core.hashing import hash_image_content
+from core.device_detector import get_device_detector
+from core.llama_cpp_runtime import is_llama_timeout_error
 from interrogators import LlamaCppInterrogator
 from ui.widgets import TagEditorWidget, ResultsTableWidget
 
@@ -255,6 +258,11 @@ class AdvancedImageInspectionDialog(QDialog):
 
     # Settings keys
     SETTINGS_KEY_LAST_TAB = "AdvancedImageInspectionDialog/lastTabIndex"
+    DGX_TIMEOUT_HINT = (
+        "Hint: On NVIDIA ARM64 systems (for example DGX Spark), prebuilt llama.cpp "
+        "binaries can be unstable for multimodal inference. Build llama.cpp from source "
+        "with CUDA support and set Inquiry -> llama-server Path to that compiled binary."
+    )
 
     def __init__(self,
                  image_path: Union[str, List[str]],
@@ -993,6 +1001,25 @@ class AdvancedImageInspectionDialog(QDialog):
         self.llama_config = config
         return config
 
+    def _append_timeout_hint_if_needed(self, error_text: str) -> str:
+        """Append DGX Spark guidance for timeout failures on ARM64 NVIDIA systems."""
+        if not is_llama_timeout_error(error_text):
+            return error_text
+
+        arch = platform.machine().lower()
+        if arch not in ("arm64", "aarch64"):
+            return error_text
+
+        try:
+            if not get_device_detector().is_pytorch_cuda_available():
+                return error_text
+        except Exception:
+            return error_text
+
+        if self.DGX_TIMEOUT_HINT in error_text:
+            return error_text
+        return f"{error_text}\n\n{self.DGX_TIMEOUT_HINT}"
+
     def _ensure_multimodal_ready(self) -> bool:
         """Ensure llama.cpp interrogator exists and is loaded with valid config."""
         if self.is_multi_mode:
@@ -1181,7 +1208,8 @@ class AdvancedImageInspectionDialog(QDialog):
             self._load_multimodal_history()
 
         except Exception as e:
-            QMessageBox.critical(self, "Multimodal Error", f"Multimodal inquiry failed:\n{str(e)}")
+            error_text = self._append_timeout_hint_if_needed(str(e))
+            QMessageBox.critical(self, "Multimodal Error", f"Multimodal inquiry failed:\n{error_text}")
         finally:
             self.mm_send_button.setEnabled(True)
 

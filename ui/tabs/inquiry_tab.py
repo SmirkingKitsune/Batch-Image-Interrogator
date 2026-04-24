@@ -1,5 +1,6 @@
 """Inquiry Tab - dedicated llama.cpp multimodal workflows."""
 
+import platform
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +33,8 @@ from PyQt6.QtWidgets import (
 )
 
 from core import InterrogationDatabase, TagFilterSettings, get_image_metadata, hash_image_content
+from core.device_detector import get_device_detector
+from core.llama_cpp_runtime import is_llama_timeout_error
 from interrogators import LlamaCppInterrogator
 from ui.dialogs import create_llama_config_widget
 from ui.dialogs_advanced import AdvancedImageInspectionDialog
@@ -40,6 +43,12 @@ from ui.workers import MultimodalInterrogationWorker
 
 class InquiryTab(QWidget):
     """Dedicated tab for llama.cpp multimodal image inquiry workflows."""
+
+    DGX_TIMEOUT_HINT = (
+        "Hint: On NVIDIA ARM64 systems (for example DGX Spark), prebuilt llama.cpp "
+        "binaries can be unstable for multimodal inference. Build llama.cpp from source "
+        "with CUDA support and set Inquiry -> llama-server Path to that compiled binary."
+    )
 
     model_loaded = pyqtSignal(str)
     model_unloaded = pyqtSignal()
@@ -427,6 +436,25 @@ class InquiryTab(QWidget):
             except ValueError:
                 return path.name
         return path.name
+
+    def _append_timeout_hint_if_needed(self, error_text: str) -> str:
+        """Append DGX Spark guidance for timeout failures on ARM64 NVIDIA systems."""
+        if not is_llama_timeout_error(error_text):
+            return error_text
+
+        arch = platform.machine().lower()
+        if arch not in ("arm64", "aarch64"):
+            return error_text
+
+        try:
+            if not get_device_detector().is_pytorch_cuda_available():
+                return error_text
+        except Exception:
+            return error_text
+
+        if self.DGX_TIMEOUT_HINT in error_text:
+            return error_text
+        return f"{error_text}\n\n{self.DGX_TIMEOUT_HINT}"
 
     def load_model(self):
         """Load llama.cpp interrogator with current config."""
@@ -883,7 +911,12 @@ class InquiryTab(QWidget):
         except Exception as exc:
             recent_logs = self.current_interrogator.runtime.get_recent_logs(max_lines=60)
             details = f"\n\nRecent llama logs:\n{recent_logs}" if recent_logs else ""
-            QMessageBox.critical(self, "Inquiry Error", f"Single-image inquiry failed:\n{exc}{details}")
+            error_text = self._append_timeout_hint_if_needed(str(exc))
+            QMessageBox.critical(
+                self,
+                "Inquiry Error",
+                f"Single-image inquiry failed:\n{error_text}{details}",
+            )
         finally:
             self.send_single_button.setEnabled(True)
 
@@ -1041,7 +1074,7 @@ class InquiryTab(QWidget):
                 item.setText(f"Error - {self._to_display_name(image_path)}")
                 break
         self.batch_error_count += 1
-        self.last_batch_error = error
+        self.last_batch_error = self._append_timeout_hint_if_needed(error)
         self.progress_label.setText(error or "Batch inquiry error")
 
     def on_batch_finished(self):
