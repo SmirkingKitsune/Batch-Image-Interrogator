@@ -30,6 +30,37 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/onnxruntime_build"
 ONNX_VERSION="v1.23.2"  # Latest stable release
 
+detect_cuda_architectures() {
+    local cap_lines=""
+    local cap=""
+    local arch=""
+    local arch_values=()
+
+    cap_lines="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -z "$cap_lines" ]; then
+        cap_lines="$(nvidia-smi -q 2>/dev/null | grep -oE 'CUDA Compute Capability[[:space:]]*:[[:space:]]*[0-9]+\.[0-9]+' | awk -F: '{print $2}' | tr -d '[:space:]' || true)"
+    fi
+
+    if [ -n "$cap_lines" ]; then
+        while IFS= read -r cap; do
+            [ -n "$cap" ] || continue
+            if [[ "$cap" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+                arch="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+                if [[ " ${arch_values[*]} " != *" ${arch} "* ]]; then
+                    arch_values+=("$arch")
+                fi
+            fi
+        done <<< "$cap_lines"
+    fi
+
+    if [ ${#arch_values[@]} -eq 0 ]; then
+        # Safe default set for recent high-end GPUs including Blackwell.
+        arch_values=("90" "100")
+    fi
+
+    (IFS=';'; echo "${arch_values[*]}")
+}
+
 echo ""
 echo "============================================================"
 echo "ONNX RUNTIME GPU BUILD FOR ARM64"
@@ -93,10 +124,30 @@ if [ -z "$CUDA_HOME" ]; then
     elif [ -d "/opt/cuda" ]; then
         export CUDA_HOME="/opt/cuda"
     else
-        CUDA_HOME=$(dirname $(dirname $(which nvcc)))
+        CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
     fi
 fi
 echo "    CUDA_HOME: ${CUDA_HOME}"
+
+CUDA_ARCHITECTURES="$(detect_cuda_architectures)"
+echo "    CUDA Architectures: ${CUDA_ARCHITECTURES}"
+
+CCCL_INCLUDE=""
+for cccl_path in \
+    "${CUDA_HOME}/targets/sbsa-linux/include/cccl" \
+    "${CUDA_HOME}/targets/aarch64-linux/include/cccl" \
+    "${CUDA_HOME}/include/cccl"
+do
+    if [ -d "$cccl_path" ]; then
+        CCCL_INCLUDE="$cccl_path"
+        break
+    fi
+done
+if [ -n "$CCCL_INCLUDE" ]; then
+    echo "    CCCL Include: ${CCCL_INCLUDE}"
+else
+    echo -e "${YELLOW}    [INFO] CCCL include path not found explicitly; using default CUDA include paths${NC}"
+fi
 
 # Check for cuDNN
 CUDNN_FOUND=false
@@ -266,21 +317,35 @@ echo ""
 # --skip_tests to save time
 # --parallel for faster compilation
 # Use system Eigen to avoid download issues with hash mismatches
-./build.sh \
-    --config Release \
-    --build_wheel \
-    --skip_tests \
-    --parallel ${PARALLEL_JOBS} \
-    --use_cuda \
-    --cuda_home "${CUDA_HOME}" \
-    --cudnn_home "$(dirname ${CUDNN_INCLUDE})" \
-    --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES="80;86;87;89;90" \
-    --cmake_extra_defines Eigen3_DIR=/usr/share/eigen3/cmake \
-    --cmake_extra_defines onnxruntime_USE_PREINSTALLED_EIGEN=ON \
-    --cmake_extra_defines onnxruntime_ENABLE_CPUINFO=OFF \
-    --cmake_extra_defines onnxruntime_DEV_MODE=OFF \
-    --cmake_extra_defines CMAKE_CXX_FLAGS="-Wno-error=deprecated-declarations -I/usr/local/cuda/targets/sbsa-linux/include/cccl" \
-    --cmake_extra_defines CMAKE_CUDA_FLAGS="-Wno-deprecated-declarations -I/usr/local/cuda/targets/sbsa-linux/include/cccl"
+BUILD_CMD=(
+    ./build.sh
+    --config Release
+    --build_wheel
+    --skip_tests
+    --parallel "${PARALLEL_JOBS}"
+    --use_cuda
+    --cuda_home "${CUDA_HOME}"
+    --cudnn_home "$(dirname "${CUDNN_INCLUDE}")"
+    --cmake_extra_defines "CMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}"
+    --cmake_extra_defines "Eigen3_DIR=/usr/share/eigen3/cmake"
+    --cmake_extra_defines "onnxruntime_USE_PREINSTALLED_EIGEN=ON"
+    --cmake_extra_defines "onnxruntime_ENABLE_CPUINFO=OFF"
+    --cmake_extra_defines "onnxruntime_DEV_MODE=OFF"
+)
+
+if [ -n "$CCCL_INCLUDE" ]; then
+    BUILD_CMD+=(
+        --cmake_extra_defines "CMAKE_CXX_FLAGS=-Wno-error=deprecated-declarations -I${CCCL_INCLUDE}"
+        --cmake_extra_defines "CMAKE_CUDA_FLAGS=-Wno-deprecated-declarations -I${CCCL_INCLUDE}"
+    )
+else
+    BUILD_CMD+=(
+        --cmake_extra_defines "CMAKE_CXX_FLAGS=-Wno-error=deprecated-declarations"
+        --cmake_extra_defines "CMAKE_CUDA_FLAGS=-Wno-deprecated-declarations"
+    )
+fi
+
+"${BUILD_CMD[@]}"
 
 if [ $? -ne 0 ]; then
     echo ""
