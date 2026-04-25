@@ -3,6 +3,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "interrogators" / "llama_cpp_interrogator.py"
 SPEC = importlib.util.spec_from_file_location("llama_cpp_interrogator", MODULE_PATH)
@@ -182,6 +183,34 @@ class TestLlamaCppInterrogator(unittest.TestCase):
         self.assertIn('"OCR": [', prompt)
         self.assertIn('"comment":', prompt)
         self.assertIn("Do not include markdown fences", prompt)
+
+    def test_load_model_uses_runtime_resolved_server_port(self):
+        interrogator = LlamaCppInterrogator(model_name="LlamaCpp")
+        runtime_mock = mock.Mock()
+        runtime_mock.resolve_server_port.return_value = 18081
+        runtime_mock.ensure_server.return_value = "http://127.0.0.1:18081"
+        interrogator.runtime = runtime_mock
+
+        interrogator.load_model(
+            llama_binary_path="C:/tmp/llama-server.exe",
+            llama_model_path="C:/tmp/model.gguf",
+            llama_mmproj_path=None,
+            ctx_size=4096,
+            gpu_layers=-1,
+            temperature=0.2,
+            max_tokens=256,
+            server_port=8080,
+            server_host="127.0.0.1",
+        )
+
+        cfg = interrogator.get_config()
+        self.assertEqual(cfg["server_port"], 18081)
+        runtime_mock.resolve_server_port.assert_called_once_with(
+            host="127.0.0.1",
+            requested_port=8080,
+        )
+        ensure_kwargs = runtime_mock.ensure_server.call_args.kwargs
+        self.assertEqual(ensure_kwargs["port"], 18081)
 
 
 if __name__ == "__main__":

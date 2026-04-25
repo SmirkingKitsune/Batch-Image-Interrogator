@@ -4,6 +4,7 @@ Pillow>=10.0.0
 numpy>=1.24.0
 huggingface-hub>=0.19.0
 pandas>=2.0.0
+tqdm>=4.66.0
 
 # CLIP Interrogator
 clip-interrogator>=0.6.0

@@ -287,15 +287,16 @@ Organize images into subdirectories based on tags with smart recursive search:
 2. **Review the warning**: Operation will MOVE (not copy) files
 3. Enter tags to match (comma-separated)
 4. Specify target subdirectory name
-5. Choose match mode:
+5. Optional: Check "Create target subdirectory in root directory" to place all matches under `<root>/<subdir>` instead of each image's parent
+6. Choose match mode:
    - **any**: Move if image has at least one matching tag
    - **all**: Move only if image has all specified tags
-6. **Optional - Recursive Search**:
+7. **Optional - Recursive Search**:
    - Check "Include subdirectories (recursive)" to search all subdirectories
    - Select which subdirectories to include as sources (prevents re-organizing already-organized files)
    - Example: Uncheck "organized" folder to avoid moving previously organized images
-7. Optionally move .txt files with images
-8. Click "Move Images" and confirm the operation
+8. Optionally move .txt files with images
+9. Click "Move Images" and confirm the operation
 
 **Important Safety Features:**
 - ⚠️ Bold warning at top of dialog indicates this is a MOVE operation

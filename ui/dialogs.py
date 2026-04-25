@@ -1098,6 +1098,11 @@ class OrganizeDialog(QDialog):
         self.recursive_check.stateChanged.connect(self._on_recursive_changed)
         form_layout.addRow("", self.recursive_check)
 
+        # Destination mode
+        self.target_in_root_check = QCheckBox("Create target subdirectory in root directory")
+        self.target_in_root_check.setChecked(False)
+        form_layout.addRow("", self.target_in_root_check)
+
         layout.addLayout(form_layout)
 
         # Directory selection (initially hidden)
@@ -1289,6 +1294,8 @@ class OrganizeDialog(QDialog):
 
         # Get recursive option
         recursive = self.recursive_check.isChecked()
+        target_in_root = self.target_in_root_check.isChecked()
+        target_root_dir = self.current_directory if target_in_root else None
         selected_dirs = []
 
         # Get images
@@ -1337,6 +1344,7 @@ class OrganizeDialog(QDialog):
         tags_str = ", ".join(tags)
         move_text_str = "Yes" if move_text else "No"
         recursive_str = "Yes" if recursive else "No"
+        target_mode_str = "Root directory" if target_in_root else "Each image's parent directory"
 
         confirmation_msg = (
             f"⚠️ WARNING: This will MOVE files (not copy)!\n\n"
@@ -1345,6 +1353,7 @@ class OrganizeDialog(QDialog):
             f"• Tags to match: {tags_str}\n"
             f"• Match mode: {match_mode}\n"
             f"• Target subdirectory: {subdir}\n"
+            f"• Target location mode: {target_mode_str}\n"
             f"• Move .txt files: {move_text_str}\n"
             f"• Recursive search: {recursive_str}\n"
         )
@@ -1353,9 +1362,14 @@ class OrganizeDialog(QDialog):
             dirs_str = ", ".join(selected_dirs)
             confirmation_msg += f"• Source directories: {dirs_str}\n"
 
+        if target_in_root:
+            destination_details = f"{self.current_directory / subdir}"
+        else:
+            destination_details = "<each source image parent>/" + subdir
+
         confirmation_msg += (
             f"\nFiles will be permanently moved from their current location to:\n"
-            f"{self.current_directory / subdir}\n\n"
+            f"{destination_details}\n\n"
             f"Do you want to proceed?"
         )
 
@@ -1376,7 +1390,8 @@ class OrganizeDialog(QDialog):
             tags,
             subdir,
             match_mode,
-            move_text
+            move_text,
+            target_root_dir
         )
 
         # Connect signals

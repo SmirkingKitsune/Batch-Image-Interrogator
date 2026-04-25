@@ -48,6 +48,10 @@ class LlamaCppInterrogator(BaseInterrogator):
     ):
         """Start or reuse managed llama.cpp server and load multimodal model."""
         model_path = Path(llama_model_path).expanduser().resolve()
+        resolved_port = self.runtime.resolve_server_port(
+            host=str(server_host),
+            requested_port=int(server_port),
+        )
         model_label = f"LlamaCpp/{model_path.name}"
         self.model_name = model_label
         self.temperature = float(temperature)
@@ -65,7 +69,7 @@ class LlamaCppInterrogator(BaseInterrogator):
             "gpu_layers": int(gpu_layers),
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
-            "server_port": int(server_port),
+            "server_port": int(resolved_port),
             "server_host": str(server_host),
             **kwargs,
         }

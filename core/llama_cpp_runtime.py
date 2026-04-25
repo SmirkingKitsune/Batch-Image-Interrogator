@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib import request, error
+from urllib.parse import urlparse
 
 
 class LlamaCppRuntimeError(RuntimeError):
@@ -106,16 +107,18 @@ class LlamaCppRuntimeManager:
         if mmproj and not mmproj.exists():
             raise LlamaCppRuntimeError(f"Multimodal projector not found: {mmproj}")
 
+        resolved_port = self.resolve_server_port(host=host, requested_port=int(port))
+
         config_key = (
             str(binary),
             str(model),
             str(mmproj) if mmproj else "",
             host,
-            int(port),
+            int(resolved_port),
             int(ctx_size),
             int(gpu_layers),
         )
-        base_url = f"http://{host}:{port}"
+        base_url = f"http://{host}:{resolved_port}"
 
         with self._lock:
             if self._is_process_running() and self._config_key == config_key:
@@ -132,7 +135,7 @@ class LlamaCppRuntimeManager:
                 "--host",
                 host,
                 "--port",
-                str(port),
+                str(resolved_port),
                 "--model",
                 str(model),
                 "--ctx-size",
@@ -147,7 +150,7 @@ class LlamaCppRuntimeManager:
                 log_dir = Path(__file__).resolve().parents[1] / "cache" / "llama_cpp" / "logs"
                 log_dir.mkdir(parents=True, exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                log_path = log_dir / f"llama-server-{port}-{timestamp}.log"
+                log_path = log_dir / f"llama-server-{resolved_port}-{timestamp}.log"
                 process_env = self._build_process_env(binary.parent)
                 self._log_handle = log_path.open("w", encoding="utf-8", errors="replace")
                 self._log_handle.write(f"# Started at {datetime.now().isoformat()}\n")
@@ -219,6 +222,44 @@ class LlamaCppRuntimeManager:
 
         return self._read_recent_logs_from_path(log_path, max_lines=max_lines)
 
+    def resolve_server_port(
+        self,
+        host: str = "127.0.0.1",
+        requested_port: int = 8080,
+        scan_window: int = 200,
+    ) -> int:
+        """
+        Resolve a usable server port for llama.cpp.
+
+        Rules:
+        - Reuse the currently managed healthy runtime port when available.
+        - Otherwise prefer requested_port when free.
+        - Otherwise scan upward for a free port to avoid overlap.
+        """
+        requested = int(requested_port)
+        if requested < 1 or requested > 65535:
+            raise LlamaCppRuntimeError(f"Invalid server port: {requested}")
+
+        with self._lock:
+            active_port = self._get_active_managed_port_locked(host=host)
+            if active_port is not None:
+                return active_port
+
+        if self._is_port_available(host=host, port=requested):
+            return requested
+
+        for candidate in range(requested + 1, min(65536, requested + 1 + max(1, int(scan_window)))):
+            if self._is_port_available(host=host, port=candidate):
+                return candidate
+
+        fallback_port = self._bind_ephemeral_port(host=host)
+        if fallback_port is not None:
+            return fallback_port
+
+        raise LlamaCppRuntimeError(
+            f"No available llama-server port found near {requested} on host {host}"
+        )
+
     @staticmethod
     def _read_recent_logs_from_path(log_path: Optional[str], max_lines: int = 120) -> str:
         """Read recent runtime logs from a specific path without runtime lock access."""
@@ -258,6 +299,31 @@ class LlamaCppRuntimeManager:
             env["DYLD_LIBRARY_PATH"] = dir_text
 
         return env
+
+    @staticmethod
+    def _is_port_available(host: str, port: int) -> bool:
+        """Return True when a TCP port can be bound on the requested host."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, int(port)))
+            return True
+        except OSError:
+            return False
+        finally:
+            sock.close()
+
+    @staticmethod
+    def _bind_ephemeral_port(host: str) -> Optional[int]:
+        """Reserve and return an ephemeral free port, or None when unavailable."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind((host, 0))
+            return int(sock.getsockname()[1])
+        except OSError:
+            return None
+        finally:
+            sock.close()
 
     def chat_completion(
         self,
@@ -310,6 +376,24 @@ class LlamaCppRuntimeManager:
     def _is_process_running(self) -> bool:
         """Return True if managed server process is alive."""
         return self._process is not None and self._process.poll() is None
+
+    def _get_active_managed_port_locked(self, host: str) -> Optional[int]:
+        """
+        Return active managed runtime port for host when healthy.
+        Must be called under self._lock.
+        """
+        if not self._is_process_running() or not self._base_url:
+            return None
+        parsed = urlparse(self._base_url)
+        active_host = parsed.hostname
+        active_port = parsed.port
+        if not active_host or active_port is None:
+            return None
+        if active_host != host:
+            return None
+        if not self._check_health(self._base_url):
+            return None
+        return int(active_port)
 
     def _stop_locked(self) -> None:
         """Stop process and clear runtime state. Must be called under lock."""
