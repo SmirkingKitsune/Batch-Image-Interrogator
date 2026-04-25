@@ -483,6 +483,14 @@ class InquiryTab(QWidget):
                 server_port=config["server_port"],
                 server_host="127.0.0.1",
             )
+            requested_port = int(config.get("server_port", 8080))
+            resolved_port = int(
+                self.current_interrogator.get_config().get("server_port", requested_port)
+            )
+            if resolved_port != requested_port:
+                self.llama_config["server_port"] = resolved_port
+                if self.llama_config_refs:
+                    self.llama_config_refs["server_port_spin"].setValue(resolved_port)
 
             model_info = f"LlamaCpp - {Path(config['llama_model_path']).name}"
             runtime_meta = self.current_interrogator.runtime.get_runtime_metadata()
@@ -495,9 +503,24 @@ class InquiryTab(QWidget):
             )
             self.inquiry_status_label.setStyleSheet("color: green;")
             if runtime_log:
-                self.progress_label.setText(f"Model loaded successfully. Runtime logs: {runtime_log}")
+                if resolved_port != requested_port:
+                    self.progress_label.setText(
+                        "Model loaded successfully. "
+                        f"Requested port {requested_port} was unavailable; using {resolved_port}. "
+                        f"Runtime logs: {runtime_log}"
+                    )
+                else:
+                    self.progress_label.setText(
+                        f"Model loaded successfully. Runtime logs: {runtime_log}"
+                    )
             else:
-                self.progress_label.setText("Model loaded successfully")
+                if resolved_port != requested_port:
+                    self.progress_label.setText(
+                        "Model loaded successfully. "
+                        f"Requested port {requested_port} was unavailable; using {resolved_port}."
+                    )
+                else:
+                    self.progress_label.setText("Model loaded successfully")
             self.unload_model_button.setEnabled(True)
             self.batch_inquiry_button.setEnabled(bool(self.loaded_image_paths))
             self._prime_current_session_history()

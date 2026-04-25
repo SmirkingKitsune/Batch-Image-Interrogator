@@ -2,6 +2,7 @@
 
 import os
 import uuid
+from contextlib import nullcontext
 from PyQt6.QtCore import QThread, pyqtSignal
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -10,6 +11,11 @@ from core import (
     FileManager, TagFilterSettings, DatabaseBusyError, DatabaseQueuedError
 )
 from core.base_interrogator import BaseInterrogator
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency fallback
+    tqdm = None
 
 
 class InterrogationWorker(QThread):
@@ -212,98 +218,114 @@ class MultimodalInterrogationWorker(QThread):
         batch_run_id = str(uuid.uuid4())
         shared_session_key = f"batch:{batch_run_id}" if self.carry_context_across_batch else None
 
-        for idx, image_path in enumerate(self.image_paths):
-            if self.is_cancelled:
-                break
+        progress_ctx = (
+            tqdm(
+                total=total,
+                desc=f"llama-cpp {self.task}",
+                unit="job",
+                dynamic_ncols=True,
+                leave=False,
+            )
+            if tqdm and total > 0
+            else nullcontext()
+        )
+        with progress_ctx as tqdm_bar:
+            for idx, image_path in enumerate(self.image_paths):
+                if self.is_cancelled:
+                    break
 
-            image_path_str = str(image_path)
-            try:
-                self.progress.emit(idx + 1, total, f"Processing: {image_path.name}")
-                file_hash = hash_image_content(image_path_str)
+                image_path_str = str(image_path)
+                try:
+                    self.progress.emit(idx + 1, total, f"Processing: {image_path.name}")
+                    file_hash = hash_image_content(image_path_str)
 
-                metadata = get_image_metadata(image_path_str)
-                image_id = self.database.register_image(
-                    image_path_str,
-                    file_hash,
-                    metadata["width"],
-                    metadata["height"],
-                    metadata["file_size"],
-                )
+                    metadata = get_image_metadata(image_path_str)
+                    image_id = self.database.register_image(
+                        image_path_str,
+                        file_hash,
+                        metadata["width"],
+                        metadata["height"],
+                        metadata["file_size"],
+                    )
 
-                included_tables = self._build_included_tables(file_hash)
+                    included_tables = self._build_included_tables(file_hash)
 
-                if shared_session_key:
-                    session_key = shared_session_key
-                else:
-                    session_key = f"batch:{batch_run_id}:{file_hash}"
+                    if shared_session_key:
+                        session_key = shared_session_key
+                    else:
+                        session_key = f"batch:{batch_run_id}:{file_hash}"
 
-                results = self.interrogator.interrogate(
-                    image_path_str,
-                    task=self.task,
-                    prompt=self.prompt,
-                    session_key=session_key,
-                    keep_context=bool(self.carry_context_across_batch),
-                    included_tables=included_tables,
-                )
+                    results = self.interrogator.interrogate(
+                        image_path_str,
+                        task=self.task,
+                        prompt=self.prompt,
+                        session_key=session_key,
+                        keep_context=bool(self.carry_context_across_batch),
+                        included_tables=included_tables,
+                    )
 
-                # Keep latest multimodal result in main interrogations table.
-                self.database.save_interrogation(
-                    image_id,
-                    model_id,
-                    results["tags"],
-                    results.get("confidence_scores"),
-                    results.get("raw_output"),
-                )
+                    # Keep latest multimodal result in main interrogations table.
+                    self.database.save_interrogation(
+                        image_id,
+                        model_id,
+                        results["tags"],
+                        results.get("confidence_scores"),
+                        results.get("raw_output"),
+                    )
 
-                response_json = results.get("multimodal_response", {})
-                session_id = self.database.create_or_get_multimodal_session(
-                    image_id=image_id,
-                    model_id=model_id,
-                    mode="batch",
-                    session_key=session_key,
-                )
-                self.database.append_multimodal_turn(
-                    session_id=session_id,
-                    prompt_type=self.task,
-                    prompt_text=self.prompt,
-                    included_tables=included_tables,
-                    response_json=response_json,
-                    tags=results["tags"],
-                    reasoning_summary=response_json.get("reasoning_summary", ""),
-                )
+                    response_json = results.get("multimodal_response", {})
+                    session_id = self.database.create_or_get_multimodal_session(
+                        image_id=image_id,
+                        model_id=model_id,
+                        mode="batch",
+                        session_key=session_key,
+                    )
+                    self.database.append_multimodal_turn(
+                        session_id=session_id,
+                        prompt_type=self.task,
+                        prompt_text=self.prompt,
+                        included_tables=included_tables,
+                        response_json=response_json,
+                        tags=results["tags"],
+                        reasoning_summary=response_json.get("reasoning_summary", ""),
+                    )
 
-                if self.write_files:
-                    tags_to_write = results["tags"]
-                    if self.tag_filters:
-                        confidence_scores = results.get("confidence_scores")
-                        if confidence_scores is not None:
-                            threshold = self.interrogator.get_config().get("threshold", 0.35)
-                            tags_to_write, _ = self.tag_filters.filter_tags_with_confidence(
+                    if self.write_files:
+                        tags_to_write = results["tags"]
+                        if self.tag_filters:
+                            confidence_scores = results.get("confidence_scores")
+                            if confidence_scores is not None:
+                                threshold = self.interrogator.get_config().get("threshold", 0.35)
+                                tags_to_write, _ = self.tag_filters.filter_tags_with_confidence(
+                                    tags_to_write,
+                                    confidence_scores,
+                                    threshold,
+                                )
+                            else:
+                                tags_to_write = self.tag_filters.apply_filters(tags_to_write)
+
+                        txt_path = FileManager.get_text_file_path(image_path)
+                        if not txt_path.exists() or self.overwrite_files:
+                            FileManager.write_tags_to_file(
+                                image_path,
                                 tags_to_write,
-                                confidence_scores,
-                                threshold,
+                                overwrite=self.overwrite_files,
                             )
-                        else:
-                            tags_to_write = self.tag_filters.apply_filters(tags_to_write)
 
-                    txt_path = FileManager.get_text_file_path(image_path)
-                    if not txt_path.exists() or self.overwrite_files:
-                        FileManager.write_tags_to_file(
-                            image_path,
-                            tags_to_write,
-                            overwrite=self.overwrite_files,
-                        )
+                    self.result.emit(image_path_str, results)
 
-                self.result.emit(image_path_str, results)
-
-            except DatabaseQueuedError:
-                # Continue even if DB operation queued.
-                continue
-            except DatabaseBusyError as e:
-                self.error.emit(image_path_str, f"Database busy: {e}")
-            except Exception as e:
-                message = str(e).strip() or repr(e)
-                self.error.emit(image_path_str, message)
+                except DatabaseQueuedError:
+                    # Continue even if DB operation queued.
+                    continue
+                except DatabaseBusyError as e:
+                    self.error.emit(image_path_str, f"Database busy: {e}")
+                except Exception as e:
+                    message = str(e).strip() or repr(e)
+                    self.error.emit(image_path_str, message)
+                finally:
+                    if tqdm_bar is not None:
+                        tqdm_bar.set_postfix_str(image_path.name, refresh=False)
+                        tqdm_bar.update(1)
 
         self.finished.emit()
 
@@ -343,13 +365,15 @@ class OrganizationWorker(QThread):
     finished = pyqtSignal(int)  # total_moved
     
     def __init__(self, image_paths: List[Path], tag_criteria: List[str],
-                 target_subdir: str, match_mode: str = 'any', move_text: bool = True):
+                 target_subdir: str, match_mode: str = 'any', move_text: bool = True,
+                 target_root_dir: Optional[Path] = None):
         super().__init__()
         self.image_paths = image_paths
         self.tag_criteria = tag_criteria
         self.target_subdir = target_subdir
         self.match_mode = match_mode
         self.move_text = move_text
+        self.target_root_dir = target_root_dir
         self.is_cancelled = False
     
     def cancel(self):
@@ -374,12 +398,14 @@ class OrganizationWorker(QThread):
                     self.tag_criteria,
                     self.target_subdir,
                     self.move_text,
-                    self.match_mode
+                    self.match_mode,
+                    self.target_root_dir
                 )
                 
                 if was_moved:
                     moved_count += 1
-                    dest_path = str(image_path.parent / self.target_subdir / image_path.name)
+                    destination_root = self.target_root_dir if self.target_root_dir else image_path.parent
+                    dest_path = str(destination_root / self.target_subdir / image_path.name)
                     self.moved.emit(str(image_path), dest_path)
                 
             except Exception as e:

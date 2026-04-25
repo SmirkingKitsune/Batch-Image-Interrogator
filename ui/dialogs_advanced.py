@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Set, Union
 from core import FileManager, TagFilterSettings, InterrogationDatabase, get_image_metadata
 from core.hashing import hash_image_content
 from core.device_detector import get_device_detector
-from core.llama_cpp_runtime import is_llama_timeout_error
+from core.llama_cpp_runtime import LlamaCppRuntimeManager, is_llama_timeout_error
 from interrogators import LlamaCppInterrogator
 from ui.widgets import TagEditorWidget, ResultsTableWidget
 
@@ -1036,6 +1036,13 @@ class AdvancedImageInspectionDialog(QDialog):
             return False
 
         mmproj_path = (config.get("llama_mmproj_path") or "").strip() or None
+        requested_port = int(config.get("server_port", 8080))
+        resolved_port = LlamaCppRuntimeManager.get_instance().resolve_server_port(
+            host="127.0.0.1",
+            requested_port=requested_port,
+        )
+        config["server_port"] = resolved_port
+        self.llama_config["server_port"] = resolved_port
         signature = (
             binary_path,
             model_path,
@@ -1044,7 +1051,7 @@ class AdvancedImageInspectionDialog(QDialog):
             int(config.get("gpu_layers", -1)),
             float(config.get("temperature", 0.2)),
             int(config.get("max_tokens", 512)),
-            int(config.get("server_port", 8080)),
+            resolved_port,
         )
 
         needs_reload = True
@@ -1074,7 +1081,7 @@ class AdvancedImageInspectionDialog(QDialog):
                 gpu_layers=int(config.get("gpu_layers", -1)),
                 temperature=float(config.get("temperature", 0.2)),
                 max_tokens=int(config.get("max_tokens", 512)),
-                server_port=int(config.get("server_port", 8080)),
+                server_port=resolved_port,
                 server_host="127.0.0.1",
             )
 
@@ -1089,7 +1096,7 @@ class AdvancedImageInspectionDialog(QDialog):
             self.multimodal_interrogator.set_session_history(self.current_multimodal_session_key, history)
 
         self.mm_status_label.setText(
-            f"Connected: {Path(model_path).name} on 127.0.0.1:{int(config.get('server_port', 8080))}"
+            f"Connected: {Path(model_path).name} on 127.0.0.1:{resolved_port}"
         )
         self.mm_status_label.setStyleSheet("color: green;")
         return True

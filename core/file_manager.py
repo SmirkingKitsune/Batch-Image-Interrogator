@@ -79,9 +79,14 @@ class FileManager:
         return FileManager.get_text_file_path(image_path).exists()
     
     @staticmethod
-    def organize_by_tags(image_path: Path, tag_criteria: List[str], 
-                        target_subdir: str, move_text: bool = True,
-                        match_mode: str = 'any') -> bool:
+    def organize_by_tags(
+        image_path: Path,
+        tag_criteria: List[str],
+        target_subdir: str,
+        move_text: bool = True,
+        match_mode: str = 'any',
+        target_root_dir: Optional[Path] = None,
+    ) -> bool:
         """
         Move image (and text file) to subdirectory if it has matching tags.
         
@@ -91,6 +96,8 @@ class FileManager:
             target_subdir: Subdirectory name to move to
             move_text: Whether to also move the text file
             match_mode: 'any' or 'all' - whether to match any tag or all tags
+            target_root_dir: Optional root directory for destination. If None,
+                destination is created under image_path.parent (legacy behavior).
             
         Returns:
             True if file was moved, False otherwise
@@ -109,8 +116,9 @@ class FileManager:
             return False
         
         # Create target directory
-        target_dir = image_path.parent / target_subdir
-        target_dir.mkdir(exist_ok=True)
+        destination_root = target_root_dir if target_root_dir is not None else image_path.parent
+        target_dir = destination_root / target_subdir
+        target_dir.mkdir(parents=True, exist_ok=True)
         
         # Move image
         new_image_path = target_dir / image_path.name
