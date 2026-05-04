@@ -9,6 +9,7 @@ from .db_queue import DatabaseOperationQueue, QueuedOperation
 from .onnx_providers import ONNXProviderSettings, ProviderPreference
 from .model_cache import ModelCacheManager, ModelCacheInfo
 from .llama_cpp_runtime import LlamaCppRuntimeManager, LlamaCppRuntimeError
+from .inquiry_settings import InquirySettings
 
 __all__ = [
     'InterrogationDatabase',
@@ -27,4 +28,5 @@ __all__ = [
     'ModelCacheInfo',
     'LlamaCppRuntimeManager',
     'LlamaCppRuntimeError',
+    'InquirySettings',
 ]
