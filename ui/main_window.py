@@ -83,9 +83,6 @@ class MainWindow(QMainWindow):
             'temperature': 0.2,
             'max_tokens': 512,
             'server_port': 8080,
-            'include_prior_tables': False,
-            'carry_batch_context': False,
-            'included_model_types': ['CLIP', 'WD', 'Camie'],
         }
 
         # Setup UI

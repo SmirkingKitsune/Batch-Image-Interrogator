@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPalette, QPixmap
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFrame,
     QGroupBox,
@@ -90,6 +91,9 @@ class InquiryTab(QWidget):
         self.batch_transcript_entries: List[Dict[str, Any]] = []
         self.active_batch_task = "describe"
         self.active_batch_prompt = ""
+        self.saved_batch_context_source_keys: List[str] = []
+        self.has_saved_batch_context_source_keys = False
+        self.saved_batch_included_model_types: List[str] = ["CLIP", "WD", "Camie"]
 
         self.llama_config_refs: Optional[Dict[str, Any]] = None
 
@@ -213,8 +217,10 @@ class InquiryTab(QWidget):
         self.single_prompt_input.setPlaceholderText("Ask a visual question or provide custom guidance...")
         single_layout.addWidget(self.single_prompt_input)
 
-        prior_group = QGroupBox("Include Prior Interrogation Tables")
+        prior_group = QGroupBox("Context Sources")
         prior_layout = QVBoxLayout()
+        prior_label = QLabel("Include selected prior results for this image")
+        prior_layout.addWidget(prior_label)
         self.single_prior_tables = QTableWidget()
         self.single_prior_tables.setColumnCount(2)
         self.single_prior_tables.setHorizontalHeaderLabels(["Include", "Model"])
@@ -263,6 +269,34 @@ class InquiryTab(QWidget):
         self.batch_prompt_input.setMaximumHeight(110)
         batch_layout.addWidget(QLabel("Prompt:"))
         batch_layout.addWidget(self.batch_prompt_input)
+
+        context_group = QGroupBox("Context Sources")
+        context_layout = QVBoxLayout()
+        self.batch_include_prior_tables_check = QCheckBox(
+            "Include matching prior results for each batch image"
+        )
+        context_layout.addWidget(self.batch_include_prior_tables_check)
+
+        context_layout.addWidget(QLabel("Available prior results across the batch queue:"))
+        self.batch_context_sources_table = QTableWidget()
+        self.batch_context_sources_table.setColumnCount(3)
+        self.batch_context_sources_table.setHorizontalHeaderLabels(["Include", "Source", "Images"])
+        self.batch_context_sources_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.batch_context_sources_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.batch_context_sources_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.batch_context_sources_table.setMinimumHeight(120)
+        context_layout.addWidget(self.batch_context_sources_table)
+
+        self.batch_carry_context_check = QCheckBox("Carry context across batch images")
+        context_layout.addWidget(self.batch_carry_context_check)
+        context_group.setLayout(context_layout)
+        batch_layout.addWidget(context_group)
 
         self.txt_output_group = QButtonGroup(self)
         self.no_txt_radio = QRadioButton("No .txt file output")
@@ -362,19 +396,13 @@ class InquiryTab(QWidget):
             self.llama_config_refs[key].textChanged.connect(lambda *_: self._save_inquiry_options())
         for key in ("ctx_size_spin", "gpu_layers_spin", "temperature_spin", "max_tokens_spin", "server_port_spin"):
             self.llama_config_refs[key].valueChanged.connect(lambda _: self._save_inquiry_options())
-        for key in (
-            "include_prior_tables_check",
-            "carry_batch_context_check",
-            "include_clip_check",
-            "include_wd_check",
-            "include_camie_check",
-        ):
-            self.llama_config_refs[key].toggled.connect(lambda *_: self._save_inquiry_options())
-
         self.single_task_combo.currentTextChanged.connect(lambda *_: self._save_inquiry_options())
         self.single_prompt_input.textChanged.connect(lambda *_: self._save_inquiry_options())
         self.batch_task_combo.currentTextChanged.connect(lambda *_: self._save_inquiry_options())
         self.batch_prompt_input.textChanged.connect(self._save_inquiry_options)
+        self.batch_include_prior_tables_check.toggled.connect(lambda *_: self._save_inquiry_options())
+        self.batch_carry_context_check.toggled.connect(lambda *_: self._save_inquiry_options())
+        self.batch_context_sources_table.itemChanged.connect(lambda *_: self._save_inquiry_options())
         self.txt_output_group.idClicked.connect(lambda _: self._save_inquiry_options())
 
     def _on_mode_tab_changed(self, index: int):
@@ -393,6 +421,15 @@ class InquiryTab(QWidget):
         self.single_prompt_input.setText(options.get("single_prompt", ""))
         self._set_combo_text(self.batch_task_combo, options.get("batch_task", "describe"))
         self.batch_prompt_input.setPlainText(options.get("batch_prompt", ""))
+        self.batch_include_prior_tables_check.setChecked(
+            bool(options.get("batch_include_prior_tables", False))
+        )
+        self.has_saved_batch_context_source_keys = "batch_context_source_keys" in options
+        self.saved_batch_context_source_keys = list(options.get("batch_context_source_keys", []))
+        self.saved_batch_included_model_types = list(
+            options.get("batch_included_model_types", ["CLIP", "WD", "Camie"])
+        )
+        self.batch_carry_context_check.setChecked(bool(options.get("batch_carry_context", False)))
         self._set_txt_output_mode(options.get("txt_output_mode", "merge"))
 
         active_tab = int(options.get("active_tab", 0))
@@ -424,31 +461,70 @@ class InquiryTab(QWidget):
         """Persist current Inquiry options."""
         if not self.llama_config_refs:
             return
+        if self.batch_context_sources_table.rowCount() > 0:
+            selected_batch_context_source_keys = self._get_selected_batch_context_source_keys()
+            self.saved_batch_context_source_keys = list(selected_batch_context_source_keys)
+            self.has_saved_batch_context_source_keys = True
+        else:
+            selected_batch_context_source_keys = list(self.saved_batch_context_source_keys)
 
-        self.inquiry_settings.update_options(
-            {
-                "llama_config": self.get_llama_config(),
-                "single_task": self.single_task_combo.currentText(),
-                "single_prompt": self.single_prompt_input.text(),
-                "batch_task": self.batch_task_combo.currentText(),
-                "batch_prompt": self.batch_prompt_input.toPlainText(),
-                "txt_output_mode": self._get_txt_output_mode(),
-                "active_tab": self.mode_tabs.currentIndex(),
-            }
-        )
+        options_payload = {
+            "llama_config": self.get_llama_config(),
+            "single_task": self.single_task_combo.currentText(),
+            "single_prompt": self.single_prompt_input.text(),
+            "batch_task": self.batch_task_combo.currentText(),
+            "batch_prompt": self.batch_prompt_input.toPlainText(),
+            "batch_include_prior_tables": self.batch_include_prior_tables_check.isChecked(),
+            "batch_carry_context": self.batch_carry_context_check.isChecked(),
+            "txt_output_mode": self._get_txt_output_mode(),
+            "active_tab": self.mode_tabs.currentIndex(),
+        }
+        if self.batch_context_sources_table.rowCount() > 0 or self.has_saved_batch_context_source_keys:
+            options_payload["batch_context_source_keys"] = selected_batch_context_source_keys
+        self.inquiry_settings.update_options(options_payload)
+
+    def _get_selected_batch_context_source_keys(self) -> List[str]:
+        """Return selected prior-result source keys for batch context."""
+        selected: List[str] = []
+        for row in range(self.batch_context_sources_table.rowCount()):
+            include_item = self.batch_context_sources_table.item(row, 0)
+            if not include_item or include_item.checkState() != Qt.CheckState.Checked:
+                continue
+            source = include_item.data(Qt.ItemDataRole.UserRole) or {}
+            source_key = source.get("source_key")
+            if source_key:
+                selected.append(source_key)
+        return selected
+
+    def _get_selected_batch_context_sources(self) -> List[Dict[str, Any]]:
+        """Return selected prior-result source descriptors for batch context."""
+        selected: List[Dict[str, Any]] = []
+        for row in range(self.batch_context_sources_table.rowCount()):
+            include_item = self.batch_context_sources_table.item(row, 0)
+            if not include_item or include_item.checkState() != Qt.CheckState.Checked:
+                continue
+            source = include_item.data(Qt.ItemDataRole.UserRole) or {}
+            if source.get("source_key"):
+                selected.append(
+                    {
+                        "model_name": source.get("model_name"),
+                        "model_type": source.get("model_type"),
+                    }
+                )
+        return selected
+
+    def _get_batch_context_options(self) -> Dict[str, Any]:
+        """Return current batch context-source options."""
+        return {
+            "include_prior_tables": self.batch_include_prior_tables_check.isChecked(),
+            "included_sources": self._get_selected_batch_context_sources(),
+            "carry_batch_context": self.batch_carry_context_check.isChecked(),
+        }
 
     def get_llama_config(self) -> Dict[str, Any]:
         """Return latest llama.cpp configuration from UI controls."""
         if not self.llama_config_refs:
             return dict(self.llama_config)
-
-        included_types = []
-        if self.llama_config_refs["include_clip_check"].isChecked():
-            included_types.append("CLIP")
-        if self.llama_config_refs["include_wd_check"].isChecked():
-            included_types.append("WD")
-        if self.llama_config_refs["include_camie_check"].isChecked():
-            included_types.append("Camie")
 
         self.llama_config.update(
             {
@@ -460,11 +536,10 @@ class InquiryTab(QWidget):
                 "temperature": self.llama_config_refs["temperature_spin"].value(),
                 "max_tokens": self.llama_config_refs["max_tokens_spin"].value(),
                 "server_port": self.llama_config_refs["server_port_spin"].value(),
-                "include_prior_tables": self.llama_config_refs["include_prior_tables_check"].isChecked(),
-                "carry_batch_context": self.llama_config_refs["carry_batch_context_check"].isChecked(),
-                "included_model_types": included_types,
             }
         )
+        for old_context_key in ("include_prior_tables", "carry_batch_context", "included_model_types"):
+            self.llama_config.pop(old_context_key, None)
         return dict(self.llama_config)
 
     def set_directory_context(self, directory: str, recursive: bool):
@@ -502,6 +577,7 @@ class InquiryTab(QWidget):
 
         self.image_selector.blockSignals(False)
         self._on_selected_image_changed()
+        self._refresh_batch_context_sources()
 
         if self.current_interrogator and self.current_interrogator.is_loaded:
             self.batch_inquiry_button.setEnabled(bool(self.loaded_image_paths))
@@ -710,6 +786,84 @@ class InquiryTab(QWidget):
             model_label = f"{interrog.get('model_name', 'Unknown')} ({interrog.get('model_type', '')})"
             self.single_prior_tables.setItem(row, 1, QTableWidgetItem(model_label))
 
+    def _refresh_batch_context_sources(self):
+        """Rebuild selectable prior-result sources across the whole batch queue."""
+        selected_keys = set(self._get_selected_batch_context_source_keys())
+        if not selected_keys:
+            selected_keys = set(self.saved_batch_context_source_keys)
+        legacy_types = set(self.saved_batch_included_model_types)
+        use_legacy_type_selection = (
+            not selected_keys
+            and not self.has_saved_batch_context_source_keys
+            and self.batch_include_prior_tables_check.isChecked()
+            and bool(legacy_types)
+        )
+
+        sources: Dict[str, Dict[str, Any]] = {}
+        for image_path in self.loaded_image_paths:
+            try:
+                file_hash = hash_image_content(image_path)
+                rows = self.database.get_all_interrogations_for_image(file_hash) or []
+            except Exception:
+                continue
+
+            for interrog in rows:
+                source_key = self._context_source_key(
+                    interrog.get("model_name"),
+                    interrog.get("model_type"),
+                )
+                source = sources.setdefault(
+                    source_key,
+                    {
+                        "source_key": source_key,
+                        "model_name": interrog.get("model_name"),
+                        "model_type": interrog.get("model_type"),
+                        "image_hashes": set(),
+                        "latest_at": interrog.get("interrogated_at") or "",
+                    },
+                )
+                source["image_hashes"].add(file_hash)
+                latest_at = interrog.get("interrogated_at") or ""
+                if latest_at > (source.get("latest_at") or ""):
+                    source["latest_at"] = latest_at
+
+        sorted_sources = sorted(
+            sources.values(),
+            key=lambda src: (
+                -(len(src.get("image_hashes") or [])),
+                str(src.get("model_type") or ""),
+                str(src.get("model_name") or ""),
+            ),
+        )
+
+        self.batch_context_sources_table.blockSignals(True)
+        self.batch_context_sources_table.setRowCount(0)
+        for source in sorted_sources:
+            row = self.batch_context_sources_table.rowCount()
+            self.batch_context_sources_table.insertRow(row)
+
+            include_item = QTableWidgetItem()
+            include_item.setFlags(
+                include_item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+            )
+            checked = source["source_key"] in selected_keys
+            if use_legacy_type_selection and source.get("model_type") in legacy_types:
+                checked = True
+            include_item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            include_item.setData(Qt.ItemDataRole.UserRole, source)
+            self.batch_context_sources_table.setItem(row, 0, include_item)
+
+            model_label = f"{source.get('model_name', 'Unknown')} ({source.get('model_type', '')})"
+            self.batch_context_sources_table.setItem(row, 1, QTableWidgetItem(model_label))
+            count = len(source.get("image_hashes") or [])
+            self.batch_context_sources_table.setItem(row, 2, QTableWidgetItem(str(count)))
+        self.batch_context_sources_table.blockSignals(False)
+
+    @staticmethod
+    def _context_source_key(model_name: Optional[str], model_type: Optional[str]) -> str:
+        """Stable key for selecting a prior-result source across batch images."""
+        return f"{model_type or ''}\u001f{model_name or ''}"
+
     def _refresh_transcript_for_active_mode(self):
         """Render transcript according to selected mode tab."""
         if self.mode_tabs.currentIndex() == 1:
@@ -762,7 +916,21 @@ class InquiryTab(QWidget):
         card_layout.setContentsMargins(8, 8, 8, 8)
         card_layout.setSpacing(6)
 
-        prompt_text = (turn.get("prompt_text") or "").strip() or "[no prompt]"
+        prompt_type = turn.get("prompt_type") or "describe"
+        user_prompt_text = turn.get("prompt_text") or ""
+        included_tables = turn.get("included_tables") or []
+        prompt_text = LlamaCppInterrogator.build_prompt_display_summary(
+            prompt_type,
+            user_prompt_text,
+            included_tables,
+        )
+        full_prompt_text = LlamaCppInterrogator.build_user_prompt_from_turn(
+            {
+                "prompt_type": prompt_type,
+                "prompt_text": user_prompt_text,
+                "included_tables": included_tables,
+            }
+        )
         prompt_frame = QFrame()
         prompt_frame.setFrameShape(QFrame.Shape.StyledPanel)
         prompt_frame.setStyleSheet(
@@ -774,6 +942,29 @@ class InquiryTab(QWidget):
         prompt_label.setWordWrap(True)
         prompt_label.setStyleSheet(f"color: {text_hex};")
         prompt_layout.addWidget(prompt_label)
+
+        details_button = QPushButton("Show Prompt Details")
+        details_button.setCheckable(True)
+        details_button.setStyleSheet(f"color: {text_hex};")
+        prompt_layout.addWidget(details_button)
+
+        details_view = QTextEdit()
+        details_view.setReadOnly(True)
+        details_view.setPlainText(full_prompt_text)
+        details_view.setMaximumHeight(220)
+        details_view.setVisible(False)
+        prompt_layout.addWidget(details_view)
+
+        transcript_item: Optional[QListWidgetItem] = None
+
+        def toggle_prompt_details(visible: bool):
+            details_view.setVisible(visible)
+            details_button.setText("Hide Prompt Details" if visible else "Show Prompt Details")
+            if transcript_item:
+                transcript_item.setSizeHint(card.sizeHint())
+
+        details_button.toggled.connect(toggle_prompt_details)
+
         turn_image_path = image_path or turn.get("image_path") or self.current_image_path
         if turn_image_path:
             prompt_path_row = QHBoxLayout()
@@ -903,6 +1094,7 @@ class InquiryTab(QWidget):
         item = QListWidgetItem()
         item.setSizeHint(card.sizeHint())
         self.single_transcript.addItem(item)
+        transcript_item = item
         self.single_transcript.setItemWidget(item, card)
 
     def _prime_current_session_history(self):
@@ -1067,7 +1259,8 @@ class InquiryTab(QWidget):
         if reply == QMessageBox.StandardButton.No:
             return
 
-        config = self.get_llama_config()
+        self.get_llama_config()
+        context_options = self._get_batch_context_options()
         task = self.batch_task_combo.currentText()
         prompt_text = self.batch_prompt_input.toPlainText().strip()
         self._save_inquiry_options()
@@ -1101,9 +1294,9 @@ class InquiryTab(QWidget):
             write_files=write_files,
             overwrite_files=overwrite_files,
             tag_filters=self.tag_filters,
-            include_prior_tables=config.get("include_prior_tables", False),
-            included_model_types=config.get("included_model_types", []),
-            carry_context_across_batch=config.get("carry_batch_context", False),
+            include_prior_tables=context_options["include_prior_tables"],
+            included_sources=context_options["included_sources"],
+            carry_context_across_batch=context_options["carry_batch_context"],
         )
         self.interrogation_worker.progress.connect(self.on_batch_progress)
         self.interrogation_worker.result.connect(self.on_batch_result)
@@ -1146,6 +1339,7 @@ class InquiryTab(QWidget):
         batch_entry = {
             "prompt_type": self.active_batch_task,
             "prompt_text": self.active_batch_prompt,
+            "included_tables": results.get("included_tables", []) or [],
             "response_json": results.get("multimodal_response", {}) or {},
             "tags": results.get("tags", []) or [],
             "model_name": self.current_interrogator.model_name if self.current_interrogator else "LlamaCpp",
@@ -1189,6 +1383,7 @@ class InquiryTab(QWidget):
         self.batch_inquiry_button.setEnabled(bool(self.current_interrogator and self.loaded_image_paths))
         self.cancel_button.setEnabled(False)
         self.progress_label.setText("Batch inquiry complete")
+        self._refresh_batch_context_sources()
         self.inquiry_finished.emit()
         if self.batch_error_count > 0:
             recent_logs = ""

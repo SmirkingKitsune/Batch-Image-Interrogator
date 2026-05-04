@@ -77,7 +77,7 @@ class InterrogationWorker(QThread):
                     self.interrogator.model_name
                 )
                 
-                if cached:
+                if cached and self._should_use_cached_result(cached):
                     # Use cached results
                     results = cached
                     self.progress.emit(
@@ -85,6 +85,12 @@ class InterrogationWorker(QThread):
                         f"Using cached: {image_path.name}"
                     )
                 else:
+                    if cached:
+                        self.progress.emit(
+                            idx + 1, total,
+                            f"Reprocessing empty cached result: {image_path.name}"
+                        )
+
                     # Interrogate image
                     results = self.interrogator.interrogate(image_path_str)
 
@@ -139,14 +145,11 @@ class InterrogationWorker(QThread):
                             # No confidence scores (CLIP), use simple filtering
                             tags_to_write = self.tag_filters.apply_filters(tags_to_write)
 
-                    # Check if file exists and handle overwrite
-                    txt_path = FileManager.get_text_file_path(image_path)
-                    if not txt_path.exists() or self.overwrite_files:
-                        FileManager.write_tags_to_file(
-                            image_path,
-                            tags_to_write,
-                            overwrite=self.overwrite_files
-                        )
+                    FileManager.write_tags_to_file(
+                        image_path,
+                        tags_to_write,
+                        overwrite=self.overwrite_files
+                    )
                 
                 # Emit result
                 self.result.emit(image_path_str, results)
@@ -156,6 +159,20 @@ class InterrogationWorker(QThread):
                 self.error.emit(str(image_path), message)
         
         self.finished.emit()
+
+    def _should_use_cached_result(self, cached: Dict[str, Any]) -> bool:
+        """Return False for stale empty ONNX tagger rows that should be regenerated."""
+        model_type = self.interrogator.get_model_type()
+        if model_type == 'WD':
+            return False
+
+        tags = cached.get('tags')
+        if tags:
+            return True
+
+        if model_type == 'Camie':
+            return False
+        return True
 
 
 class MultimodalInterrogationWorker(QThread):
@@ -179,6 +196,7 @@ class MultimodalInterrogationWorker(QThread):
         tag_filters: Optional[TagFilterSettings] = None,
         include_prior_tables: bool = False,
         included_model_types: Optional[List[str]] = None,
+        included_sources: Optional[List[Dict[str, Any]]] = None,
         carry_context_across_batch: bool = False,
     ):
         super().__init__()
@@ -192,6 +210,12 @@ class MultimodalInterrogationWorker(QThread):
         self.tag_filters = tag_filters
         self.include_prior_tables = include_prior_tables
         self.included_model_types = set(included_model_types or [])
+        self.uses_included_sources = included_sources is not None
+        self.included_source_keys = {
+            self._source_key(source.get("model_name"), source.get("model_type"))
+            for source in included_sources or []
+            if isinstance(source, dict)
+        }
         self.carry_context_across_batch = carry_context_across_batch
         self.is_cancelled = False
 
@@ -263,6 +287,7 @@ class MultimodalInterrogationWorker(QThread):
                         keep_context=bool(self.carry_context_across_batch),
                         included_tables=included_tables,
                     )
+                    results["included_tables"] = included_tables
 
                     # Keep latest multimodal result in main interrogations table.
                     self.database.save_interrogation(
@@ -304,13 +329,11 @@ class MultimodalInterrogationWorker(QThread):
                             else:
                                 tags_to_write = self.tag_filters.apply_filters(tags_to_write)
 
-                        txt_path = FileManager.get_text_file_path(image_path)
-                        if not txt_path.exists() or self.overwrite_files:
-                            FileManager.write_tags_to_file(
-                                image_path,
-                                tags_to_write,
-                                overwrite=self.overwrite_files,
-                            )
+                        FileManager.write_tags_to_file(
+                            image_path,
+                            tags_to_write,
+                            overwrite=self.overwrite_files,
+                        )
 
                     self.result.emit(image_path_str, results)
 
@@ -333,13 +356,17 @@ class MultimodalInterrogationWorker(QThread):
         """Build prior interrogation context tables for a single image."""
         if not self.include_prior_tables:
             return []
+        if self.uses_included_sources and not self.included_source_keys:
+            return []
 
         tables = self.database.get_all_interrogations_for_image(file_hash)
         filtered: List[Dict[str, Any]] = []
         for row in tables:
-            if row.get("model_name") == self.interrogator.model_name:
-                continue
-            if self.included_model_types and row.get("model_type") not in self.included_model_types:
+            source_key = self._source_key(row.get("model_name"), row.get("model_type"))
+            if self.uses_included_sources:
+                if source_key not in self.included_source_keys:
+                    continue
+            elif self.included_model_types and row.get("model_type") not in self.included_model_types:
                 continue
 
             filtered.append(
@@ -353,6 +380,11 @@ class MultimodalInterrogationWorker(QThread):
                 }
             )
         return filtered
+
+    @staticmethod
+    def _source_key(model_name: Optional[str], model_type: Optional[str]) -> str:
+        """Stable key for matching selected batch context sources."""
+        return f"{model_type or ''}\u001f{model_name or ''}"
 
 
 class OrganizationWorker(QThread):

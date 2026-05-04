@@ -16,13 +16,15 @@ class WDInterrogator(BaseInterrogator):
         self.tags = None
         self.target_size = 448
     
-    def load_model(self, threshold: float = 0.35, device: str = 'cuda', **kwargs):
+    def load_model(self, threshold: float = 0.35, device: str = 'cuda',
+                   provider_settings=None, **kwargs):
         """
         Load WD Tagger model with automatic CPU fallback.
 
         Args:
             threshold: Confidence threshold for tag inclusion (0.0-1.0)
             device: Requested device ('cuda' or 'cpu')
+            provider_settings: ONNXProviderSettings instance for provider configuration
             **kwargs: Additional configuration
         """
         # Auto-detect and validate device
@@ -57,9 +59,12 @@ class WDInterrogator(BaseInterrogator):
             # Load tags
             self.tags = pd.read_csv(tags_path)
 
-            # Load ONNX model
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
-            self.model = ort.InferenceSession(model_path, providers=providers)
+            # Load ONNX model with provider settings if available
+            if provider_settings:
+                self.model = provider_settings.create_inference_session(model_path, device)
+            else:
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+                self.model = ort.InferenceSession(model_path, providers=providers)
 
             self.is_loaded = True
 
@@ -99,8 +104,9 @@ class WDInterrogator(BaseInterrogator):
             ((self.target_size - image.width) // 2, (self.target_size - image.height) // 2)
         )
         
-        # Convert to numpy array and normalize
-        image_array = np.array(canvas).astype(np.float32) / 255.0
+        # WD tagger ONNX models expect NHWC float32 in 0-255 BGR order.
+        image_array = np.array(canvas).astype(np.float32)
+        image_array = image_array[:, :, ::-1]
         image_array = np.expand_dims(image_array, axis=0)
         
         return image_array

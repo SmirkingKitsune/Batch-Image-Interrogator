@@ -151,7 +151,7 @@ class CamieInterrogator(BaseInterrogator):
             metadata_path = hf_hub_download(self.model_name, metadata_file)
 
             with open(metadata_path, 'r') as f:
-                self.tags_data = json.load(f)
+                self.tags_data = self._normalize_metadata(json.load(f))
 
             # Load ONNX model with provider settings if available
             if provider_settings:
@@ -222,6 +222,55 @@ class CamieInterrogator(BaseInterrogator):
                 result['tag_to_category'][tag] = 'general'
 
         return result
+
+    def _normalize_metadata(self, metadata: Dict) -> Dict:
+        """
+        Normalize Camie metadata variants to {'tags': [...], 'tag_to_category': {...}}.
+
+        Camie v2 stores tag mappings under dataset_info.tag_mapping rather than a
+        top-level tags list. Without this normalization inference succeeds but no
+        probabilities can be mapped back to tag names.
+        """
+        if not isinstance(metadata, dict):
+            return {'tags': [], 'tag_to_category': {}}
+
+        if isinstance(metadata.get('tags'), list):
+            return metadata
+
+        tag_mapping = metadata.get('tag_mapping')
+        if not isinstance(tag_mapping, dict):
+            dataset_info = metadata.get('dataset_info', {})
+            if isinstance(dataset_info, dict):
+                tag_mapping = dataset_info.get('tag_mapping')
+
+        if isinstance(tag_mapping, dict):
+            idx_to_tag = tag_mapping.get('idx_to_tag')
+            tag_to_idx = tag_mapping.get('tag_to_idx')
+            tag_to_category = tag_mapping.get('tag_to_category') or {}
+
+            if isinstance(idx_to_tag, dict):
+                indexed_tags = sorted(
+                    ((int(idx), tag) for idx, tag in idx_to_tag.items()),
+                    key=lambda item: item[0]
+                )
+            elif isinstance(tag_to_idx, dict):
+                indexed_tags = sorted(
+                    ((int(idx), tag) for tag, idx in tag_to_idx.items()),
+                    key=lambda item: item[0]
+                )
+            else:
+                indexed_tags = []
+
+            tags = [
+                {
+                    'name': str(tag),
+                    'category': tag_to_category.get(str(tag), 'general')
+                }
+                for _, tag in indexed_tags
+            ]
+            return {'tags': tags, 'tag_to_category': dict(tag_to_category)}
+
+        return self._convert_tag_index_format(metadata)
 
     def preprocess_image(self, image_path: str) -> np.ndarray:
         """

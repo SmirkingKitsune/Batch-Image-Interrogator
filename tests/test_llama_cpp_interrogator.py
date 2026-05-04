@@ -184,6 +184,56 @@ class TestLlamaCppInterrogator(unittest.TestCase):
         self.assertIn('"comment":', prompt)
         self.assertIn("Do not include markdown fences", prompt)
 
+    def test_prompt_display_summary_uses_task_when_user_prompt_empty(self):
+        summary = LlamaCppInterrogator.build_prompt_display_summary(
+            task="describe",
+            prompt="",
+            included_tables=[],
+        )
+
+        self.assertEqual(summary, "Task: describe")
+        self.assertNotIn("[no prompt]", summary)
+
+    def test_prompt_display_summary_includes_context_sources(self):
+        summary = LlamaCppInterrogator.build_prompt_display_summary(
+            task="describe",
+            prompt="",
+            included_tables=[
+                {"model_name": "WD14", "model_type": "WD", "tags": ["portrait"]},
+                {"model_name": "CLIP ViT", "model_type": "CLIP", "tags": ["person"]},
+            ],
+        )
+
+        self.assertIn("Task: describe", summary)
+        self.assertIn("Context sources: 2 prior results", summary)
+        self.assertIn("WD14 (WD)", summary)
+        self.assertIn("CLIP ViT (CLIP)", summary)
+
+    def test_prompt_display_summary_includes_user_request_and_context(self):
+        summary = LlamaCppInterrogator.build_prompt_display_summary(
+            task="vqa",
+            prompt="What brand is visible?",
+            included_tables=[{"model_name": "WD14", "model_type": "WD"}],
+        )
+
+        self.assertIn("Task: vqa", summary)
+        self.assertIn("User request: What brand is visible?", summary)
+        self.assertIn("Context sources: 1 prior result", summary)
+
+    def test_build_user_prompt_from_turn_reconstructs_effective_prompt(self):
+        prompt = LlamaCppInterrogator.build_user_prompt_from_turn(
+            {
+                "prompt_type": "describe",
+                "prompt_text": "",
+                "included_tables": [{"model_name": "WD14", "tags": ["portrait"]}],
+            }
+        )
+
+        self.assertIn("Task: describe", prompt)
+        self.assertIn("Goal: describe the visible scene and subjects.", prompt)
+        self.assertIn("Prior interrogation tables", prompt)
+        self.assertIn('"model_name": "WD14"', prompt)
+
     def test_load_model_uses_runtime_resolved_server_port(self):
         interrogator = LlamaCppInterrogator(model_name="LlamaCpp")
         runtime_mock = mock.Mock()
