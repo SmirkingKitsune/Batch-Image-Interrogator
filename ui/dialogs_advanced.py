@@ -1050,8 +1050,8 @@ class AdvancedImageInspectionDialog(QDialog):
             mmproj_path or "",
             int(config.get("ctx_size", 8192)),
             int(config.get("gpu_layers", -1)),
-            float(config.get("temperature", 0.2)),
-            int(config.get("max_tokens", 512)),
+            float(config.get("temperature", 0.0)),
+            int(config.get("max_tokens", config.get("ctx_size", 8192))),
             resolved_port,
         )
 
@@ -1064,8 +1064,8 @@ class AdvancedImageInspectionDialog(QDialog):
                 existing_cfg.get("llama_mmproj_path", "") or "",
                 int(existing_cfg.get("ctx_size", 8192)),
                 int(existing_cfg.get("gpu_layers", -1)),
-                float(existing_cfg.get("temperature", 0.2)),
-                int(existing_cfg.get("max_tokens", 512)),
+                float(existing_cfg.get("temperature", 0.0)),
+                int(existing_cfg.get("max_tokens", existing_cfg.get("ctx_size", 8192))),
                 int(existing_cfg.get("server_port", 8080)),
             )
             needs_reload = existing_sig != signature
@@ -1080,8 +1080,8 @@ class AdvancedImageInspectionDialog(QDialog):
                 llama_mmproj_path=mmproj_path,
                 ctx_size=int(config.get("ctx_size", 8192)),
                 gpu_layers=int(config.get("gpu_layers", -1)),
-                temperature=float(config.get("temperature", 0.2)),
-                max_tokens=int(config.get("max_tokens", 512)),
+                temperature=float(config.get("temperature", 0.0)),
+                max_tokens=int(config.get("max_tokens", config.get("ctx_size", 8192))),
                 server_port=resolved_port,
                 server_host="127.0.0.1",
             )

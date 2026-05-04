@@ -27,8 +27,8 @@ class LlamaCppInterrogator(BaseInterrogator):
     def __init__(self, model_name: str = "LlamaCpp"):
         super().__init__(model_name)
         self.runtime = LlamaCppRuntimeManager.get_instance()
-        self.temperature = 0.2
-        self.max_tokens = 512
+        self.temperature = 0.0
+        self.max_tokens = 4096
         self.server_url: Optional[str] = None
         self._owns_runtime = False
         self._session_history: Dict[str, List[Dict[str, Any]]] = {}
@@ -40,8 +40,8 @@ class LlamaCppInterrogator(BaseInterrogator):
         llama_mmproj_path: Optional[str] = None,
         ctx_size: int = 4096,
         gpu_layers: int = -1,
-        temperature: float = 0.2,
-        max_tokens: int = 512,
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
         server_port: int = 8080,
         server_host: str = "127.0.0.1",
         **kwargs,
@@ -55,7 +55,7 @@ class LlamaCppInterrogator(BaseInterrogator):
         model_label = f"LlamaCpp/{model_path.name}"
         self.model_name = model_label
         self.temperature = float(temperature)
-        self.max_tokens = int(max_tokens)
+        self.max_tokens = int(max_tokens if max_tokens is not None else ctx_size)
 
         self.config = {
             "llama_binary_path": str(Path(llama_binary_path).expanduser().resolve()),

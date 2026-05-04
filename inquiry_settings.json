@@ -3,10 +3,10 @@
     "llama_binary_path": "Z:\\AI\\Batch-Image-Interrogator\\cache\\llama_cpp\\bin\\llama-server.exe",
     "llama_model_path": "Y:/LLM_Models/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf",
     "llama_mmproj_path": "Y:/LLM_Models/lmstudio-community/Qwen3.6-35B-A3B-GGUF/mmproj-Qwen3.6-35B-A3B-BF16.gguf",
-    "ctx_size": 8192,
+    "ctx_size": 131072,
     "gpu_layers": -1,
-    "temperature": 0.2,
-    "max_tokens": 2048,
+    "temperature": 0.0,
+    "max_tokens": 131072,
     "server_port": 8080
   },
   "single_task": "describe",
@@ -20,12 +20,14 @@
     "Camie"
   ],
   "batch_context_source_keys": [
+    "CLIP\u001fViT-bigG-14/laion2b_s39b_b160k",
     "Camie\u001fCamais03/camie-tagger-v2",
     "LlamaCpp\u001fLlamaCpp/Qwen3.6-35B-A3B-Q4_K_M.gguf",
-    "LlamaCpp\u001fLlamaCpp/gemma-4-31B-it-Q4_K_M.gguf",
-    "CLIP\u001fViT-bigG-14/laion2b_s39b_b160k"
+    "WD\u001fSmilingWolf/wd-eva02-large-tagger-v3",
+    "LlamaCpp\u001fLlamaCpp/gemma-4-31B-it-Q4_K_M.gguf"
   ],
   "batch_carry_context": false,
+  "batch_use_cache": false,
   "txt_output_mode": "merge",
   "active_tab": 1
 }

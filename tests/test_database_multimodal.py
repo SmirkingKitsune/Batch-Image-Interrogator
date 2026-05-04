@@ -96,6 +96,48 @@ class TestDatabaseMultimodal(unittest.TestCase):
         )
         self.assertEqual(history_after, [])
 
+    def test_exact_cache_entries_are_keyed_by_variant(self):
+        self.db.save_interrogation_cache_entry(
+            image_id=self.image_id,
+            model_id=self.model_id,
+            cache_key="cache-key-a",
+            cache_metadata={"task": "describe", "prompt": "A"},
+            results={
+                "tags": ["tag_a"],
+                "confidence_scores": None,
+                "raw_output": "raw a",
+                "multimodal_response": {"comment": "A"},
+            },
+        )
+        self.db.save_interrogation_cache_entry(
+            image_id=self.image_id,
+            model_id=self.model_id,
+            cache_key="cache-key-b",
+            cache_metadata={"task": "describe", "prompt": "B"},
+            results={
+                "tags": ["tag_b"],
+                "confidence_scores": None,
+                "raw_output": "raw b",
+                "multimodal_response": {"comment": "B"},
+            },
+        )
+
+        cached_a = self.db.get_interrogation_cache_entry(
+            "hash123",
+            "LlamaCpp/test-model.gguf",
+            "cache-key-a",
+        )
+        cached_b = self.db.get_interrogation_cache_entry(
+            "hash123",
+            "LlamaCpp/test-model.gguf",
+            "cache-key-b",
+        )
+
+        self.assertEqual(cached_a["tags"], ["tag_a"])
+        self.assertEqual(cached_a["cache_metadata"]["prompt"], "A")
+        self.assertEqual(cached_b["tags"], ["tag_b"])
+        self.assertEqual(cached_b["cache_metadata"]["prompt"], "B")
+
 
 if __name__ == "__main__":
     unittest.main()
