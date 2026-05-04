@@ -5,12 +5,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPalette, QPixmap
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
-    QFrame,
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
@@ -19,7 +18,6 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
-    QInputDialog,
     QPushButton,
     QProgressBar,
     QRadioButton,
@@ -46,6 +44,7 @@ from core.llama_cpp_runtime import is_llama_timeout_error
 from interrogators import LlamaCppInterrogator
 from ui.dialogs import create_llama_config_widget
 from ui.dialogs_advanced import AdvancedImageInspectionDialog
+from ui.widgets import InquiryTranscriptWidget
 from ui.workers import MultimodalInterrogationWorker
 
 
@@ -363,11 +362,10 @@ class InquiryTab(QWidget):
 
         transcript_group = QGroupBox("Transcript")
         transcript_layout = QVBoxLayout()
-        self.single_transcript = QListWidget()
-        self.single_transcript.setSelectionMode(QListWidget.SelectionMode.NoSelection)
-        self.single_transcript.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.single_transcript.setSpacing(8)
-        self.single_transcript.setMinimumHeight(520)
+        self.single_transcript = InquiryTranscriptWidget(
+            display_name_func=self._to_display_name,
+            model_name_func=self._current_transcript_model_name,
+        )
         transcript_layout.addWidget(self.single_transcript)
         transcript_group.setLayout(transcript_layout)
         layout.addWidget(transcript_group, 1)
@@ -963,210 +961,14 @@ class InquiryTab(QWidget):
             self.single_transcript.scrollToBottom()
 
     def _append_transcript_turn_card(self, turn: Dict[str, Any], image_path: Optional[str] = None) -> None:
-        """Render one transcript turn using a card layout."""
-        palette = self.palette()
-        text_hex = "#111111"
-        neutral_text_hex = palette.color(QPalette.ColorRole.Text).name()
-        prompt_border_hex = "#5A8FD8"
-        prompt_bg_hex = "#DCEBFF"
-        normal_border_hex = "#4D9B63"
-        normal_bg_hex = "#DEF6E3"
-        unusual_border_hex = "#C85D5D"
-        unusual_bg_hex = "#FCE1E1"
-        chip_border_hex = palette.color(QPalette.ColorRole.Mid).name()
-        chip_bg_hex = palette.color(QPalette.ColorRole.Button).name()
-
-        card = QWidget()
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(8, 8, 8, 8)
-        card_layout.setSpacing(6)
-
-        prompt_type = turn.get("prompt_type") or "describe"
-        user_prompt_text = turn.get("prompt_text") or ""
-        included_tables = turn.get("included_tables") or []
-        included_transcripts = turn.get("included_transcripts") or []
-        sidecar_tags = turn.get("sidecar_tags") or []
-        prompt_text = LlamaCppInterrogator.build_prompt_display_summary(
-            prompt_type,
-            user_prompt_text,
-            included_tables,
-            included_transcripts=included_transcripts,
-            sidecar_tags=sidecar_tags,
-        )
-        full_prompt_text = LlamaCppInterrogator.build_user_prompt_from_turn(
-            {
-                "prompt_type": prompt_type,
-                "prompt_text": user_prompt_text,
-                "included_tables": included_tables,
-                "included_transcripts": included_transcripts,
-                "sidecar_tags": sidecar_tags,
-            }
-        )
-        prompt_frame = QFrame()
-        prompt_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        prompt_frame.setStyleSheet(
-            f"QFrame {{ border: 1px solid {prompt_border_hex}; border-radius: 6px; background-color: {prompt_bg_hex}; }}"
-        )
-        prompt_layout = QVBoxLayout(prompt_frame)
-        prompt_layout.setContentsMargins(8, 6, 8, 6)
-        prompt_label = QLabel(prompt_text)
-        prompt_label.setWordWrap(True)
-        prompt_label.setStyleSheet(f"color: {text_hex};")
-        prompt_layout.addWidget(prompt_label)
-
-        details_button = QPushButton("Show Prompt Details")
-        details_button.setCheckable(True)
-        details_button.setStyleSheet(f"color: {text_hex};")
-        prompt_layout.addWidget(details_button)
-
-        details_view = QTextEdit()
-        details_view.setReadOnly(True)
-        details_view.setPlainText(full_prompt_text)
-        details_view.setMaximumHeight(220)
-        details_view.setVisible(False)
-        prompt_layout.addWidget(details_view)
-
-        transcript_item: Optional[QListWidgetItem] = None
-
-        def toggle_prompt_details(visible: bool):
-            details_view.setVisible(visible)
-            details_button.setText("Hide Prompt Details" if visible else "Show Prompt Details")
-            if transcript_item:
-                transcript_item.setSizeHint(card.sizeHint())
-
-        details_button.toggled.connect(toggle_prompt_details)
-
+        """Render one transcript turn using the shared transcript widget."""
         turn_image_path = image_path or turn.get("image_path") or self.current_image_path
-        if turn_image_path:
-            prompt_path_row = QHBoxLayout()
-            prompt_path_row.addStretch()
-            path_label = QLabel(f"[{self._to_display_name(turn_image_path)}]")
-            path_label.setStyleSheet(f"color: {text_hex};")
-            prompt_path_row.addWidget(path_label)
-            prompt_layout.addLayout(prompt_path_row)
-        card_layout.addWidget(prompt_frame)
+        self.single_transcript.append_turn_card(turn, image_path=turn_image_path)
 
-        image_label = QLabel("[image]")
-        image_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        if turn_image_path and Path(turn_image_path).exists():
-            pixmap = QPixmap(turn_image_path)
-            if not pixmap.isNull():
-                thumb = pixmap.scaled(
-                    220,
-                    160,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                image_label.setPixmap(thumb)
-        card_layout.addWidget(image_label)
-
-        response_json = turn.get("response_json", {}) or {}
-        comment = ""
-        if isinstance(response_json, dict):
-            comment = (
-                response_json.get("comment")
-                or response_json.get("answer")
-                or response_json.get("reasoning_summary")
-                or ""
-            )
-        warnings = response_json.get("warnings", []) if isinstance(response_json, dict) else []
-        parse_mode = response_json.get("_parse_mode", "") if isinstance(response_json, dict) else ""
-        unusual = bool(
-            "model_returned_non_json_response" in warnings
-            or parse_mode == "non_json_fallback"
-        )
-        raw_text = ""
-        if isinstance(response_json, dict):
-            raw_text = (
-                response_json.get("_debug_raw_response")
-                or response_json.get("comment")
-                or response_json.get("answer")
-                or ""
-            )
-        if unusual:
-            raw_payload = raw_text.strip()
-            display_text = "[Raw]" if not raw_payload else f"[Raw]\n{raw_payload}"
-        else:
-            display_text = (comment or "").strip() or "[no comment]"
-        model_name = turn.get("model_name") or (
-            self.current_interrogator.model_name if self.current_interrogator else "LlamaCpp"
-        )
-
-        response_frame = QFrame()
-        response_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        response_border_hex = unusual_border_hex if unusual else normal_border_hex
-        response_bg_hex = unusual_bg_hex if unusual else normal_bg_hex
-        response_frame.setStyleSheet(
-            f"QFrame {{ border: 1px solid {response_border_hex}; border-radius: 6px; background-color: {response_bg_hex}; }}"
-        )
-        response_layout = QVBoxLayout(response_frame)
-        response_layout.setContentsMargins(8, 6, 8, 6)
-        comment_label = QLabel(display_text)
-        comment_label.setWordWrap(True)
-        comment_label.setStyleSheet(f"color: {text_hex};")
-        model_label = QLabel(f"[{model_name}]")
-        model_label.setStyleSheet(f"color: {text_hex};")
-        model_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        response_layout.addWidget(comment_label)
-        response_layout.addWidget(model_label)
-        card_layout.addWidget(response_frame)
-
-        tags_row = QHBoxLayout()
-        tags_row.setSpacing(4)
-        tags = list(turn.get("tags") or [])
-
-        def refresh_tags_row():
-            while tags_row.count():
-                child = tags_row.takeAt(0)
-                widget_obj = child.widget()
-                if widget_obj:
-                    widget_obj.deleteLater()
-
-            for tag in tags:
-                tag_button = QPushButton(f"[{tag}]")
-                tag_button.setStyleSheet(
-                    f"QPushButton {{ border: 1px solid {chip_border_hex}; border-radius: 10px; padding: 2px 8px; background: {chip_bg_hex}; color: {neutral_text_hex}; }}"
-                )
-                tag_button.setFlat(False)
-
-                def remove_tag(_: bool = False, tag_value: str = tag):
-                    if tag_value in tags:
-                        tags.remove(tag_value)
-                        turn["tags"] = list(tags)
-                        refresh_tags_row()
-
-                tag_button.clicked.connect(remove_tag)
-                tags_row.addWidget(tag_button)
-
-            add_button = QPushButton("[+]")
-            add_button.setStyleSheet(
-                f"QPushButton {{ border: 1px solid {chip_border_hex}; border-radius: 10px; padding: 2px 8px; background: {chip_bg_hex}; color: {neutral_text_hex}; }}"
-            )
-
-            def add_tag(_: bool = False):
-                new_tag, ok = QInputDialog.getText(self, "Add Tag", "New tag:")
-                if not ok:
-                    return
-                clean = new_tag.strip()
-                if not clean:
-                    return
-                if clean not in tags:
-                    tags.append(clean)
-                    turn["tags"] = list(tags)
-                    refresh_tags_row()
-
-            add_button.clicked.connect(add_tag)
-            tags_row.addWidget(add_button)
-            tags_row.addStretch()
-
-        refresh_tags_row()
-        card_layout.addLayout(tags_row)
-
-        item = QListWidgetItem()
-        item.setSizeHint(card.sizeHint())
-        self.single_transcript.addItem(item)
-        transcript_item = item
-        self.single_transcript.setItemWidget(item, card)
+    def _current_transcript_model_name(self) -> Optional[str]:
+        if self.current_interrogator:
+            return self.current_interrogator.model_name
+        return None
 
     def _prime_current_session_history(self):
         """Prime in-memory context for the currently selected image session."""

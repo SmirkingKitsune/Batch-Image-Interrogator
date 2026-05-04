@@ -11,9 +11,11 @@
   },
   "single_task": "describe",
   "single_prompt": "",
-  "batch_task": "describe",
+  "batch_task": "audit",
   "batch_prompt": "",
   "batch_include_prior_tables": true,
+  "single_include_prior_transcripts": false,
+  "batch_include_prior_transcripts": false,
   "batch_included_model_types": [
     "CLIP",
     "WD",
