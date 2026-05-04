@@ -18,7 +18,7 @@ from core.llama_cpp_runtime import (
 class LlamaCppInterrogator(BaseInterrogator):
     """Multimodal interrogator backed by a managed llama.cpp server."""
 
-    TASK_MODES = ["describe", "ocr", "vqa", "custom"]
+    TASK_MODES = ["describe", "ocr", "vqa", "custom", "audit"]
     REQUIRED_FIELDS = ["comment"]
     RESPONSE_TOOL_NAME = "submit_multimodal_response"
     REQUEST_TIMEOUT_SECONDS = 120.0
@@ -97,6 +97,8 @@ class LlamaCppInterrogator(BaseInterrogator):
         session_key: Optional[str] = None,
         keep_context: bool = False,
         included_tables: Optional[List[Dict[str, Any]]] = None,
+        included_transcripts: Optional[List[Dict[str, Any]]] = None,
+        sidecar_tags: Optional[List[str]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -111,7 +113,13 @@ class LlamaCppInterrogator(BaseInterrogator):
             raise ValueError(f"Invalid task '{task}'. Choose from {self.TASK_MODES}")
 
         system_prompt = self._build_system_prompt()
-        user_text = self._build_user_prompt(task, prompt, included_tables or [])
+        user_text = self._build_user_prompt(
+            task,
+            prompt,
+            included_tables or [],
+            included_transcripts=included_transcripts or [],
+            sidecar_tags=sidecar_tags or [],
+        )
         image_data_url = self._encode_image_as_data_url(image_path)
 
         if keep_context and session_key:
@@ -168,6 +176,8 @@ class LlamaCppInterrogator(BaseInterrogator):
                     task=task,
                     prompt=prompt,
                     included_tables=included_tables or [],
+                    included_transcripts=included_transcripts or [],
+                    sidecar_tags=sidecar_tags or [],
                     include_format_example=True,
                 )
                 retry_messages = list(messages[:-1])
@@ -250,6 +260,16 @@ class LlamaCppInterrogator(BaseInterrogator):
         if debug_raw:
             parsed["_debug_raw_response"] = debug_raw[:20000]
         parsed["_parse_mode"] = parse_mode
+        if task == "audit":
+            delete_tags = self._normalize_tag_list(parsed.get("delete_tags", []))
+            parsed["delete_tags"] = delete_tags
+            parsed["sidecar_tags"] = list(sidecar_tags or [])
+            if sidecar_tags and not parsed.get("tags"):
+                delete_lookup = {tag.strip().casefold() for tag in delete_tags}
+                parsed["tags"] = [
+                    tag for tag in sidecar_tags
+                    if tag.strip().casefold() not in delete_lookup
+                ]
 
         if keep_context and session_key:
             compact_user = {"role": "user", "content": user_text}
@@ -361,6 +381,8 @@ class LlamaCppInterrogator(BaseInterrogator):
         task: str,
         prompt: str,
         included_tables: List[Dict[str, Any]],
+        included_transcripts: Optional[List[Dict[str, Any]]] = None,
+        sidecar_tags: Optional[List[str]] = None,
         include_format_example: bool = False,
     ) -> str:
         task_instructions = {
@@ -389,17 +411,33 @@ class LlamaCppInterrogator(BaseInterrogator):
                 "- Keep comment concise and grounded in visible image content.\n"
                 "- Output key for custom labels: custom (string[])."
             ),
+            "audit": (
+                "Goal: audit the sidecar text-file tags against the image.\n"
+                "- Treat sidecar_tags as the current tag file contents.\n"
+                "- Delete only tags that are clearly erroneous, contradicted by visible image evidence, or unsupported after reviewing optional context.\n"
+                "- If uncertain, keep the tag.\n"
+                "- tags should be the sidecar tags that should remain.\n"
+                "- delete_tags should contain exact sidecar tag strings to remove from the .txt file.\n"
+                "- Do not add new tags in this task."
+            ),
         }
         base = task_instructions.get(task, task_instructions["describe"])
         user_prompt = prompt.strip() if prompt else ""
 
         parts = [f"Task: {task}", base]
+        if sidecar_tags:
+            parts.append("Current sidecar text-file tags:")
+            parts.append(json.dumps(list(sidecar_tags), ensure_ascii=False, indent=2))
         if user_prompt:
             parts.append(f"User request: {user_prompt}")
         if included_tables:
             tables_json = json.dumps(included_tables, ensure_ascii=False, indent=2)
             parts.append("Prior interrogation tables (use as context when helpful):")
             parts.append(tables_json)
+        if included_transcripts:
+            transcripts_json = json.dumps(included_transcripts, ensure_ascii=False, indent=2)
+            parts.append("Prior inquiry transcripts (use as context when helpful):")
+            parts.append(transcripts_json)
         parts.append("Task output JSON schema template (placeholders):")
         parts.append(cls._build_format_example_json(task=task))
         if include_format_example:
@@ -419,6 +457,8 @@ class LlamaCppInterrogator(BaseInterrogator):
             task=turn.get("prompt_type") or "describe",
             prompt=turn.get("prompt_text") or "",
             included_tables=turn.get("included_tables") or [],
+            included_transcripts=turn.get("included_transcripts") or [],
+            sidecar_tags=turn.get("sidecar_tags") or [],
         )
 
     @classmethod
@@ -427,6 +467,8 @@ class LlamaCppInterrogator(BaseInterrogator):
         task: str,
         prompt: str,
         included_tables: List[Dict[str, Any]],
+        included_transcripts: Optional[List[Dict[str, Any]]] = None,
+        sidecar_tags: Optional[List[str]] = None,
     ) -> str:
         """Build a readable transcript summary of the effective request."""
         clean_task = (task or "describe").strip() or "describe"
@@ -454,6 +496,16 @@ class LlamaCppInterrogator(BaseInterrogator):
                 source_text = f"{source_text}, +{len(labels) - 4} more"
             plural = "result" if table_count == 1 else "results"
             parts.append(f"Context sources: {table_count} prior {plural} from {source_text}")
+
+        transcript_count = len(included_transcripts or [])
+        if transcript_count:
+            plural = "turn" if transcript_count == 1 else "turns"
+            parts.append(f"Transcript context: {transcript_count} prior inquiry {plural}")
+
+        sidecar_count = len(sidecar_tags or [])
+        if sidecar_count:
+            plural = "tag" if sidecar_count == 1 else "tags"
+            parts.append(f"Sidecar tags: {sidecar_count} {plural}")
 
         return "\n".join(parts)
 
@@ -488,8 +540,48 @@ class LlamaCppInterrogator(BaseInterrogator):
                 '  "warnings": []\n'
                 "}"
             ),
+            "audit": (
+                "{\n"
+                '  "tags": [list],\n'
+                '  "delete_tags": [list],\n'
+                '  "comment": "string",\n'
+                '  "reasoning_summary": "string",\n'
+                '  "warnings": []\n'
+                "}"
+            ),
         }
         return templates.get(task, templates["describe"])
+
+    @classmethod
+    def build_transcript_context(cls, turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Compact persisted multimodal turns into prompt-safe transcript context."""
+        context: List[Dict[str, Any]] = []
+        for turn in turns or []:
+            if not isinstance(turn, dict):
+                continue
+            response = turn.get("response_json", {}) or {}
+            if not isinstance(response, dict):
+                response = {}
+            context.append(
+                {
+                    "model_name": turn.get("model_name"),
+                    "mode": turn.get("mode"),
+                    "turn_index": turn.get("turn_index"),
+                    "task": turn.get("prompt_type"),
+                    "prompt": turn.get("prompt_text") or "",
+                    "response_summary": (
+                        response.get("comment")
+                        or response.get("answer")
+                        or response.get("reasoning_summary")
+                        or ""
+                    ),
+                    "tags": turn.get("tags", []) or [],
+                    "delete_tags": response.get("delete_tags", []) or [],
+                    "warnings": response.get("warnings", []) or [],
+                    "created_at": turn.get("created_at"),
+                }
+            )
+        return context
 
     @staticmethod
     def _encode_image_as_data_url(image_path: str) -> str:
@@ -593,6 +685,10 @@ class LlamaCppInterrogator(BaseInterrogator):
                                 "type": "array",
                                 "items": {"type": "string"},
                             },
+                            "delete_tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
                             "comment": {"type": "string"},
                             "answer": {"type": "string"},
                             "ocr_text": {"type": "string"},
@@ -666,6 +762,8 @@ class LlamaCppInterrogator(BaseInterrogator):
             if isinstance(describe_custom, list) and all(isinstance(x, str) for x in describe_custom):
                 tags = list(describe_custom)
 
+        delete_tags = cls._normalize_tag_list(parsed.get("delete_tags", []))
+
         reasoning_summary = parsed.get("reasoning_summary", "")
         if not isinstance(reasoning_summary, str):
             reasoning_summary = ""
@@ -677,8 +775,28 @@ class LlamaCppInterrogator(BaseInterrogator):
             "answer": comment,
             "ocr_text": ocr_text,
             "reasoning_summary": reasoning_summary,
+            "delete_tags": delete_tags,
             "warnings": warnings,
         }
+        return normalized
+
+    @staticmethod
+    def _normalize_tag_list(value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        normalized: List[str] = []
+        seen = set()
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            clean = item.strip()
+            if not clean:
+                continue
+            key = clean.casefold()
+            if key in seen:
+                continue
+            normalized.append(clean)
+            seen.add(key)
         return normalized
 
     def _repair_response_to_json(self, raw_text: str, task: Optional[str] = None) -> Dict[str, Any]:
@@ -692,7 +810,7 @@ class LlamaCppInterrogator(BaseInterrogator):
                 "content": (
                     "Convert the user content into valid JSON with keys: "
                     "tags (string[]), comment (string), ocr_text (string), "
-                    "reasoning_summary (string), warnings (string[]). "
+                    "reasoning_summary (string), delete_tags (string[]), warnings (string[]). "
                     "Return only JSON."
                 ),
             },
@@ -726,6 +844,7 @@ class LlamaCppInterrogator(BaseInterrogator):
             "answer": comment,
             "ocr_text": "",
             "reasoning_summary": summary,
+            "delete_tags": [],
             "warnings": warning_list or ["model_returned_non_json_response"],
         }
 

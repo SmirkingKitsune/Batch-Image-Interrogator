@@ -262,8 +262,10 @@ python main.py
   - `ocr`: extract text + tags
   - `vqa`: answer visual question + tags
   - `custom`: freeform instruction + tags
+  - `audit`: review the image against existing sidecar `.txt` tags and delete tags the model judges erroneous
 - **Batch context controls**:
   - include selected prior interrogation tables
+  - optionally include prior inquiry transcripts for each image
   - optional carry-context across batch (disabled by default)
 
 **Recommended Models:**
@@ -346,8 +348,9 @@ Access detailed image analysis by:
 
 **Multimodal Inquiry Tab:**
 - Single-image multimodal chat using llama.cpp
-- Task selector (`describe`, `ocr`, `vqa`, `custom`)
+- Task selector (`describe`, `ocr`, `vqa`, `custom`, `audit`)
 - Prompt input plus manual selection of prior interrogation tables
+- Optional prior inquiry transcript context for audit/reasoning-heavy turns
 - Persistent per-image transcript backed by SQLite session/turn history
 - `Reset Image Context` clears in-memory and persisted conversation for the current image
 

@@ -200,6 +200,7 @@ class MultimodalInterrogationWorker(QThread):
         overwrite_files: bool = False,
         tag_filters: Optional[TagFilterSettings] = None,
         include_prior_tables: bool = False,
+        include_prior_transcripts: bool = False,
         included_model_types: Optional[List[str]] = None,
         included_sources: Optional[List[Dict[str, Any]]] = None,
         carry_context_across_batch: bool = False,
@@ -215,6 +216,7 @@ class MultimodalInterrogationWorker(QThread):
         self.overwrite_files = overwrite_files
         self.tag_filters = tag_filters
         self.include_prior_tables = include_prior_tables
+        self.include_prior_transcripts = include_prior_transcripts
         self.included_model_types = set(included_model_types or [])
         self.uses_included_sources = included_sources is not None
         self.included_source_keys = {
@@ -280,11 +282,21 @@ class MultimodalInterrogationWorker(QThread):
                     )
 
                     included_tables = self._build_included_tables(file_hash)
+                    included_transcripts = self._build_included_transcripts(file_hash)
+                    sidecar_tags = (
+                        FileManager.read_tags_from_file(image_path)
+                        if self.task == "audit"
+                        else []
+                    )
                     cache_key = None
                     cache_metadata: Dict[str, Any] = {}
                     can_use_cache = self.use_cache and not self.carry_context_across_batch
                     if can_use_cache:
-                        cache_key, cache_metadata = self._build_cache_identity(included_tables)
+                        cache_key, cache_metadata = self._build_cache_identity(
+                            included_tables,
+                            included_transcripts,
+                            sidecar_tags,
+                        )
                         cached = self.database.get_interrogation_cache_entry(
                             file_hash,
                             self.interrogator.model_name,
@@ -309,6 +321,8 @@ class MultimodalInterrogationWorker(QThread):
                             session_key=session_key,
                             keep_context=bool(self.carry_context_across_batch),
                             included_tables=included_tables,
+                            included_transcripts=included_transcripts,
+                            sidecar_tags=sidecar_tags,
                         )
                         if cache_key:
                             self.database.save_interrogation_cache_entry(
@@ -319,6 +333,21 @@ class MultimodalInterrogationWorker(QThread):
                                 results=results,
                             )
                     results["included_tables"] = included_tables
+                    results["included_transcripts"] = included_transcripts
+                    results["sidecar_tags"] = sidecar_tags
+
+                    if self.task == "audit" and self.write_files:
+                        removed_tags, remaining_tags = FileManager.delete_tags_from_file(
+                            image_path,
+                            (results.get("multimodal_response") or {}).get("delete_tags", []),
+                        )
+                        response_json = results.get("multimodal_response", {}) or {}
+                        response_json["removed_tags"] = removed_tags
+                        response_json["remaining_tags"] = remaining_tags
+                        results["multimodal_response"] = response_json
+                        results["audit_removed_tags"] = removed_tags
+                        results["audit_remaining_tags"] = remaining_tags
+                        results["tags"] = remaining_tags
 
                     # Keep latest multimodal result in main interrogations table.
                     self.database.save_interrogation(
@@ -341,12 +370,14 @@ class MultimodalInterrogationWorker(QThread):
                         prompt_type=self.task,
                         prompt_text=self.prompt,
                         included_tables=included_tables,
+                        included_transcripts=included_transcripts,
+                        sidecar_tags=sidecar_tags,
                         response_json=response_json,
                         tags=results["tags"],
                         reasoning_summary=response_json.get("reasoning_summary", ""),
                     )
 
-                    if self.write_files:
+                    if self.write_files and self.task != "audit":
                         tags_to_write = results["tags"]
                         if self.tag_filters:
                             confidence_scores = results.get("confidence_scores")
@@ -412,15 +443,36 @@ class MultimodalInterrogationWorker(QThread):
             )
         return filtered
 
+    def _build_included_transcripts(self, file_hash: str) -> List[Dict[str, Any]]:
+        """Build prior inquiry transcript context for a single image."""
+        if not self.include_prior_transcripts:
+            return []
+        history = self.database.get_multimodal_history(image_hash=file_hash)
+        builder = getattr(self.interrogator, "build_transcript_context", None)
+        if callable(builder):
+            return builder(history)
+        return history
+
     @staticmethod
     def _source_key(model_name: Optional[str], model_type: Optional[str]) -> str:
         """Stable key for matching selected batch context sources."""
         return f"{model_type or ''}\u001f{model_name or ''}"
 
-    def _build_cache_identity(self, included_tables: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
+    def _build_cache_identity(
+        self,
+        included_tables: List[Dict[str, Any]],
+        included_transcripts: Optional[List[Dict[str, Any]]] = None,
+        sidecar_tags: Optional[List[str]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
         """Build a deterministic exact-match cache key and its metadata."""
         normalized_config = self._normalize_cache_config(self.interrogator.get_config())
-        context_digest = self._stable_digest(included_tables)
+        context_digest = self._stable_digest(
+            {
+                "tables": included_tables,
+                "transcripts": included_transcripts or [],
+                "sidecar_tags": sidecar_tags or [],
+            }
+        )
         metadata: Dict[str, Any] = {
             "cache_version": self.CACHE_VERSION,
             "prompt_builder_version": self.PROMPT_BUILDER_VERSION,
@@ -434,6 +486,8 @@ class MultimodalInterrogationWorker(QThread):
             "included_source_keys": sorted(self.included_source_keys),
             "included_model_types": sorted(self.included_model_types),
             "context_tables": included_tables,
+            "context_transcripts": included_transcripts or [],
+            "sidecar_tags": sidecar_tags or [],
             "context_digest": context_digest,
         }
         return self._stable_digest(metadata), metadata

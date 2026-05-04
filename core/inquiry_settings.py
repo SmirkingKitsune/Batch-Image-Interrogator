@@ -21,6 +21,8 @@ class InquirySettings:
         "batch_task": "describe",
         "batch_prompt": "",
         "batch_include_prior_tables": False,
+        "single_include_prior_transcripts": False,
+        "batch_include_prior_transcripts": False,
         "batch_included_model_types": ["CLIP", "WD", "Camie"],
         "batch_context_source_keys": [],
         "batch_carry_context": False,
@@ -116,7 +118,13 @@ class InquirySettings:
             if isinstance(value, str):
                 normalized[key] = value
 
-        for key in ("batch_include_prior_tables", "batch_carry_context", "batch_use_cache"):
+        for key in (
+            "batch_include_prior_tables",
+            "single_include_prior_transcripts",
+            "batch_include_prior_transcripts",
+            "batch_carry_context",
+            "batch_use_cache",
+        ):
             value = data.get(key)
             if isinstance(value, bool):
                 normalized[key] = value

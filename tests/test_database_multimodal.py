@@ -54,6 +54,8 @@ class TestDatabaseMultimodal(unittest.TestCase):
             prompt_type="describe",
             prompt_text="Describe this image.",
             included_tables=[{"model_name": "WD", "tags": ["portrait"]}],
+            included_transcripts=[{"task": "vqa", "response_summary": "It is indoors."}],
+            sidecar_tags=["portrait", "wrong_tag"],
             response_json={
                 "tags": ["portrait", "smile"],
                 "answer": "A smiling portrait.",
@@ -75,9 +77,13 @@ class TestDatabaseMultimodal(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["prompt_type"], "describe")
         self.assertEqual(history[0]["tags"], ["portrait", "smile"])
+        self.assertEqual(history[0]["included_transcripts"][0]["task"], "vqa")
+        self.assertEqual(history[0]["sidecar_tags"], ["portrait", "wrong_tag"])
         effective_prompt = LlamaCppInterrogator.build_user_prompt_from_turn(history[0])
         self.assertIn("Task: describe", effective_prompt)
         self.assertIn("Prior interrogation tables", effective_prompt)
+        self.assertIn("Prior inquiry transcripts", effective_prompt)
+        self.assertIn("Current sidecar text-file tags", effective_prompt)
         self.assertIn('"model_name": "WD"', effective_prompt)
 
         deleted = self.db.clear_multimodal_session(

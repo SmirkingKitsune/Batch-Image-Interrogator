@@ -100,6 +100,26 @@ class FakeLlamaInterrogator:
         }
 
 
+class FakeAuditInterrogator(FakeLlamaInterrogator):
+    def interrogate(self, image_path, **kwargs):
+        self.calls += 1
+        sidecar_tags = kwargs.get("sidecar_tags") or []
+        delete_tags = ["dog"] if "dog" in sidecar_tags else []
+        remaining = [tag for tag in sidecar_tags if tag not in delete_tags]
+        return {
+            "tags": remaining,
+            "confidence_scores": None,
+            "raw_output": "audit raw",
+            "multimodal_response": {
+                "tags": remaining,
+                "delete_tags": delete_tags,
+                "comment": "Audit complete.",
+                "warnings": [],
+                "reasoning_summary": "Dog is unsupported.",
+            },
+        }
+
+
 class MultimodalWorkerContextTests(unittest.TestCase):
     def _make_image(self, directory: Path) -> Path:
         image_path = directory / "image.png"
@@ -117,6 +137,7 @@ class MultimodalWorkerContextTests(unittest.TestCase):
         included_sources=None,
         carry_context_across_batch=False,
         use_cache=True,
+        write_files=False,
     ):
         worker = MultimodalInterrogationWorker(
             image_paths=[image_path],
@@ -124,7 +145,7 @@ class MultimodalWorkerContextTests(unittest.TestCase):
             database=db,
             task=task,
             prompt=prompt,
-            write_files=False,
+            write_files=write_files,
             include_prior_tables=include_prior_tables,
             included_sources=included_sources,
             carry_context_across_batch=carry_context_across_batch,
@@ -312,6 +333,26 @@ class MultimodalWorkerContextTests(unittest.TestCase):
         )
 
         self.assertEqual(worker._build_included_tables("hash123"), [])
+
+    def test_audit_deletes_erroneous_sidecar_tags(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            image_path = self._make_image(tmp)
+            image_path.with_suffix(".txt").write_text("cat, dog, indoor", encoding="utf-8")
+            db = InterrogationDatabase(str(tmp / "interrogations.db"))
+
+            self._run_worker(
+                db,
+                image_path,
+                FakeAuditInterrogator("audit"),
+                task="audit",
+                use_cache=False,
+                write_files=True,
+            )
+
+            self.assertEqual(image_path.with_suffix(".txt").read_text(encoding="utf-8"), "cat, indoor")
+            cached = db.get_interrogation(hash_image_content(str(image_path)), "LlamaCpp/test-model.gguf")
+            self.assertEqual(cached["tags"], ["cat", "indoor"])
 
 
 if __name__ == "__main__":

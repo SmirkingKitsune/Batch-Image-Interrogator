@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core import (
+    FileManager,
     InquirySettings,
     InterrogationDatabase,
     TagFilterSettings,
@@ -91,6 +92,7 @@ class InquiryTab(QWidget):
         self.batch_transcript_entries: List[Dict[str, Any]] = []
         self.active_batch_task = "describe"
         self.active_batch_prompt = ""
+        self.last_non_audit_txt_output_mode = "merge"
         self.saved_batch_context_source_keys: List[str] = []
         self.has_saved_batch_context_source_keys = False
         self.saved_batch_included_model_types: List[str] = ["CLIP", "WD", "Camie"]
@@ -207,7 +209,7 @@ class InquiryTab(QWidget):
         task_row = QHBoxLayout()
         task_row.addWidget(QLabel("Task:"))
         self.single_task_combo = QComboBox()
-        self.single_task_combo.addItems(["describe", "ocr", "vqa", "custom"])
+        self.single_task_combo.addItems(["describe", "ocr", "vqa", "custom", "audit"])
         task_row.addWidget(self.single_task_combo)
         task_row.addStretch()
         single_layout.addLayout(task_row)
@@ -226,6 +228,10 @@ class InquiryTab(QWidget):
         self.single_prior_tables.setHorizontalHeaderLabels(["Include", "Model"])
         self.single_prior_tables.horizontalHeader().setStretchLastSection(True)
         prior_layout.addWidget(self.single_prior_tables)
+        self.single_include_transcripts_check = QCheckBox(
+            "Include prior inquiry transcripts for this image"
+        )
+        prior_layout.addWidget(self.single_include_transcripts_check)
         prior_group.setLayout(prior_layout)
         single_layout.addWidget(prior_group)
 
@@ -258,7 +264,7 @@ class InquiryTab(QWidget):
         batch_layout = QVBoxLayout()
 
         self.batch_task_combo = QComboBox()
-        self.batch_task_combo.addItems(["describe", "ocr", "vqa", "custom"])
+        self.batch_task_combo.addItems(["describe", "ocr", "vqa", "custom", "audit"])
         batch_layout.addWidget(QLabel("Task:"))
         batch_layout.addWidget(self.batch_task_combo)
 
@@ -276,6 +282,10 @@ class InquiryTab(QWidget):
             "Include matching prior results for each batch image"
         )
         context_layout.addWidget(self.batch_include_prior_tables_check)
+        self.batch_include_transcripts_check = QCheckBox(
+            "Include prior inquiry transcripts for each batch image"
+        )
+        context_layout.addWidget(self.batch_include_transcripts_check)
 
         context_layout.addWidget(QLabel("Available prior results across the batch queue:"))
         self.batch_context_sources_table = QTableWidget()
@@ -400,9 +410,11 @@ class InquiryTab(QWidget):
             self.llama_config_refs[key].valueChanged.connect(lambda _: self._save_inquiry_options())
         self.single_task_combo.currentTextChanged.connect(lambda *_: self._save_inquiry_options())
         self.single_prompt_input.textChanged.connect(lambda *_: self._save_inquiry_options())
-        self.batch_task_combo.currentTextChanged.connect(lambda *_: self._save_inquiry_options())
+        self.single_include_transcripts_check.toggled.connect(lambda *_: self._save_inquiry_options())
+        self.batch_task_combo.currentTextChanged.connect(self._on_batch_task_changed)
         self.batch_prompt_input.textChanged.connect(self._save_inquiry_options)
         self.batch_include_prior_tables_check.toggled.connect(lambda *_: self._save_inquiry_options())
+        self.batch_include_transcripts_check.toggled.connect(lambda *_: self._save_inquiry_options())
         self.batch_carry_context_check.toggled.connect(lambda *_: self._save_inquiry_options())
         self.batch_use_cache_check.toggled.connect(lambda *_: self._save_inquiry_options())
         self.batch_context_sources_table.itemChanged.connect(lambda *_: self._save_inquiry_options())
@@ -427,6 +439,12 @@ class InquiryTab(QWidget):
         self.batch_include_prior_tables_check.setChecked(
             bool(options.get("batch_include_prior_tables", False))
         )
+        self.single_include_transcripts_check.setChecked(
+            bool(options.get("single_include_prior_transcripts", False))
+        )
+        self.batch_include_transcripts_check.setChecked(
+            bool(options.get("batch_include_prior_transcripts", False))
+        )
         self.has_saved_batch_context_source_keys = "batch_context_source_keys" in options
         self.saved_batch_context_source_keys = list(options.get("batch_context_source_keys", []))
         self.saved_batch_included_model_types = list(
@@ -442,6 +460,28 @@ class InquiryTab(QWidget):
         active_tab = int(options.get("active_tab", 0))
         if 0 <= active_tab < self.mode_tabs.count():
             self.mode_tabs.setCurrentIndex(active_tab)
+        self._update_txt_output_controls_for_task()
+
+    def _on_batch_task_changed(self, *_):
+        """Update batch-only controls whose behavior depends on the selected task."""
+        self._update_txt_output_controls_for_task()
+        self._save_inquiry_options()
+
+    def _update_txt_output_controls_for_task(self):
+        audit_mode = self.batch_task_combo.currentText() == "audit"
+        if audit_mode:
+            self.last_non_audit_txt_output_mode = self._selected_txt_output_mode()
+            self.merge_txt_radio.setChecked(True)
+        else:
+            self._set_txt_output_mode(self.last_non_audit_txt_output_mode)
+
+        for radio in (self.no_txt_radio, self.merge_txt_radio, self.overwrite_txt_radio):
+            radio.setEnabled(not audit_mode)
+            radio.setToolTip(
+                "Audit mode always mutates sidecar .txt files by deleting rejected tags."
+                if audit_mode
+                else ""
+            )
 
     @staticmethod
     def _set_combo_text(combo: QComboBox, value: str):
@@ -450,6 +490,7 @@ class InquiryTab(QWidget):
             combo.setCurrentIndex(index)
 
     def _set_txt_output_mode(self, mode: str):
+        self.last_non_audit_txt_output_mode = mode if mode in {"none", "merge", "overwrite"} else "merge"
         if mode == "none":
             self.no_txt_radio.setChecked(True)
         elif mode == "overwrite":
@@ -457,12 +498,17 @@ class InquiryTab(QWidget):
         else:
             self.merge_txt_radio.setChecked(True)
 
-    def _get_txt_output_mode(self) -> str:
+    def _selected_txt_output_mode(self) -> str:
         if self.no_txt_radio.isChecked():
             return "none"
         if self.overwrite_txt_radio.isChecked():
             return "overwrite"
         return "merge"
+
+    def _get_txt_output_mode(self) -> str:
+        if self.batch_task_combo.currentText() == "audit":
+            return self.last_non_audit_txt_output_mode
+        return self._selected_txt_output_mode()
 
     def _save_inquiry_options(self):
         """Persist current Inquiry options."""
@@ -482,6 +528,8 @@ class InquiryTab(QWidget):
             "batch_task": self.batch_task_combo.currentText(),
             "batch_prompt": self.batch_prompt_input.toPlainText(),
             "batch_include_prior_tables": self.batch_include_prior_tables_check.isChecked(),
+            "single_include_prior_transcripts": self.single_include_transcripts_check.isChecked(),
+            "batch_include_prior_transcripts": self.batch_include_transcripts_check.isChecked(),
             "batch_carry_context": self.batch_carry_context_check.isChecked(),
             "batch_use_cache": self.batch_use_cache_check.isChecked(),
             "txt_output_mode": self._get_txt_output_mode(),
@@ -525,6 +573,7 @@ class InquiryTab(QWidget):
         """Return current batch context-source options."""
         return {
             "include_prior_tables": self.batch_include_prior_tables_check.isChecked(),
+            "include_prior_transcripts": self.batch_include_transcripts_check.isChecked(),
             "included_sources": self._get_selected_batch_context_sources(),
             "carry_batch_context": self.batch_carry_context_check.isChecked(),
             "use_cache": self.batch_use_cache_check.isChecked(),
@@ -935,16 +984,22 @@ class InquiryTab(QWidget):
         prompt_type = turn.get("prompt_type") or "describe"
         user_prompt_text = turn.get("prompt_text") or ""
         included_tables = turn.get("included_tables") or []
+        included_transcripts = turn.get("included_transcripts") or []
+        sidecar_tags = turn.get("sidecar_tags") or []
         prompt_text = LlamaCppInterrogator.build_prompt_display_summary(
             prompt_type,
             user_prompt_text,
             included_tables,
+            included_transcripts=included_transcripts,
+            sidecar_tags=sidecar_tags,
         )
         full_prompt_text = LlamaCppInterrogator.build_user_prompt_from_turn(
             {
                 "prompt_type": prompt_type,
                 "prompt_text": user_prompt_text,
                 "included_tables": included_tables,
+                "included_transcripts": included_transcripts,
+                "sidecar_tags": sidecar_tags,
             }
         )
         prompt_frame = QFrame()
@@ -1148,6 +1203,13 @@ class InquiryTab(QWidget):
             )
         return selected
 
+    def _build_selected_prior_transcripts(self) -> List[Dict[str, Any]]:
+        """Build optional prior inquiry transcript context for the selected image."""
+        if not self.single_include_transcripts_check.isChecked() or not self.current_image_hash:
+            return []
+        history = self.database.get_multimodal_history(image_hash=self.current_image_hash)
+        return LlamaCppInterrogator.build_transcript_context(history)
+
     def send_single_inquiry(self):
         """Send one multimodal inquiry turn for selected image."""
         if not self.current_interrogator or not self.current_interrogator.is_loaded:
@@ -1161,6 +1223,12 @@ class InquiryTab(QWidget):
             task = self.single_task_combo.currentText()
             prompt_text = self.single_prompt_input.text().strip()
             included_tables = self._build_selected_prior_tables()
+            included_transcripts = self._build_selected_prior_transcripts()
+            sidecar_tags = (
+                FileManager.read_tags_from_file(Path(self.current_image_path))
+                if task == "audit"
+                else []
+            )
             self._save_inquiry_options()
             self.send_single_button.setEnabled(False)
 
@@ -1171,7 +1239,22 @@ class InquiryTab(QWidget):
                 session_key=self.current_session_key,
                 keep_context=True,
                 included_tables=included_tables,
+                included_transcripts=included_transcripts,
+                sidecar_tags=sidecar_tags,
             )
+
+            if task == "audit":
+                removed_tags, remaining_tags = FileManager.delete_tags_from_file(
+                    Path(self.current_image_path),
+                    (results.get("multimodal_response") or {}).get("delete_tags", []),
+                )
+                response_json = results.get("multimodal_response", {}) or {}
+                response_json["removed_tags"] = removed_tags
+                response_json["remaining_tags"] = remaining_tags
+                results["multimodal_response"] = response_json
+                results["audit_removed_tags"] = removed_tags
+                results["audit_remaining_tags"] = remaining_tags
+                results["tags"] = remaining_tags
 
             file_hash = self.current_image_hash or hash_image_content(self.current_image_path)
             metadata = get_image_metadata(self.current_image_path)
@@ -1207,6 +1290,8 @@ class InquiryTab(QWidget):
                 prompt_type=task,
                 prompt_text=prompt_text,
                 included_tables=included_tables,
+                included_transcripts=included_transcripts,
+                sidecar_tags=sidecar_tags,
                 response_json=response_json,
                 tags=results["tags"],
                 reasoning_summary=response_json.get("reasoning_summary", ""),
@@ -1218,7 +1303,12 @@ class InquiryTab(QWidget):
             self.raw_response_view.setPlainText(results.get("raw_output", ""))
 
             warnings = (results.get("multimodal_response") or {}).get("warnings", [])
-            if warnings:
+            if task == "audit":
+                removed_tags = results.get("audit_removed_tags", []) or []
+                self.progress_label.setText(
+                    f"Audit completed. Removed {len(removed_tags)} sidecar tag(s)."
+                )
+            elif warnings:
                 self.progress_label.setText(f"Single-image inquiry completed with warnings: {', '.join(warnings[:2])}")
             else:
                 self.progress_label.setText("Single-image inquiry completed.")
@@ -1283,7 +1373,10 @@ class InquiryTab(QWidget):
         self.active_batch_task = task
         self.active_batch_prompt = prompt_text
 
-        if self.no_txt_radio.isChecked():
+        if task == "audit":
+            write_files = True
+            overwrite_files = False
+        elif self.no_txt_radio.isChecked():
             write_files = False
             overwrite_files = False
         elif self.merge_txt_radio.isChecked():
@@ -1311,6 +1404,7 @@ class InquiryTab(QWidget):
             overwrite_files=overwrite_files,
             tag_filters=self.tag_filters,
             include_prior_tables=context_options["include_prior_tables"],
+            include_prior_transcripts=context_options["include_prior_transcripts"],
             included_sources=context_options["included_sources"],
             carry_context_across_batch=context_options["carry_batch_context"],
             use_cache=context_options["use_cache"],
@@ -1357,6 +1451,8 @@ class InquiryTab(QWidget):
             "prompt_type": self.active_batch_task,
             "prompt_text": self.active_batch_prompt,
             "included_tables": results.get("included_tables", []) or [],
+            "included_transcripts": results.get("included_transcripts", []) or [],
+            "sidecar_tags": results.get("sidecar_tags", []) or [],
             "response_json": results.get("multimodal_response", {}) or {},
             "tags": results.get("tags", []) or [],
             "model_name": self.current_interrogator.model_name if self.current_interrogator else "LlamaCpp",

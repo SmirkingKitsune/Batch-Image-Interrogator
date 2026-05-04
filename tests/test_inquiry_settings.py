@@ -23,6 +23,8 @@ class InquirySettingsTests(unittest.TestCase):
                     "batch_task": "ocr",
                     "batch_prompt": "Read text.",
                     "batch_include_prior_tables": True,
+                    "single_include_prior_transcripts": True,
+                    "batch_include_prior_transcripts": True,
                     "batch_included_model_types": ["WD"],
                     "batch_context_source_keys": ["WD\u001fWD14"],
                     "batch_carry_context": True,
@@ -38,6 +40,8 @@ class InquirySettingsTests(unittest.TestCase):
             self.assertNotIn("included_model_types", reloaded.get_llama_config())
             self.assertEqual(reloaded.get_options()["single_task"], "vqa")
             self.assertTrue(reloaded.get_options()["batch_include_prior_tables"])
+            self.assertTrue(reloaded.get_options()["single_include_prior_transcripts"])
+            self.assertTrue(reloaded.get_options()["batch_include_prior_transcripts"])
             self.assertEqual(reloaded.get_options()["batch_included_model_types"], ["WD"])
             self.assertEqual(reloaded.get_options()["batch_context_source_keys"], ["WD\u001fWD14"])
             self.assertTrue(reloaded.get_options()["batch_carry_context"])

@@ -1,7 +1,7 @@
 """File management for images and associated text files."""
 
 from pathlib import Path
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Tuple
 import shutil
 
 
@@ -55,6 +55,44 @@ class FileManager:
             all_tags = list(dict.fromkeys(existing_tags + tags))  # Remove duplicates, preserve order
             with open(txt_path, 'w', encoding='utf-8') as f:
                 f.write(separator.join(all_tags))
+
+    @staticmethod
+    def delete_tags_from_file(
+        image_path: Path,
+        tags_to_delete: List[str],
+        separator: str = ', ',
+    ) -> Tuple[List[str], List[str]]:
+        """Remove selected tags from an image sidecar text file.
+
+        Returns:
+            Tuple of (removed_tags, remaining_tags), preserving sidecar order and spelling.
+        """
+        existing_tags = FileManager.read_tags_from_file(image_path)
+        if not existing_tags or not tags_to_delete:
+            return [], existing_tags
+
+        delete_lookup = {
+            tag.strip().casefold()
+            for tag in tags_to_delete
+            if isinstance(tag, str) and tag.strip()
+        }
+        if not delete_lookup:
+            return [], existing_tags
+
+        removed_tags = []
+        remaining_tags = []
+        for tag in existing_tags:
+            if tag.strip().casefold() in delete_lookup:
+                removed_tags.append(tag)
+            else:
+                remaining_tags.append(tag)
+
+        if removed_tags:
+            txt_path = FileManager.get_text_file_path(image_path)
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write(separator.join(remaining_tags))
+
+        return removed_tags, remaining_tags
     
     @staticmethod
     def read_tags_from_file(image_path: Path) -> List[str]:
