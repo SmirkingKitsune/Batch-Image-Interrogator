@@ -19,7 +19,7 @@ from core.hashing import hash_image_content
 from core.device_detector import get_device_detector
 from core.llama_cpp_runtime import LlamaCppRuntimeManager, is_llama_timeout_error
 from interrogators import LlamaCppInterrogator
-from ui.widgets import TagEditorWidget, ResultsTableWidget
+from ui.widgets import InquiryTranscriptWidget, TagEditorWidget, ResultsTableWidget
 
 logger = logging.getLogger(__name__)
 
@@ -677,12 +677,9 @@ class AdvancedImageInspectionDialog(QDialog):
 
         transcript_group = QGroupBox("Transcript")
         transcript_layout = QVBoxLayout()
-        self.mm_transcript = QTableWidget()
-        self.mm_transcript.setColumnCount(3)
-        self.mm_transcript.setHorizontalHeaderLabels(["Turn", "Prompt", "Response Summary"])
-        self.mm_transcript.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.mm_transcript.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.mm_transcript.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.mm_transcript = InquiryTranscriptWidget(
+            model_name_func=self._current_multimodal_model_name,
+        )
         transcript_layout.addWidget(self.mm_transcript)
         transcript_group.setLayout(transcript_layout)
         layout.addWidget(transcript_group, 1)
@@ -1138,7 +1135,7 @@ class AdvancedImageInspectionDialog(QDialog):
         if self.is_multi_mode or self.multimodal_tab is None:
             return
 
-        self.mm_transcript.setRowCount(0)
+        self.mm_transcript.clear()
         if not self.current_multimodal_session_key or not self.current_image_hash:
             return
 
@@ -1148,13 +1145,15 @@ class AdvancedImageInspectionDialog(QDialog):
             image_hash=self.current_image_hash,
         )
         for turn in history:
-            row = self.mm_transcript.rowCount()
-            self.mm_transcript.insertRow(row)
-            self.mm_transcript.setItem(row, 0, QTableWidgetItem(str(turn.get("turn_index", row))))
-            self.mm_transcript.setItem(row, 1, QTableWidgetItem(turn.get("prompt_text", "")))
-            response = turn.get("response_json", {}) or {}
-            summary = response.get("reasoning_summary", "") if isinstance(response, dict) else ""
-            self.mm_transcript.setItem(row, 2, QTableWidgetItem(summary))
+            self.mm_transcript.append_turn_card(turn, image_path=self.current_image)
+
+        if self.mm_transcript.count() > 0:
+            self.mm_transcript.scrollToBottom()
+
+    def _current_multimodal_model_name(self) -> Optional[str]:
+        if self.multimodal_interrogator:
+            return self.multimodal_interrogator.model_name
+        return None
 
     def _on_send_multimodal(self):
         """Run one multimodal inquiry turn and persist session history."""
@@ -1272,7 +1271,7 @@ class AdvancedImageInspectionDialog(QDialog):
                 mode="single",
                 image_hash=self.current_image_hash,
             )
-            self.mm_transcript.setRowCount(0)
+            self.mm_transcript.clear()
             QMessageBox.information(self, "Context Reset", "Multimodal context was reset for this image.")
         except Exception as e:
             QMessageBox.critical(self, "Reset Failed", f"Could not reset context:\n{str(e)}")
