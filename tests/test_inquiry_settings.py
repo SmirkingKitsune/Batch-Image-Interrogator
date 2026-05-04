@@ -17,12 +17,15 @@ class InquirySettingsTests(unittest.TestCase):
                     "llama_config": {
                         "llama_binary_path": "llama-server",
                         "ctx_size": 4096,
-                        "included_model_types": ["WD"],
                     },
                     "single_task": "vqa",
                     "single_prompt": "What is visible?",
                     "batch_task": "ocr",
                     "batch_prompt": "Read text.",
+                    "batch_include_prior_tables": True,
+                    "batch_included_model_types": ["WD"],
+                    "batch_context_source_keys": ["WD\u001fWD14"],
+                    "batch_carry_context": True,
                     "txt_output_mode": "overwrite",
                     "active_tab": 1,
                 }
@@ -31,9 +34,39 @@ class InquirySettingsTests(unittest.TestCase):
             reloaded = InquirySettings(str(settings_path))
 
             self.assertEqual(reloaded.get_llama_config()["ctx_size"], 4096)
+            self.assertNotIn("included_model_types", reloaded.get_llama_config())
             self.assertEqual(reloaded.get_options()["single_task"], "vqa")
+            self.assertTrue(reloaded.get_options()["batch_include_prior_tables"])
+            self.assertEqual(reloaded.get_options()["batch_included_model_types"], ["WD"])
+            self.assertEqual(reloaded.get_options()["batch_context_source_keys"], ["WD\u001fWD14"])
+            self.assertTrue(reloaded.get_options()["batch_carry_context"])
             self.assertEqual(reloaded.get_options()["txt_output_mode"], "overwrite")
             self.assertEqual(reloaded.get_options()["active_tab"], 1)
+
+    def test_migrates_legacy_batch_context_from_llama_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "inquiry_settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "llama_config": {
+                            "ctx_size": 4096,
+                            "include_prior_tables": True,
+                            "included_model_types": ["CLIP", "WD"],
+                            "carry_batch_context": True,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            settings = InquirySettings(str(settings_path))
+            options = settings.get_options()
+
+            self.assertEqual(settings.get_llama_config(), {"ctx_size": 4096})
+            self.assertTrue(options["batch_include_prior_tables"])
+            self.assertEqual(options["batch_included_model_types"], ["CLIP", "WD"])
+            self.assertTrue(options["batch_carry_context"])
 
     def test_ignores_invalid_option_values(self):
         with tempfile.TemporaryDirectory() as tmpdir:

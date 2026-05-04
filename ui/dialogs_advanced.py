@@ -7,7 +7,8 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QComboBox, QGroupBox, QSplitter,
                              QTabWidget, QWidget, QTableWidget, QTableWidgetItem,
                              QProgressBar, QMessageBox, QMenu, QScrollArea,
-                             QCheckBox, QLineEdit, QGridLayout, QFrame)
+                             QCheckBox, QLineEdit, QGridLayout, QFrame,
+                             QHeaderView)
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QSettings
 from PyQt6.QtGui import QKeySequence, QColor, QShortcut, QBrush, QPixmap
 from pathlib import Path

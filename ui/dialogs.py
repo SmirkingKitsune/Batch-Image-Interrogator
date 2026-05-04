@@ -634,12 +634,7 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
             'gpu_layers_spin': QSpinBox,
             'temperature_spin': QDoubleSpinBox,
             'max_tokens_spin': QSpinBox,
-            'server_port_spin': QSpinBox,
-            'include_prior_tables_check': QCheckBox,
-            'carry_batch_context_check': QCheckBox,
-            'include_clip_check': QCheckBox,
-            'include_wd_check': QCheckBox,
-            'include_camie_check': QCheckBox
+            'server_port_spin': QSpinBox
         }
     """
     widget = QWidget(parent)
@@ -718,38 +713,6 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
 
     layout.addLayout(form_layout)
 
-    options_group = QGroupBox("Batch Context Options")
-    options_layout = QVBoxLayout()
-
-    include_prior_tables_check = QCheckBox("Include prior interrogation tables in submissions")
-    include_prior_tables_check.setChecked(bool(llama_config.get("include_prior_tables", False)))
-    options_layout.addWidget(include_prior_tables_check)
-
-    carry_batch_context_check = QCheckBox("Carry context across batch images (off by default)")
-    carry_batch_context_check.setChecked(bool(llama_config.get("carry_batch_context", False)))
-    options_layout.addWidget(carry_batch_context_check)
-
-    include_types_label = QLabel("Manual inclusion by prior model type:")
-    options_layout.addWidget(include_types_label)
-
-    include_clip_check = QCheckBox("CLIP")
-    include_wd_check = QCheckBox("WD")
-    include_camie_check = QCheckBox("Camie")
-    included_types = set(llama_config.get("included_model_types", ["CLIP", "WD", "Camie"]))
-    include_clip_check.setChecked("CLIP" in included_types)
-    include_wd_check.setChecked("WD" in included_types)
-    include_camie_check.setChecked("Camie" in included_types)
-
-    type_row = QHBoxLayout()
-    type_row.addWidget(include_clip_check)
-    type_row.addWidget(include_wd_check)
-    type_row.addWidget(include_camie_check)
-    type_row.addStretch()
-    options_layout.addLayout(type_row)
-
-    options_group.setLayout(options_layout)
-    layout.addWidget(options_group)
-
     desc_group = QGroupBox("llama.cpp Notes")
     desc_layout = QVBoxLayout()
     desc_layout.addWidget(QLabel(
@@ -772,11 +735,6 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
         "temperature_spin": temperature_spin,
         "max_tokens_spin": max_tokens_spin,
         "server_port_spin": server_port_spin,
-        "include_prior_tables_check": include_prior_tables_check,
-        "carry_batch_context_check": carry_batch_context_check,
-        "include_clip_check": include_clip_check,
-        "include_wd_check": include_wd_check,
-        "include_camie_check": include_camie_check,
     }
     return widget, references
   

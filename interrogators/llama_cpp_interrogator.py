@@ -274,14 +274,13 @@ class LlamaCppInterrogator(BaseInterrogator):
         """Prime single-image session context from persisted turn history."""
         history: List[Dict[str, Any]] = [{"role": "system", "content": self._build_system_prompt()}]
         for turn in turns:
-            prompt_text = turn.get("prompt_text", "")
+            prompt_text = self.build_user_prompt_from_turn(turn)
             response_json = turn.get("response_json")
             if isinstance(response_json, str):
                 assistant_content = response_json
             else:
                 assistant_content = json.dumps(response_json or {}, ensure_ascii=False)
-            if prompt_text:
-                history.append({"role": "user", "content": prompt_text})
+            history.append({"role": "user", "content": prompt_text})
             history.append({"role": "assistant", "content": assistant_content})
         self._session_history[session_key] = history
 
@@ -412,6 +411,51 @@ class LlamaCppInterrogator(BaseInterrogator):
         )
         parts.append("Do not include markdown fences or prose outside the JSON/tool arguments.")
         return "\n\n".join(parts)
+
+    @classmethod
+    def build_user_prompt_from_turn(cls, turn: Dict[str, Any]) -> str:
+        """Reconstruct the effective user prompt from a persisted multimodal turn."""
+        return cls._build_user_prompt(
+            task=turn.get("prompt_type") or "describe",
+            prompt=turn.get("prompt_text") or "",
+            included_tables=turn.get("included_tables") or [],
+        )
+
+    @classmethod
+    def build_prompt_display_summary(
+        cls,
+        task: str,
+        prompt: str,
+        included_tables: List[Dict[str, Any]],
+    ) -> str:
+        """Build a readable transcript summary of the effective request."""
+        clean_task = (task or "describe").strip() or "describe"
+        clean_prompt = (prompt or "").strip()
+        parts = [f"Task: {clean_task}"]
+        if clean_prompt:
+            parts.append(f"User request: {clean_prompt}")
+
+        table_count = len(included_tables or [])
+        if table_count:
+            labels: List[str] = []
+            seen = set()
+            for table in included_tables:
+                if not isinstance(table, dict):
+                    continue
+                model_name = table.get("model_name") or "Unknown"
+                model_type = table.get("model_type")
+                label = f"{model_name} ({model_type})" if model_type else str(model_name)
+                if label not in seen:
+                    labels.append(label)
+                    seen.add(label)
+
+            source_text = ", ".join(labels[:4]) if labels else "selected prior results"
+            if len(labels) > 4:
+                source_text = f"{source_text}, +{len(labels) - 4} more"
+            plural = "result" if table_count == 1 else "results"
+            parts.append(f"Context sources: {table_count} prior {plural} from {source_text}")
+
+        return "\n".join(parts)
 
     @classmethod
     def _build_format_example_json(cls, task: str = "describe") -> str:

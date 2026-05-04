@@ -675,14 +675,14 @@ class InterrogationTab(QWidget):
                 'clip_model': clip_model,
                 'caption_model': None if caption_model == 'None' else caption_model,
                 'mode': self.clip_config_refs['mode_combo'].currentText(),
-                'device': self.clip_config_refs['device_combo'].currentText()
+                'device': self._combo_current_data_or_text(self.clip_config_refs['device_combo'])
             }
         elif current_tab_index == 1:  # WD tab
             return {
                 'type': 'WD',
                 'wd_model': self.wd_config_refs['wd_model_combo'].currentText(),
                 'threshold': self.wd_config_refs['threshold_spin'].value(),
-                'device': self.wd_config_refs['device_combo'].currentText()
+                'device': self._combo_current_data_or_text(self.wd_config_refs['device_combo'])
             }
         else:  # Camie tab (index 2)
             # Get enabled categories from checkboxes
@@ -705,10 +705,16 @@ class InterrogationTab(QWidget):
                 'camie_model': self.camie_config_refs['camie_model_combo'].currentText(),
                 'threshold': self.camie_config_refs['threshold_spin'].value(),
                 'threshold_profile': threshold_profile,
-                'device': self.camie_config_refs['device_combo'].currentText(),
+                'device': self._combo_current_data_or_text(self.camie_config_refs['device_combo']),
                 'category_thresholds': category_thresholds,
                 'enabled_categories': enabled_categories
             }
+
+    @staticmethod
+    def _combo_current_data_or_text(combo: QComboBox) -> str:
+        """Return canonical combo item data when available, otherwise visible text."""
+        data = combo.currentData()
+        return str(data) if data is not None else combo.currentText()
 
     def load_model(self):
         """Load the selected model."""
@@ -819,6 +825,7 @@ class InterrogationTab(QWidget):
         # Clear accumulated tags from previous batch
         self.all_discovered_tags.clear()
         self.discovered_tags_table.setRowCount(0)
+        self.batch_errors = []
 
         # Determine write_files and overwrite_files based on radio button selection
         if self.no_txt_radio.isChecked():
@@ -1014,12 +1021,19 @@ class InterrogationTab(QWidget):
 
     def on_interrogation_error(self, image_path: str, error: str):
         """Handle interrogation error."""
+        if not hasattr(self, 'batch_errors'):
+            self.batch_errors = []
+        self.batch_errors.append((image_path, error))
+
         # Update queue status via O(1) dict lookup
         idx = self._queue_path_to_index.get(image_path)
         if idx is not None:
             item = self.image_queue.item(idx)
             if item:
                 item.setText(f"✗ {Path(image_path).name}")
+
+        error_name = Path(image_path).name if image_path else "batch"
+        self.progress_label.setText(f"Error on {error_name}: {error}")
 
     def on_interrogation_finished(self):
         """Handle interrogation completion."""
@@ -1028,7 +1042,11 @@ class InterrogationTab(QWidget):
         self._tags_display_dirty = False
         self._update_discovered_tags_display()
 
-        self.progress_label.setText("Batch interrogation complete")
+        error_count = len(getattr(self, 'batch_errors', []))
+        if error_count:
+            self.progress_label.setText(f"Batch finished with {error_count} errors")
+        else:
+            self.progress_label.setText("Batch interrogation complete")
         self.batch_interrogate_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
 
@@ -1056,7 +1074,20 @@ class InterrogationTab(QWidget):
         # Emit signal
         self.interrogation_finished.emit()
 
-        QMessageBox.information(self, "Complete", "Batch interrogation finished")
+        if error_count:
+            details = "\n".join(
+                f"{Path(path).name if path else 'batch'}: {error}"
+                for path, error in self.batch_errors[:5]
+            )
+            if error_count > 5:
+                details += f"\n... and {error_count - 5} more"
+            QMessageBox.warning(
+                self,
+                "Batch Finished With Errors",
+                f"Batch interrogation finished with {error_count} errors:\n\n{details}"
+            )
+        else:
+            QMessageBox.information(self, "Complete", "Batch interrogation finished")
 
     def on_result(self, image_path: str, results: Dict):
         """Handle interrogation result from external source."""

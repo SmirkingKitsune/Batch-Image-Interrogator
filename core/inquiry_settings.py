@@ -8,12 +8,22 @@ from typing import Any, Dict, Optional
 class InquirySettings:
     """Manages persisted llama.cpp inquiry options."""
 
+    CONTEXT_CONFIG_KEYS = {
+        "include_prior_tables": "batch_include_prior_tables",
+        "included_model_types": "batch_included_model_types",
+        "carry_batch_context": "batch_carry_context",
+    }
+
     DEFAULT_OPTIONS: Dict[str, Any] = {
         "llama_config": {},
         "single_task": "describe",
         "single_prompt": "",
         "batch_task": "describe",
         "batch_prompt": "",
+        "batch_include_prior_tables": False,
+        "batch_included_model_types": ["CLIP", "WD", "Camie"],
+        "batch_context_source_keys": [],
+        "batch_carry_context": False,
         "txt_output_mode": "merge",
         "active_tab": 0,
     }
@@ -67,7 +77,13 @@ class InquirySettings:
     def update_llama_config(self, config: Dict[str, Any]):
         """Merge and persist llama.cpp config values."""
         saved_config = self.get_llama_config()
-        saved_config.update(dict(config or {}))
+        saved_config.update(
+            {
+                key: value
+                for key, value in dict(config or {}).items()
+                if key not in self.CONTEXT_CONFIG_KEYS
+            }
+        )
         self.options["llama_config"] = saved_config
         self.save_settings()
 
@@ -76,12 +92,36 @@ class InquirySettings:
 
         llama_config = data.get("llama_config")
         if isinstance(llama_config, dict):
-            normalized["llama_config"] = dict(llama_config)
+            normalized["llama_config"] = {
+                key: value
+                for key, value in llama_config.items()
+                if key not in self.CONTEXT_CONFIG_KEYS
+            }
+            for old_key, new_key in self.CONTEXT_CONFIG_KEYS.items():
+                if new_key not in data and old_key in llama_config:
+                    normalized[new_key] = llama_config[old_key]
 
         for key in ("single_task", "single_prompt", "batch_task", "batch_prompt"):
             value = data.get(key)
             if isinstance(value, str):
                 normalized[key] = value
+
+        for key in ("batch_include_prior_tables", "batch_carry_context"):
+            value = data.get(key)
+            if isinstance(value, bool):
+                normalized[key] = value
+
+        included_model_types = data.get("batch_included_model_types")
+        if isinstance(included_model_types, list):
+            normalized["batch_included_model_types"] = [
+                model_type for model_type in included_model_types if isinstance(model_type, str)
+            ]
+
+        context_source_keys = data.get("batch_context_source_keys")
+        if isinstance(context_source_keys, list):
+            normalized["batch_context_source_keys"] = [
+                source_key for source_key in context_source_keys if isinstance(source_key, str)
+            ]
 
         txt_output_mode = data.get("txt_output_mode")
         if txt_output_mode in self.VALID_TXT_OUTPUT_MODES:

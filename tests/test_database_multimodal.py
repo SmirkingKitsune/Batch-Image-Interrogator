@@ -2,9 +2,17 @@
 
 import tempfile
 import unittest
+import importlib.util
 from pathlib import Path
 
 from core.database import InterrogationDatabase
+
+MODULE_PATH = Path(__file__).resolve().parents[1] / "interrogators" / "llama_cpp_interrogator.py"
+SPEC = importlib.util.spec_from_file_location("llama_cpp_interrogator", MODULE_PATH)
+MODULE = importlib.util.module_from_spec(SPEC)
+assert SPEC and SPEC.loader
+SPEC.loader.exec_module(MODULE)
+LlamaCppInterrogator = MODULE.LlamaCppInterrogator
 
 
 class TestDatabaseMultimodal(unittest.TestCase):
@@ -67,6 +75,10 @@ class TestDatabaseMultimodal(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["prompt_type"], "describe")
         self.assertEqual(history[0]["tags"], ["portrait", "smile"])
+        effective_prompt = LlamaCppInterrogator.build_user_prompt_from_turn(history[0])
+        self.assertIn("Task: describe", effective_prompt)
+        self.assertIn("Prior interrogation tables", effective_prompt)
+        self.assertIn('"model_name": "WD"', effective_prompt)
 
         deleted = self.db.clear_multimodal_session(
             session_key="single:hash123",
@@ -87,4 +99,3 @@ class TestDatabaseMultimodal(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
