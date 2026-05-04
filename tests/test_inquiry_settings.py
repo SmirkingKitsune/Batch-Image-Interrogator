@@ -26,6 +26,7 @@ class InquirySettingsTests(unittest.TestCase):
                     "batch_included_model_types": ["WD"],
                     "batch_context_source_keys": ["WD\u001fWD14"],
                     "batch_carry_context": True,
+                    "batch_use_cache": True,
                     "txt_output_mode": "overwrite",
                     "active_tab": 1,
                 }
@@ -40,6 +41,8 @@ class InquirySettingsTests(unittest.TestCase):
             self.assertEqual(reloaded.get_options()["batch_included_model_types"], ["WD"])
             self.assertEqual(reloaded.get_options()["batch_context_source_keys"], ["WD\u001fWD14"])
             self.assertTrue(reloaded.get_options()["batch_carry_context"])
+            self.assertTrue(reloaded.get_options()["batch_use_cache"])
+            self.assertTrue(reloaded.has_saved_option("batch_use_cache"))
             self.assertEqual(reloaded.get_options()["txt_output_mode"], "overwrite")
             self.assertEqual(reloaded.get_options()["active_tab"], 1)
 
@@ -72,7 +75,13 @@ class InquirySettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             settings_path = Path(tmpdir) / "inquiry_settings.json"
             settings_path.write_text(
-                json.dumps({"txt_output_mode": "delete", "active_tab": "bad"}),
+                json.dumps(
+                    {
+                        "txt_output_mode": "delete",
+                        "active_tab": "bad",
+                        "batch_use_cache": "yes",
+                    }
+                ),
                 encoding="utf-8",
             )
 
@@ -81,6 +90,8 @@ class InquirySettingsTests(unittest.TestCase):
 
             self.assertEqual(options["txt_output_mode"], "merge")
             self.assertEqual(options["active_tab"], 0)
+            self.assertIsNone(options["batch_use_cache"])
+            self.assertFalse(settings.has_saved_option("batch_use_cache"))
 
 
 if __name__ == "__main__":

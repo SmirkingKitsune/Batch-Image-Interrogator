@@ -80,8 +80,8 @@ class MainWindow(QMainWindow):
             'llama_mmproj_path': '',
             'ctx_size': 8192,
             'gpu_layers': -1,
-            'temperature': 0.2,
-            'max_tokens': 512,
+            'temperature': 0.0,
+            'max_tokens': 8192,
             'server_port': 8080,
         }
 

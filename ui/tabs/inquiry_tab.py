@@ -295,6 +295,8 @@ class InquiryTab(QWidget):
 
         self.batch_carry_context_check = QCheckBox("Carry context across batch images")
         context_layout.addWidget(self.batch_carry_context_check)
+        self.batch_use_cache_check = QCheckBox("Use exact-match cache")
+        context_layout.addWidget(self.batch_use_cache_check)
         context_group.setLayout(context_layout)
         batch_layout.addWidget(context_group)
 
@@ -402,6 +404,7 @@ class InquiryTab(QWidget):
         self.batch_prompt_input.textChanged.connect(self._save_inquiry_options)
         self.batch_include_prior_tables_check.toggled.connect(lambda *_: self._save_inquiry_options())
         self.batch_carry_context_check.toggled.connect(lambda *_: self._save_inquiry_options())
+        self.batch_use_cache_check.toggled.connect(lambda *_: self._save_inquiry_options())
         self.batch_context_sources_table.itemChanged.connect(lambda *_: self._save_inquiry_options())
         self.txt_output_group.idClicked.connect(lambda _: self._save_inquiry_options())
 
@@ -430,6 +433,10 @@ class InquiryTab(QWidget):
             options.get("batch_included_model_types", ["CLIP", "WD", "Camie"])
         )
         self.batch_carry_context_check.setChecked(bool(options.get("batch_carry_context", False)))
+        if self.inquiry_settings.has_saved_option("batch_use_cache"):
+            self.batch_use_cache_check.setChecked(bool(options.get("batch_use_cache", False)))
+        else:
+            self.batch_use_cache_check.setChecked(self._default_batch_use_cache_enabled())
         self._set_txt_output_mode(options.get("txt_output_mode", "merge"))
 
         active_tab = int(options.get("active_tab", 0))
@@ -476,6 +483,7 @@ class InquiryTab(QWidget):
             "batch_prompt": self.batch_prompt_input.toPlainText(),
             "batch_include_prior_tables": self.batch_include_prior_tables_check.isChecked(),
             "batch_carry_context": self.batch_carry_context_check.isChecked(),
+            "batch_use_cache": self.batch_use_cache_check.isChecked(),
             "txt_output_mode": self._get_txt_output_mode(),
             "active_tab": self.mode_tabs.currentIndex(),
         }
@@ -519,7 +527,15 @@ class InquiryTab(QWidget):
             "include_prior_tables": self.batch_include_prior_tables_check.isChecked(),
             "included_sources": self._get_selected_batch_context_sources(),
             "carry_batch_context": self.batch_carry_context_check.isChecked(),
+            "use_cache": self.batch_use_cache_check.isChecked(),
         }
+
+    def _default_batch_use_cache_enabled(self) -> bool:
+        """Default exact cache use to deterministic llama settings only."""
+        try:
+            return float(self.get_llama_config().get("temperature", 0.0)) == 0.0
+        except (TypeError, ValueError):
+            return False
 
     def get_llama_config(self) -> Dict[str, Any]:
         """Return latest llama.cpp configuration from UI controls."""
@@ -1297,6 +1313,7 @@ class InquiryTab(QWidget):
             include_prior_tables=context_options["include_prior_tables"],
             included_sources=context_options["included_sources"],
             carry_context_across_batch=context_options["carry_batch_context"],
+            use_cache=context_options["use_cache"],
         )
         self.interrogation_worker.progress.connect(self.on_batch_progress)
         self.interrogation_worker.result.connect(self.on_batch_result)

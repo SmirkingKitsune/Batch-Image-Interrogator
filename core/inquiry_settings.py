@@ -24,6 +24,7 @@ class InquirySettings:
         "batch_included_model_types": ["CLIP", "WD", "Camie"],
         "batch_context_source_keys": [],
         "batch_carry_context": False,
+        "batch_use_cache": None,
         "txt_output_mode": "merge",
         "active_tab": 0,
     }
@@ -33,6 +34,7 @@ class InquirySettings:
     def __init__(self, settings_file: str = "inquiry_settings.json"):
         self.settings_file = Path(settings_file)
         self.options: Dict[str, Any] = dict(self.DEFAULT_OPTIONS)
+        self._saved_keys = set()
         self.load_settings()
 
     def load_settings(self):
@@ -50,7 +52,9 @@ class InquirySettings:
         if not isinstance(data, dict):
             return
 
-        self.options.update(self._normalize_options(data))
+        normalized = self._normalize_options(data)
+        self.options.update(normalized)
+        self._saved_keys.update(normalized.keys())
 
     def save_settings(self):
         """Save inquiry options to disk."""
@@ -69,9 +73,15 @@ class InquirySettings:
         config = self.options.get("llama_config", {})
         return dict(config) if isinstance(config, dict) else {}
 
+    def has_saved_option(self, key: str) -> bool:
+        """Return True when an option was explicitly loaded or saved."""
+        return key in self._saved_keys
+
     def update_options(self, options: Dict[str, Any]):
         """Merge and persist inquiry options."""
-        self.options.update(self._normalize_options(options))
+        normalized = self._normalize_options(options)
+        self.options.update(normalized)
+        self._saved_keys.update(normalized.keys())
         self.save_settings()
 
     def update_llama_config(self, config: Dict[str, Any]):
@@ -106,7 +116,7 @@ class InquirySettings:
             if isinstance(value, str):
                 normalized[key] = value
 
-        for key in ("batch_include_prior_tables", "batch_carry_context"):
+        for key in ("batch_include_prior_tables", "batch_carry_context", "batch_use_cache"):
             value = data.get(key)
             if isinstance(value, bool):
                 normalized[key] = value

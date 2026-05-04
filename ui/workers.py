@@ -1,5 +1,7 @@
 """Worker threads for background processing in PyQt6."""
 
+import hashlib
+import json
 import os
 import uuid
 from contextlib import nullcontext
@@ -178,6 +180,9 @@ class InterrogationWorker(QThread):
 class MultimodalInterrogationWorker(QThread):
     """Worker thread for llama.cpp multimodal batch interrogation."""
 
+    CACHE_VERSION = 1
+    PROMPT_BUILDER_VERSION = "llama_cpp_interrogator_prompt_v1"
+
     # Signals
     progress = pyqtSignal(int, int, str)  # current, total, message
     result = pyqtSignal(str, dict)  # image_path, results
@@ -198,6 +203,7 @@ class MultimodalInterrogationWorker(QThread):
         included_model_types: Optional[List[str]] = None,
         included_sources: Optional[List[Dict[str, Any]]] = None,
         carry_context_across_batch: bool = False,
+        use_cache: bool = False,
     ):
         super().__init__()
         self.image_paths = image_paths
@@ -217,6 +223,7 @@ class MultimodalInterrogationWorker(QThread):
             if isinstance(source, dict)
         }
         self.carry_context_across_batch = carry_context_across_batch
+        self.use_cache = bool(use_cache)
         self.is_cancelled = False
 
     def cancel(self):
@@ -273,20 +280,44 @@ class MultimodalInterrogationWorker(QThread):
                     )
 
                     included_tables = self._build_included_tables(file_hash)
+                    cache_key = None
+                    cache_metadata: Dict[str, Any] = {}
+                    can_use_cache = self.use_cache and not self.carry_context_across_batch
+                    if can_use_cache:
+                        cache_key, cache_metadata = self._build_cache_identity(included_tables)
+                        cached = self.database.get_interrogation_cache_entry(
+                            file_hash,
+                            self.interrogator.model_name,
+                            cache_key,
+                        )
+                    else:
+                        cached = None
 
                     if shared_session_key:
                         session_key = shared_session_key
                     else:
                         session_key = f"batch:{batch_run_id}:{file_hash}"
 
-                    results = self.interrogator.interrogate(
-                        image_path_str,
-                        task=self.task,
-                        prompt=self.prompt,
-                        session_key=session_key,
-                        keep_context=bool(self.carry_context_across_batch),
-                        included_tables=included_tables,
-                    )
+                    if cached:
+                        results = cached
+                        self.progress.emit(idx + 1, total, f"Using exact cache: {image_path.name}")
+                    else:
+                        results = self.interrogator.interrogate(
+                            image_path_str,
+                            task=self.task,
+                            prompt=self.prompt,
+                            session_key=session_key,
+                            keep_context=bool(self.carry_context_across_batch),
+                            included_tables=included_tables,
+                        )
+                        if cache_key:
+                            self.database.save_interrogation_cache_entry(
+                                image_id=image_id,
+                                model_id=model_id,
+                                cache_key=cache_key,
+                                cache_metadata=cache_metadata,
+                                results=results,
+                            )
                     results["included_tables"] = included_tables
 
                     # Keep latest multimodal result in main interrogations table.
@@ -385,6 +416,59 @@ class MultimodalInterrogationWorker(QThread):
     def _source_key(model_name: Optional[str], model_type: Optional[str]) -> str:
         """Stable key for matching selected batch context sources."""
         return f"{model_type or ''}\u001f{model_name or ''}"
+
+    def _build_cache_identity(self, included_tables: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
+        """Build a deterministic exact-match cache key and its metadata."""
+        normalized_config = self._normalize_cache_config(self.interrogator.get_config())
+        context_digest = self._stable_digest(included_tables)
+        metadata: Dict[str, Any] = {
+            "cache_version": self.CACHE_VERSION,
+            "prompt_builder_version": self.PROMPT_BUILDER_VERSION,
+            "model_name": self.interrogator.model_name,
+            "model_type": self.interrogator.get_model_type(),
+            "llama_config": normalized_config,
+            "temperature": normalized_config.get("temperature"),
+            "task": self.task,
+            "prompt": self.prompt,
+            "include_prior_tables": self.include_prior_tables,
+            "included_source_keys": sorted(self.included_source_keys),
+            "included_model_types": sorted(self.included_model_types),
+            "context_tables": included_tables,
+            "context_digest": context_digest,
+        }
+        return self._stable_digest(metadata), metadata
+
+    @classmethod
+    def _stable_digest(cls, payload: Any) -> str:
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _normalize_cache_config(config: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep only llama settings that can affect model output."""
+        if not isinstance(config, dict):
+            return {}
+
+        relevant_keys = (
+            "llama_binary_path",
+            "llama_model_path",
+            "llama_mmproj_path",
+            "ctx_size",
+            "gpu_layers",
+            "temperature",
+            "max_tokens",
+            "server_host",
+            "server_port",
+        )
+        normalized: Dict[str, Any] = {}
+        for key in relevant_keys:
+            if key not in config:
+                continue
+            value = config.get(key)
+            if isinstance(value, Path):
+                value = str(value)
+            normalized[key] = value
+        return normalized
 
 
 class OrganizationWorker(QThread):

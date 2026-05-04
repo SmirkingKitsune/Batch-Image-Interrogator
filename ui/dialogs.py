@@ -12,6 +12,7 @@ from typing import Dict
 from pathlib import Path
 from core.clip_model_loader import get_categorized_models
 from core import FileManager
+from core.gguf_metadata import get_gguf_context_length
 from ui.workers import OrganizationWorker
 
 logger = logging.getLogger(__name__)
@@ -662,10 +663,9 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     model_layout = QHBoxLayout()
     model_layout.addWidget(model_path_edit)
     model_btn = QPushButton("Browse...")
-    model_btn.clicked.connect(
-        lambda: _browse_path(model_path_edit, "Select multimodal GGUF model")
-    )
     model_layout.addWidget(model_btn)
+    model_metadata_btn = QPushButton("Read Metadata")
+    model_layout.addWidget(model_metadata_btn)
     model_widget = QWidget()
     model_widget.setLayout(model_layout)
     form_layout.addRow("Model Path (required):", model_widget)
@@ -685,7 +685,8 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     ctx_size_spin = QSpinBox()
     ctx_size_spin.setRange(256, 131072)
     ctx_size_spin.setSingleStep(512)
-    ctx_size_spin.setValue(int(llama_config.get("ctx_size", 8192)))
+    default_ctx_size = int(llama_config.get("ctx_size", 8192))
+    ctx_size_spin.setValue(default_ctx_size)
     form_layout.addRow("Context Size:", ctx_size_spin)
 
     gpu_layers_spin = QSpinBox()
@@ -697,14 +698,53 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     temperature_spin.setRange(0.0, 2.0)
     temperature_spin.setSingleStep(0.05)
     temperature_spin.setDecimals(2)
-    temperature_spin.setValue(float(llama_config.get("temperature", 0.2)))
+    temperature_spin.setValue(float(llama_config.get("temperature", 0.0)))
     form_layout.addRow("Temperature:", temperature_spin)
 
     max_tokens_spin = QSpinBox()
-    max_tokens_spin.setRange(16, 8192)
+    max_tokens_spin.setRange(16, 131072)
     max_tokens_spin.setSingleStep(32)
-    max_tokens_spin.setValue(int(llama_config.get("max_tokens", 512)))
+    max_tokens_spin.setValue(int(llama_config.get("max_tokens", default_ctx_size)))
     form_layout.addRow("Max Tokens:", max_tokens_spin)
+
+    metadata_status_label = QLabel("")
+    metadata_status_label.setWordWrap(True)
+    form_layout.addRow("Model Metadata:", metadata_status_label)
+
+    def _apply_model_metadata():
+        model_path = model_path_edit.text().strip()
+        if not model_path:
+            metadata_status_label.setText("No model path selected.")
+            metadata_status_label.setStyleSheet("color: orange;")
+            return
+
+        try:
+            context_length = get_gguf_context_length(model_path)
+        except Exception as exc:
+            metadata_status_label.setText(f"Could not read GGUF metadata: {exc}")
+            metadata_status_label.setStyleSheet("color: orange;")
+            return
+
+        if not context_length:
+            metadata_status_label.setText("No context length found in GGUF metadata.")
+            metadata_status_label.setStyleSheet("color: orange;")
+            return
+
+        bounded_context = max(ctx_size_spin.minimum(), min(ctx_size_spin.maximum(), int(context_length)))
+        ctx_size_spin.setValue(bounded_context)
+        max_tokens_spin.setValue(bounded_context)
+        metadata_status_label.setText(
+            f"Detected context length: {context_length}. Context Size and Max Tokens updated."
+        )
+        metadata_status_label.setStyleSheet("color: green;")
+
+    def _browse_model_path():
+        _browse_path(model_path_edit, "Select multimodal GGUF model")
+        _apply_model_metadata()
+
+    model_btn.clicked.connect(_browse_model_path)
+    model_metadata_btn.clicked.connect(_apply_model_metadata)
+    model_path_edit.editingFinished.connect(_apply_model_metadata)
 
     server_port_spin = QSpinBox()
     server_port_spin.setRange(1024, 65535)

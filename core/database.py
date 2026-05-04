@@ -165,6 +165,26 @@ class InterrogationDatabase:
                 )
             """)
 
+            # Exact-match cache entries for multimodal batch inquiry variants.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS interrogation_cache_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    image_id INTEGER NOT NULL,
+                    model_id INTEGER NOT NULL,
+                    cache_key TEXT NOT NULL,
+                    cache_metadata TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    tags TEXT NOT NULL,
+                    confidence_scores TEXT,
+                    raw_output TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (image_id) REFERENCES images(id),
+                    FOREIGN KEY (model_id) REFERENCES models(id),
+                    UNIQUE(image_id, model_id, cache_key)
+                )
+            """)
+
             # Multimodal sessions table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS multimodal_sessions (
@@ -203,6 +223,9 @@ class InterrogationDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_hash ON images(file_hash)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_image_interrogations ON interrogations(image_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_model_interrogations ON interrogations(model_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_cache_entries_image ON interrogation_cache_entries(image_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_cache_entries_model ON interrogation_cache_entries(model_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_cache_entries_key ON interrogation_cache_entries(cache_key)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_sessions_image ON multimodal_sessions(image_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_sessions_model ON multimodal_sessions(model_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_turns_session ON multimodal_turns(session_id)")
@@ -302,6 +325,109 @@ class InterrogationDatabase:
                     'interrogated_at': result['interrogated_at']
                 }
             return None
+
+    @_retry_on_busy()
+    def save_interrogation_cache_entry(
+        self,
+        image_id: int,
+        model_id: int,
+        cache_key: str,
+        cache_metadata: Dict[str, Any],
+        results: Dict[str, Any],
+    ) -> None:
+        """Save or update an exact-match interrogation cache entry."""
+        if not cache_key:
+            raise ValueError("cache_key is required")
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            tags = list(results.get("tags") or [])
+            confidence_scores = results.get("confidence_scores")
+            raw_output = results.get("raw_output")
+
+            cursor.execute(
+                """
+                INSERT INTO interrogation_cache_entries (
+                    image_id, model_id, cache_key, cache_metadata,
+                    result_json, tags, confidence_scores, raw_output
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(image_id, model_id, cache_key)
+                DO UPDATE SET
+                    cache_metadata = excluded.cache_metadata,
+                    result_json = excluded.result_json,
+                    tags = excluded.tags,
+                    confidence_scores = excluded.confidence_scores,
+                    raw_output = excluded.raw_output,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    image_id,
+                    model_id,
+                    cache_key,
+                    json.dumps(cache_metadata or {}, ensure_ascii=False, sort_keys=True),
+                    json.dumps(results or {}, ensure_ascii=False, sort_keys=True),
+                    json.dumps(tags, ensure_ascii=False),
+                    json.dumps(confidence_scores, ensure_ascii=False) if confidence_scores else None,
+                    raw_output,
+                ),
+            )
+
+    @_retry_on_busy()
+    def get_interrogation_cache_entry(
+        self,
+        image_hash: str,
+        model_name: str,
+        cache_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve an exact-match interrogation cache entry if it exists."""
+        if not cache_key:
+            return None
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT
+                    c.cache_metadata,
+                    c.result_json,
+                    c.tags,
+                    c.confidence_scores,
+                    c.raw_output,
+                    c.updated_at
+                FROM interrogation_cache_entries c
+                JOIN images img ON c.image_id = img.id
+                JOIN models m ON c.model_id = m.id
+                WHERE img.file_hash = ? AND m.model_name = ? AND c.cache_key = ?
+                """,
+                (image_hash, model_name, cache_key),
+            )
+
+            result = cursor.fetchone()
+            if not result:
+                return None
+
+            try:
+                payload = json.loads(result["result_json"]) if result["result_json"] else {}
+            except json.JSONDecodeError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+
+            payload.setdefault("tags", json.loads(result["tags"]) if result["tags"] else [])
+            payload.setdefault(
+                "confidence_scores",
+                json.loads(result["confidence_scores"]) if result["confidence_scores"] else None,
+            )
+            payload.setdefault("raw_output", result["raw_output"])
+            payload["cache_key"] = cache_key
+            payload["cache_metadata"] = (
+                json.loads(result["cache_metadata"]) if result["cache_metadata"] else {}
+            )
+            payload["cached_at"] = result["updated_at"]
+            return payload
     
     @_retry_on_busy()
     def get_all_interrogations_for_image(self, file_hash: str) -> List[Dict]:
