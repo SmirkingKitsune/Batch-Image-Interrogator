@@ -210,6 +210,8 @@ class InterrogationDatabase:
                     prompt_type TEXT NOT NULL,
                     prompt_text TEXT,
                     included_tables_json TEXT,
+                    included_transcripts_json TEXT,
+                    sidecar_tags_json TEXT,
                     response_json TEXT NOT NULL,
                     tags_json TEXT NOT NULL,
                     reasoning_summary TEXT NOT NULL,
@@ -218,6 +220,12 @@ class InterrogationDatabase:
                     UNIQUE(session_id, turn_index)
                 )
             """)
+            cursor.execute("PRAGMA table_info(multimodal_turns)")
+            existing_turn_columns = {row["name"] for row in cursor.fetchall()}
+            if "included_transcripts_json" not in existing_turn_columns:
+                cursor.execute("ALTER TABLE multimodal_turns ADD COLUMN included_transcripts_json TEXT")
+            if "sidecar_tags_json" not in existing_turn_columns:
+                cursor.execute("ALTER TABLE multimodal_turns ADD COLUMN sidecar_tags_json TEXT")
 
             # Create indices
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_hash ON images(file_hash)")
@@ -511,6 +519,8 @@ class InterrogationDatabase:
         response_json: Dict[str, Any],
         tags: List[str],
         reasoning_summary: str,
+        included_transcripts: Optional[List[Dict[str, Any]]] = None,
+        sidecar_tags: Optional[List[str]] = None,
     ) -> int:
         """Append a turn to multimodal conversation history."""
         with self._get_connection() as conn:
@@ -526,9 +536,10 @@ class InterrogationDatabase:
                 """
                 INSERT INTO multimodal_turns (
                     session_id, turn_index, prompt_type, prompt_text,
-                    included_tables_json, response_json, tags_json, reasoning_summary
+                    included_tables_json, included_transcripts_json, sidecar_tags_json,
+                    response_json, tags_json, reasoning_summary
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -536,6 +547,8 @@ class InterrogationDatabase:
                     prompt_type,
                     prompt_text,
                     json.dumps(included_tables or [], ensure_ascii=False),
+                    json.dumps(included_transcripts or [], ensure_ascii=False),
+                    json.dumps(sidecar_tags or [], ensure_ascii=False),
                     json.dumps(response_json, ensure_ascii=False),
                     json.dumps(tags, ensure_ascii=False),
                     reasoning_summary,
@@ -578,6 +591,8 @@ class InterrogationDatabase:
                     t.prompt_type,
                     t.prompt_text,
                     t.included_tables_json,
+                    t.included_transcripts_json,
+                    t.sidecar_tags_json,
                     t.response_json,
                     t.tags_json,
                     t.reasoning_summary,
@@ -627,6 +642,16 @@ class InterrogationDatabase:
                         "included_tables": (
                             json.loads(row["included_tables_json"])
                             if row["included_tables_json"]
+                            else []
+                        ),
+                        "included_transcripts": (
+                            json.loads(row["included_transcripts_json"])
+                            if row["included_transcripts_json"]
+                            else []
+                        ),
+                        "sidecar_tags": (
+                            json.loads(row["sidecar_tags_json"])
+                            if row["sidecar_tags_json"]
                             else []
                         ),
                         "response_json": json.loads(row["response_json"]),

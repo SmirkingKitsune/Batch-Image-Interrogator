@@ -72,6 +72,16 @@ class TestLlamaCppInterrogator(unittest.TestCase):
         self.assertEqual(parsed["tags"], ["person", "outdoor"])
         self.assertEqual(parsed["ocr_text"], "")
 
+    def test_parse_audit_schema(self):
+        raw = (
+            '{"tags":["cat","indoor"],"delete_tags":["dog"],'
+            '"comment":"Dog is not visible.","reasoning_summary":"Only a cat is visible.",'
+            '"warnings":[]}'
+        )
+        parsed = LlamaCppInterrogator._parse_and_validate_json_response(raw, task="audit")
+        self.assertEqual(parsed["tags"], ["cat", "indoor"])
+        self.assertEqual(parsed["delete_tags"], ["dog"])
+
     def test_parse_legacy_answer_schema_is_still_accepted(self):
         raw = '{"tags":["portrait"],"answer":"Legacy shape.","warnings":[]}'
         parsed = LlamaCppInterrogator._parse_and_validate_json_response(raw, task="describe")
@@ -183,6 +193,20 @@ class TestLlamaCppInterrogator(unittest.TestCase):
         self.assertIn('"OCR": [', prompt)
         self.assertIn('"comment":', prompt)
         self.assertIn("Do not include markdown fences", prompt)
+
+    def test_build_audit_prompt_includes_sidecar_and_transcript_context(self):
+        prompt = LlamaCppInterrogator._build_user_prompt(
+            task="audit",
+            prompt="Be conservative.",
+            included_tables=[{"model_name": "WD14", "tags": ["cat"]}],
+            included_transcripts=[{"task": "describe", "response_summary": "A cat indoors."}],
+            sidecar_tags=["cat", "dog"],
+        )
+
+        self.assertIn("Goal: audit the sidecar text-file tags", prompt)
+        self.assertIn("Current sidecar text-file tags", prompt)
+        self.assertIn("Prior inquiry transcripts", prompt)
+        self.assertIn('"delete_tags": [', prompt)
 
     def test_prompt_display_summary_uses_task_when_user_prompt_empty(self):
         summary = LlamaCppInterrogator.build_prompt_display_summary(

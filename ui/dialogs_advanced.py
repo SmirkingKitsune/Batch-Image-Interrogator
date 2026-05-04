@@ -638,7 +638,7 @@ class AdvancedImageInspectionDialog(QDialog):
         task_row = QHBoxLayout()
         task_row.addWidget(QLabel("Task:"))
         self.mm_task_combo = QComboBox()
-        self.mm_task_combo.addItems(["describe", "ocr", "vqa", "custom"])
+        self.mm_task_combo.addItems(["describe", "ocr", "vqa", "custom", "audit"])
         task_row.addWidget(self.mm_task_combo)
         task_row.addStretch()
         layout.addLayout(task_row)
@@ -657,6 +657,10 @@ class AdvancedImageInspectionDialog(QDialog):
         self.mm_prior_tables.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.mm_prior_tables.setMinimumHeight(120)
         prior_layout.addWidget(self.mm_prior_tables)
+        self.mm_include_transcripts_check = QCheckBox(
+            "Include prior inquiry transcripts for this image"
+        )
+        prior_layout.addWidget(self.mm_include_transcripts_check)
         prior_group.setLayout(prior_layout)
         layout.addWidget(prior_group)
 
@@ -1122,6 +1126,13 @@ class AdvancedImageInspectionDialog(QDialog):
             )
         return selected
 
+    def _build_selected_prior_transcripts(self) -> List[Dict[str, Any]]:
+        """Build optional prior inquiry transcript context for the current image."""
+        if not self.mm_include_transcripts_check.isChecked() or not self.current_image_hash:
+            return []
+        history = self.database.get_multimodal_history(image_hash=self.current_image_hash)
+        return LlamaCppInterrogator.build_transcript_context(history)
+
     def _load_multimodal_history(self):
         """Load persisted multimodal transcript for the current single-image session."""
         if self.is_multi_mode or self.multimodal_tab is None:
@@ -1160,6 +1171,12 @@ class AdvancedImageInspectionDialog(QDialog):
             task = self.mm_task_combo.currentText()
             prompt_text = self.mm_prompt_input.text().strip()
             included_tables = self._build_selected_prior_tables()
+            included_transcripts = self._build_selected_prior_transcripts()
+            sidecar_tags = (
+                FileManager.read_tags_from_file(Path(self.current_image))
+                if task == "audit"
+                else []
+            )
 
             self.mm_send_button.setEnabled(False)
             results = self.multimodal_interrogator.interrogate(
@@ -1169,7 +1186,20 @@ class AdvancedImageInspectionDialog(QDialog):
                 session_key=self.current_multimodal_session_key,
                 keep_context=True,
                 included_tables=included_tables,
+                included_transcripts=included_transcripts,
+                sidecar_tags=sidecar_tags,
             )
+
+            if task == "audit":
+                removed_tags, remaining_tags = FileManager.delete_tags_from_file(
+                    Path(self.current_image),
+                    (results.get("multimodal_response") or {}).get("delete_tags", []),
+                )
+                response_json = results.get("multimodal_response", {}) or {}
+                response_json["removed_tags"] = removed_tags
+                response_json["remaining_tags"] = remaining_tags
+                results["multimodal_response"] = response_json
+                results["tags"] = remaining_tags
 
             file_hash = self.current_image_hash or hash_image_content(self.current_image)
             metadata = get_image_metadata(self.current_image)
@@ -1205,6 +1235,8 @@ class AdvancedImageInspectionDialog(QDialog):
                 prompt_type=task,
                 prompt_text=prompt_text,
                 included_tables=included_tables,
+                included_transcripts=included_transcripts,
+                sidecar_tags=sidecar_tags,
                 response_json=response_json,
                 tags=results["tags"],
                 reasoning_summary=response_json.get("reasoning_summary", ""),
