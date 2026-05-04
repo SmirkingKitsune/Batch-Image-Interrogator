@@ -32,7 +32,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core import InterrogationDatabase, TagFilterSettings, get_image_metadata, hash_image_content
+from core import (
+    InquirySettings,
+    InterrogationDatabase,
+    TagFilterSettings,
+    get_image_metadata,
+    hash_image_content,
+)
 from core.device_detector import get_device_detector
 from core.llama_cpp_runtime import is_llama_timeout_error
 from interrogators import LlamaCppInterrogator
@@ -66,6 +72,8 @@ class InquiryTab(QWidget):
         self.database = database
         self.llama_config = llama_config
         self.tag_filters = tag_filters
+        self.inquiry_settings = InquirySettings()
+        self.llama_config.update(self.inquiry_settings.get_llama_config())
 
         self.current_interrogator: Optional[LlamaCppInterrogator] = None
         self.interrogation_worker: Optional[MultimodalInterrogationWorker] = None
@@ -86,6 +94,7 @@ class InquiryTab(QWidget):
         self.llama_config_refs: Optional[Dict[str, Any]] = None
 
         self.setup_ui()
+        self._apply_saved_inquiry_options()
         self.setup_connections()
 
     def setup_ui(self):
@@ -347,6 +356,26 @@ class InquiryTab(QWidget):
         self.image_queue.itemDoubleClicked.connect(self._on_queue_item_double_click)
         self.open_advanced_button.clicked.connect(self._open_selected_in_advanced)
         self.mode_tabs.currentChanged.connect(self._on_mode_tab_changed)
+        self.mode_tabs.currentChanged.connect(lambda _: self._save_inquiry_options())
+
+        for key in ("binary_path_edit", "model_path_edit", "mmproj_path_edit"):
+            self.llama_config_refs[key].textChanged.connect(lambda *_: self._save_inquiry_options())
+        for key in ("ctx_size_spin", "gpu_layers_spin", "temperature_spin", "max_tokens_spin", "server_port_spin"):
+            self.llama_config_refs[key].valueChanged.connect(lambda _: self._save_inquiry_options())
+        for key in (
+            "include_prior_tables_check",
+            "carry_batch_context_check",
+            "include_clip_check",
+            "include_wd_check",
+            "include_camie_check",
+        ):
+            self.llama_config_refs[key].toggled.connect(lambda *_: self._save_inquiry_options())
+
+        self.single_task_combo.currentTextChanged.connect(lambda *_: self._save_inquiry_options())
+        self.single_prompt_input.textChanged.connect(lambda *_: self._save_inquiry_options())
+        self.batch_task_combo.currentTextChanged.connect(lambda *_: self._save_inquiry_options())
+        self.batch_prompt_input.textChanged.connect(self._save_inquiry_options)
+        self.txt_output_group.idClicked.connect(lambda _: self._save_inquiry_options())
 
     def _on_mode_tab_changed(self, index: int):
         """Switch transcript source based on active mode tab."""
@@ -356,6 +385,57 @@ class InquiryTab(QWidget):
         """Show/hide raw response panel content."""
         self.raw_response_view.setVisible(visible)
         self.raw_toggle_button.setText("Hide Raw Response" if visible else "Show Raw Response")
+
+    def _apply_saved_inquiry_options(self):
+        """Restore persisted Inquiry controls that are not part of llama config."""
+        options = self.inquiry_settings.get_options()
+        self._set_combo_text(self.single_task_combo, options.get("single_task", "describe"))
+        self.single_prompt_input.setText(options.get("single_prompt", ""))
+        self._set_combo_text(self.batch_task_combo, options.get("batch_task", "describe"))
+        self.batch_prompt_input.setPlainText(options.get("batch_prompt", ""))
+        self._set_txt_output_mode(options.get("txt_output_mode", "merge"))
+
+        active_tab = int(options.get("active_tab", 0))
+        if 0 <= active_tab < self.mode_tabs.count():
+            self.mode_tabs.setCurrentIndex(active_tab)
+
+    @staticmethod
+    def _set_combo_text(combo: QComboBox, value: str):
+        index = combo.findText(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _set_txt_output_mode(self, mode: str):
+        if mode == "none":
+            self.no_txt_radio.setChecked(True)
+        elif mode == "overwrite":
+            self.overwrite_txt_radio.setChecked(True)
+        else:
+            self.merge_txt_radio.setChecked(True)
+
+    def _get_txt_output_mode(self) -> str:
+        if self.no_txt_radio.isChecked():
+            return "none"
+        if self.overwrite_txt_radio.isChecked():
+            return "overwrite"
+        return "merge"
+
+    def _save_inquiry_options(self):
+        """Persist current Inquiry options."""
+        if not self.llama_config_refs:
+            return
+
+        self.inquiry_settings.update_options(
+            {
+                "llama_config": self.get_llama_config(),
+                "single_task": self.single_task_combo.currentText(),
+                "single_prompt": self.single_prompt_input.text(),
+                "batch_task": self.batch_task_combo.currentText(),
+                "batch_prompt": self.batch_prompt_input.toPlainText(),
+                "txt_output_mode": self._get_txt_output_mode(),
+                "active_tab": self.mode_tabs.currentIndex(),
+            }
+        )
 
     def get_llama_config(self) -> Dict[str, Any]:
         """Return latest llama.cpp configuration from UI controls."""
@@ -464,6 +544,7 @@ class InquiryTab(QWidget):
                 raise ValueError("llama-server path is required")
             if not config.get("llama_model_path"):
                 raise ValueError("Multimodal model path is required")
+            self._save_inquiry_options()
 
             self.load_model_button.setEnabled(False)
             self.progress_label.setText("Loading model...")
@@ -491,6 +572,7 @@ class InquiryTab(QWidget):
                 self.llama_config["server_port"] = resolved_port
                 if self.llama_config_refs:
                     self.llama_config_refs["server_port_spin"].setValue(resolved_port)
+                self.inquiry_settings.update_llama_config(self.llama_config)
 
             model_info = f"LlamaCpp - {Path(config['llama_model_path']).name}"
             runtime_meta = self.current_interrogator.runtime.get_runtime_metadata()
@@ -871,6 +953,7 @@ class InquiryTab(QWidget):
             task = self.single_task_combo.currentText()
             prompt_text = self.single_prompt_input.text().strip()
             included_tables = self._build_selected_prior_tables()
+            self._save_inquiry_options()
             self.send_single_button.setEnabled(False)
 
             results = self.current_interrogator.interrogate(
@@ -987,6 +1070,7 @@ class InquiryTab(QWidget):
         config = self.get_llama_config()
         task = self.batch_task_combo.currentText()
         prompt_text = self.batch_prompt_input.toPlainText().strip()
+        self._save_inquiry_options()
         self.active_batch_task = task
         self.active_batch_prompt = prompt_text
 
