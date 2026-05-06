@@ -138,6 +138,8 @@ class MultimodalWorkerContextTests(unittest.TestCase):
         carry_context_across_batch=False,
         use_cache=True,
         write_files=False,
+        overwrite_files=False,
+        txt_output_mode=None,
     ):
         worker = MultimodalInterrogationWorker(
             image_paths=[image_path],
@@ -146,6 +148,8 @@ class MultimodalWorkerContextTests(unittest.TestCase):
             task=task,
             prompt=prompt,
             write_files=write_files,
+            overwrite_files=overwrite_files,
+            txt_output_mode=txt_output_mode,
             include_prior_tables=include_prior_tables,
             included_sources=included_sources,
             carry_context_across_batch=carry_context_across_batch,
@@ -285,6 +289,69 @@ class MultimodalWorkerContextTests(unittest.TestCase):
             )
 
             self.assertEqual(second.calls, 1)
+
+    def test_default_txt_output_mode_merges_existing_sidecar_tags(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            image_path = self._make_image(tmp)
+            image_path.with_suffix(".txt").write_text("existing_tag", encoding="utf-8")
+            db = InterrogationDatabase(str(tmp / "interrogations.db"))
+
+            self._run_worker(
+                db,
+                image_path,
+                FakeLlamaInterrogator("new"),
+                use_cache=False,
+                write_files=True,
+                overwrite_files=False,
+            )
+
+            self.assertEqual(
+                image_path.with_suffix(".txt").read_text(encoding="utf-8"),
+                "existing_tag, new_1",
+            )
+
+    def test_none_txt_output_mode_leaves_sidecar_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            image_path = self._make_image(tmp)
+            image_path.with_suffix(".txt").write_text("existing_tag", encoding="utf-8")
+            db = InterrogationDatabase(str(tmp / "interrogations.db"))
+
+            self._run_worker(
+                db,
+                image_path,
+                FakeLlamaInterrogator("new"),
+                use_cache=False,
+                write_files=True,
+                overwrite_files=True,
+                txt_output_mode="none",
+            )
+
+            self.assertEqual(
+                image_path.with_suffix(".txt").read_text(encoding="utf-8"),
+                "existing_tag",
+            )
+
+    def test_overwrite_txt_output_mode_replaces_sidecar_tags(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            image_path = self._make_image(tmp)
+            image_path.with_suffix(".txt").write_text("existing_tag", encoding="utf-8")
+            db = InterrogationDatabase(str(tmp / "interrogations.db"))
+
+            self._run_worker(
+                db,
+                image_path,
+                FakeLlamaInterrogator("new"),
+                use_cache=False,
+                txt_output_mode="overwrite",
+            )
+
+            self.assertEqual(
+                image_path.with_suffix(".txt").read_text(encoding="utf-8"),
+                "new_1",
+            )
 
     def test_prior_tables_filter_by_selected_model_types(self):
         worker = MultimodalInterrogationWorker(
