@@ -1127,7 +1127,13 @@ class AdvancedImageInspectionDialog(QDialog):
         """Build optional prior inquiry transcript context for the current image."""
         if not self.mm_include_transcripts_check.isChecked() or not self.current_image_hash:
             return []
-        history = self.database.get_multimodal_history(image_hash=self.current_image_hash)
+        model_name = self._active_multimodal_model_name()
+        if not model_name:
+            return []
+        history = self.database.get_multimodal_history(
+            image_hash=self.current_image_hash,
+            model_name=model_name,
+        )
         return LlamaCppInterrogator.build_transcript_context(history)
 
     def _load_multimodal_history(self):
@@ -1139,10 +1145,15 @@ class AdvancedImageInspectionDialog(QDialog):
         if not self.current_multimodal_session_key or not self.current_image_hash:
             return
 
+        model_name = self._active_multimodal_model_name()
+        if not model_name:
+            return
+
         history = self.database.get_multimodal_history(
             session_key=self.current_multimodal_session_key,
             mode="single",
             image_hash=self.current_image_hash,
+            model_name=model_name,
         )
         for turn in history:
             self.mm_transcript.append_turn_card(turn, image_path=self.current_image)
@@ -1151,9 +1162,17 @@ class AdvancedImageInspectionDialog(QDialog):
             self.mm_transcript.scrollToBottom()
 
     def _current_multimodal_model_name(self) -> Optional[str]:
-        if self.multimodal_interrogator:
+        return self._active_multimodal_model_name()
+
+    def _active_multimodal_model_name(self) -> Optional[str]:
+        """Return the model name used to scope persisted multimodal turns."""
+        if self.multimodal_interrogator and self.multimodal_interrogator.is_loaded:
             return self.multimodal_interrogator.model_name
-        return None
+
+        model_path = (self._resolve_llama_config().get("llama_model_path") or "").strip()
+        if not model_path:
+            return None
+        return f"LlamaCpp/{Path(model_path).name}"
 
     def _on_send_multimodal(self):
         """Run one multimodal inquiry turn and persist session history."""

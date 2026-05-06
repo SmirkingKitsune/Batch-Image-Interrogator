@@ -953,6 +953,8 @@ class InquiryTab(QWidget):
             return
 
         model_name = self.current_interrogator.model_name if self.current_interrogator else None
+        if not model_name:
+            return
         history = self.database.get_multimodal_history(
             image_hash=self.current_image_hash,
             model_name=model_name,
@@ -1013,7 +1015,12 @@ class InquiryTab(QWidget):
         """Build optional prior inquiry transcript context for the selected image."""
         if not self.single_include_transcripts_check.isChecked() or not self.current_image_hash:
             return []
-        history = self.database.get_multimodal_history(image_hash=self.current_image_hash)
+        if not self.current_interrogator:
+            return []
+        history = self.database.get_multimodal_history(
+            image_hash=self.current_image_hash,
+            model_name=self.current_interrogator.model_name,
+        )
         return LlamaCppInterrogator.build_transcript_context(history)
 
     def send_single_inquiry(self):
