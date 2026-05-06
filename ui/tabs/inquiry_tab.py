@@ -89,6 +89,10 @@ class InquiryTab(QWidget):
         self.batch_error_count = 0
         self.last_batch_error = ""
         self.batch_transcript_entries: List[Dict[str, Any]] = []
+        self.batch_cancel_requested = False
+        self.active_batch_total = 0
+        self.batch_completed_paths = set()
+        self.batch_failed_paths = set()
         self.active_batch_task = "describe"
         self.active_batch_prompt = ""
         self.last_non_audit_txt_output_mode = "merge"
@@ -1197,6 +1201,10 @@ class InquiryTab(QWidget):
         self.batch_error_count = 0
         self.last_batch_error = ""
         self.batch_transcript_entries.clear()
+        self.batch_cancel_requested = False
+        self.active_batch_total = len(images)
+        self.batch_completed_paths.clear()
+        self.batch_failed_paths.clear()
         if self.mode_tabs.currentIndex() == 1:
             self.single_transcript.clear()
 
@@ -1224,14 +1232,18 @@ class InquiryTab(QWidget):
         self.batch_inquiry_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress_bar.setMaximum(len(images))
+        self.progress_bar.setValue(0)
+        self.progress_label.setText(f"Starting batch inquiry on {len(images)} image(s)...")
         self.inquiry_started.emit()
         self.interrogation_worker.start()
 
     def cancel_operation(self):
         """Cancel active batch inquiry."""
         if self.interrogation_worker:
+            self.batch_cancel_requested = True
             self.interrogation_worker.cancel()
-            self.progress_label.setText("Cancelling...")
+            self.cancel_button.setEnabled(False)
+            self.progress_label.setText("Cancelling after the current image finishes...")
 
     def on_batch_progress(self, current: int, total: int, message: str):
         """Update progress UI for batch inquiry."""
@@ -1246,6 +1258,7 @@ class InquiryTab(QWidget):
 
     def on_batch_result(self, image_path: str, results: Dict[str, Any]):
         """Track batch result and refresh rolling tag frequency table."""
+        self.batch_completed_paths.add(image_path)
         for i in range(self.image_queue.count()):
             item = self.image_queue.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == image_path:
@@ -1289,6 +1302,8 @@ class InquiryTab(QWidget):
 
     def on_batch_error(self, image_path: str, error: str):
         """Mark failed batch image rows."""
+        if image_path:
+            self.batch_failed_paths.add(image_path)
         for i in range(self.image_queue.count()):
             item = self.image_queue.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == image_path:
@@ -1298,10 +1313,34 @@ class InquiryTab(QWidget):
         self.last_batch_error = self._append_timeout_hint_if_needed(error)
         self.progress_label.setText(error or "Batch inquiry error")
 
-    def on_batch_finished(self):
+    def on_batch_finished(self, was_cancelled: bool = False):
         """Reset controls when batch processing completes."""
         self.batch_inquiry_button.setEnabled(bool(self.current_interrogator and self.loaded_image_paths))
         self.cancel_button.setEnabled(False)
+        worker_cancelled = bool(was_cancelled)
+        if self.interrogation_worker is not None:
+            worker_cancelled = worker_cancelled or bool(
+                getattr(self.interrogation_worker, "was_cancelled", False)
+            )
+        was_cancelled = worker_cancelled or self.batch_cancel_requested
+
+        if was_cancelled:
+            processed_count = self._batch_finished_count()
+            total = self.active_batch_total or len(self.loaded_image_paths)
+            self._reset_incomplete_batch_queue_items()
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(processed_count)
+            self.progress_label.setText(
+                f"Batch inquiry canceled after {processed_count} of {total} image(s). "
+                "Partial results were kept."
+            )
+            self._refresh_batch_context_sources()
+            self.inquiry_finished.emit()
+            return
+
+        total = self.active_batch_total or len(self.loaded_image_paths)
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(total)
         self.progress_label.setText("Batch inquiry complete")
         self._refresh_batch_context_sources()
         self.inquiry_finished.emit()
@@ -1318,6 +1357,17 @@ class InquiryTab(QWidget):
             )
         else:
             QMessageBox.information(self, "Complete", "Batch inquiry finished")
+
+    def _batch_finished_count(self) -> int:
+        return len(self.batch_completed_paths | self.batch_failed_paths)
+
+    def _reset_incomplete_batch_queue_items(self):
+        for i in range(self.image_queue.count()):
+            item = self.image_queue.item(i)
+            image_path = item.data(Qt.ItemDataRole.UserRole)
+            if image_path in self.batch_completed_paths or image_path in self.batch_failed_paths:
+                continue
+            item.setText(self._to_display_name(image_path))
 
     def _refresh_batch_tags_table(self):
         self.discovered_tags_table.setRowCount(0)
