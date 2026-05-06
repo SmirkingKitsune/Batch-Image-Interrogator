@@ -188,7 +188,7 @@ class MultimodalInterrogationWorker(QThread):
     progress = pyqtSignal(int, int, str)  # current, total, message
     result = pyqtSignal(str, dict)  # image_path, results
     error = pyqtSignal(str, str)  # image_path, error_message
-    finished = pyqtSignal()
+    finished = pyqtSignal(bool)  # was_cancelled
 
     def __init__(
         self,
@@ -234,15 +234,22 @@ class MultimodalInterrogationWorker(QThread):
         self.carry_context_across_batch = carry_context_across_batch
         self.use_cache = bool(use_cache)
         self.is_cancelled = False
+        self.was_cancelled = False
 
     def cancel(self):
         """Cancel the operation."""
         self.is_cancelled = True
+        self.was_cancelled = True
 
     def run(self):
         """Execute multimodal batch interrogation."""
         total = len(self.image_paths)
         model_id = None
+
+        if self.is_cancelled:
+            self.was_cancelled = True
+            self.finished.emit(True)
+            return
 
         try:
             model_id = self.database.register_model(
@@ -252,7 +259,7 @@ class MultimodalInterrogationWorker(QThread):
             )
         except Exception as e:
             self.error.emit("", f"Failed to register model: {e}")
-            self.finished.emit()
+            self.finished.emit(self.was_cancelled)
             return
 
         batch_run_id = str(uuid.uuid4())
@@ -272,6 +279,7 @@ class MultimodalInterrogationWorker(QThread):
         with progress_ctx as tqdm_bar:
             for idx, image_path in enumerate(self.image_paths):
                 if self.is_cancelled:
+                    self.was_cancelled = True
                     break
 
                 image_path_str = str(image_path)
@@ -419,7 +427,7 @@ class MultimodalInterrogationWorker(QThread):
                         tqdm_bar.set_postfix_str(image_path.name, refresh=False)
                         tqdm_bar.update(1)
 
-        self.finished.emit()
+        self.finished.emit(self.was_cancelled)
 
     @classmethod
     def _resolve_txt_output_mode(

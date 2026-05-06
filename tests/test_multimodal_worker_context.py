@@ -126,6 +126,11 @@ class MultimodalWorkerContextTests(unittest.TestCase):
         Image.new("RGB", (8, 8), (20, 40, 60)).save(image_path)
         return image_path
 
+    def _make_named_image(self, directory: Path, name: str) -> Path:
+        image_path = directory / name
+        Image.new("RGB", (8, 8), (20, 40, 60)).save(image_path)
+        return image_path
+
     def _run_worker(
         self,
         db,
@@ -175,6 +180,49 @@ class MultimodalWorkerContextTests(unittest.TestCase):
         )
 
         self.assertEqual(worker._build_included_tables("hash123"), [])
+
+    def test_cancel_before_run_reports_cancelled(self):
+        worker = MultimodalInterrogationWorker(
+            image_paths=[],
+            interrogator=FakeInterrogator(),
+            database=FakeDatabase(),
+            task="describe",
+            prompt="",
+        )
+        finished_states = []
+        worker.finished.connect(finished_states.append)
+
+        worker.cancel()
+        worker.run()
+
+        self.assertTrue(worker.was_cancelled)
+        self.assertEqual(finished_states, [True])
+
+    def test_cancel_after_result_reports_cancelled_and_stops_remaining_images(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            first_image = self._make_named_image(tmp, "first.png")
+            second_image = self._make_named_image(tmp, "second.png")
+            db = InterrogationDatabase(str(tmp / "interrogations.db"))
+            interrogator = FakeLlamaInterrogator("cancel")
+            worker = MultimodalInterrogationWorker(
+                image_paths=[first_image, second_image],
+                interrogator=interrogator,
+                database=db,
+                task="describe",
+                prompt="",
+                write_files=False,
+                use_cache=False,
+            )
+            finished_states = []
+            worker.result.connect(lambda _path, _results: worker.cancel())
+            worker.finished.connect(finished_states.append)
+
+            worker.run()
+
+            self.assertEqual(interrogator.calls, 1)
+            self.assertEqual(finished_states, [True])
+            self.assertTrue(worker.was_cancelled)
 
     def test_exact_cache_hit_skips_interrogator(self):
         with tempfile.TemporaryDirectory() as tmpdir:
