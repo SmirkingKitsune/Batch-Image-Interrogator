@@ -19,6 +19,9 @@ MultimodalInterrogationWorker = MODULE.MultimodalInterrogationWorker
 
 
 class FakeDatabase:
+    def __init__(self):
+        self.history_calls = []
+
     def get_all_interrogations_for_image(self, file_hash):
         return [
             {
@@ -54,6 +57,10 @@ class FakeDatabase:
                 "interrogated_at": "2026-01-04",
             },
         ]
+
+    def get_multimodal_history(self, **kwargs):
+        self.history_calls.append(kwargs)
+        return [{"prompt_type": "describe", "model_name": kwargs.get("model_name")}]
 
 
 class FakeInterrogator:
@@ -180,6 +187,25 @@ class MultimodalWorkerContextTests(unittest.TestCase):
         )
 
         self.assertEqual(worker._build_included_tables("hash123"), [])
+
+    def test_prior_transcripts_are_scoped_to_worker_model(self):
+        db = FakeDatabase()
+        worker = MultimodalInterrogationWorker(
+            image_paths=[],
+            interrogator=FakeInterrogator(),
+            database=db,
+            task="describe",
+            prompt="",
+            include_prior_transcripts=True,
+        )
+
+        history = worker._build_included_transcripts("hash123")
+
+        self.assertEqual(
+            db.history_calls,
+            [{"image_hash": "hash123", "model_name": "LlamaCpp"}],
+        )
+        self.assertEqual(history[0]["model_name"], "LlamaCpp")
 
     def test_cancel_before_run_reports_cancelled(self):
         worker = MultimodalInterrogationWorker(

@@ -481,7 +481,10 @@ class MultimodalInterrogationWorker(QThread):
         """Build prior inquiry transcript context for a single image."""
         if not self.include_prior_transcripts:
             return []
-        history = self.database.get_multimodal_history(image_hash=file_hash)
+        history = self.database.get_multimodal_history(
+            image_hash=file_hash,
+            model_name=self.interrogator.model_name,
+        )
         builder = getattr(self.interrogator, "build_transcript_context", None)
         if callable(builder):
             return builder(history)
