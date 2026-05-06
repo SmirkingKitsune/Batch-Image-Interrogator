@@ -182,6 +182,7 @@ class MultimodalInterrogationWorker(QThread):
 
     CACHE_VERSION = 1
     PROMPT_BUILDER_VERSION = "llama_cpp_interrogator_prompt_v1"
+    VALID_TXT_OUTPUT_MODES = {"none", "merge", "overwrite"}
 
     # Signals
     progress = pyqtSignal(int, int, str)  # current, total, message
@@ -205,6 +206,7 @@ class MultimodalInterrogationWorker(QThread):
         included_sources: Optional[List[Dict[str, Any]]] = None,
         carry_context_across_batch: bool = False,
         use_cache: bool = False,
+        txt_output_mode: Optional[str] = None,
     ):
         super().__init__()
         self.image_paths = image_paths
@@ -212,8 +214,13 @@ class MultimodalInterrogationWorker(QThread):
         self.database = database
         self.task = task
         self.prompt = prompt
-        self.write_files = write_files
-        self.overwrite_files = overwrite_files
+        self.txt_output_mode = self._resolve_txt_output_mode(
+            write_files=write_files,
+            overwrite_files=overwrite_files,
+            txt_output_mode=txt_output_mode,
+        )
+        self.write_files = self.txt_output_mode != "none"
+        self.overwrite_files = self.txt_output_mode == "overwrite"
         self.tag_filters = tag_filters
         self.include_prior_tables = include_prior_tables
         self.include_prior_transcripts = include_prior_transcripts
@@ -394,7 +401,7 @@ class MultimodalInterrogationWorker(QThread):
                         FileManager.write_tags_to_file(
                             image_path,
                             tags_to_write,
-                            overwrite=self.overwrite_files,
+                            overwrite=self.txt_output_mode == "overwrite",
                         )
 
                     self.result.emit(image_path_str, results)
@@ -413,6 +420,25 @@ class MultimodalInterrogationWorker(QThread):
                         tqdm_bar.update(1)
 
         self.finished.emit()
+
+    @classmethod
+    def _resolve_txt_output_mode(
+        cls,
+        write_files: bool,
+        overwrite_files: bool,
+        txt_output_mode: Optional[str],
+    ) -> str:
+        """Normalize text-output settings to the three UI modes."""
+        if txt_output_mode is not None:
+            if txt_output_mode not in cls.VALID_TXT_OUTPUT_MODES:
+                raise ValueError(f"Invalid txt_output_mode: {txt_output_mode}")
+            return txt_output_mode
+
+        if not write_files:
+            return "none"
+        if overwrite_files:
+            return "overwrite"
+        return "merge"
 
     def _build_included_tables(self, file_hash: str) -> List[Dict[str, Any]]:
         """Build prior interrogation context tables for a single image."""

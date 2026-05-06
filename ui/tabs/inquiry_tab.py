@@ -1176,15 +1176,19 @@ class InquiryTab(QWidget):
         self.active_batch_prompt = prompt_text
 
         if task == "audit":
+            txt_output_mode = "merge"
             write_files = True
             overwrite_files = False
         elif self.no_txt_radio.isChecked():
+            txt_output_mode = "none"
             write_files = False
             overwrite_files = False
         elif self.merge_txt_radio.isChecked():
+            txt_output_mode = "merge"
             write_files = True
             overwrite_files = False
         else:
+            txt_output_mode = "overwrite"
             write_files = True
             overwrite_files = True
 
@@ -1204,6 +1208,7 @@ class InquiryTab(QWidget):
             prompt=prompt_text,
             write_files=write_files,
             overwrite_files=overwrite_files,
+            txt_output_mode=txt_output_mode,
             tag_filters=self.tag_filters,
             include_prior_tables=context_options["include_prior_tables"],
             include_prior_transcripts=context_options["include_prior_transcripts"],
