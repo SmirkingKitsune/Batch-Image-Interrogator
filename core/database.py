@@ -235,9 +235,36 @@ class InterrogationDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_cache_entries_model ON interrogation_cache_entries(model_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_cache_entries_key ON interrogation_cache_entries(cache_key)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_sessions_image ON multimodal_sessions(image_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_sessions_model ON multimodal_sessions(model_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_turns_session ON multimodal_turns(session_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_turns_created_at ON multimodal_turns(created_at)")
+
+            # No query filters sessions by model alone, and model_id is very
+            # low-cardinality, so this index could only ever lure the planner
+            # into scanning every session for a single-model database.
+            cursor.execute("DROP INDEX IF EXISTS idx_mm_sessions_model")
+
+            self._ensure_planner_statistics(cursor)
+
+    @staticmethod
+    def _ensure_planner_statistics(cursor) -> None:
+        """Populate query planner statistics when they are missing.
+
+        Without sqlite_stat1 the planner has no cardinality information and
+        picks indexes by declaration order, which makes multimodal history
+        lookups scan every session instead of seeking by image. ANALYZE skips
+        empty tables, so key off a table that matters rather than the mere
+        existence of sqlite_stat1 -- otherwise a database analyzed while empty
+        would never pick up statistics as it grows.
+        """
+        cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'"
+        )
+        if cursor.fetchone() is not None:
+            cursor.execute("SELECT 1 FROM sqlite_stat1 WHERE tbl = 'multimodal_sessions'")
+            if cursor.fetchone() is not None:
+                return
+
+        cursor.execute("ANALYZE")
     
     @_retry_on_busy()
     def register_image(self, file_path: str, file_hash: str,

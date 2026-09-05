@@ -1,7 +1,7 @@
 """Waifu Diffusion Tagger interrogator implementation."""
 
 from core.base_interrogator import BaseInterrogator
-from typing import Dict, Any
+from typing import Dict, Any, List
 from PIL import Image
 import numpy as np
 
@@ -15,6 +15,10 @@ class WDInterrogator(BaseInterrogator):
         self.model = None
         self.tags = None
         self.target_size = 448
+        self.input_name = None
+        # Tag-name column cached from self.tags (see _get_tag_names).
+        self._tag_names_source = None
+        self._tag_names = []
     
     def load_model(self, threshold: float = 0.35, device: str = 'cuda',
                    provider_settings=None, **kwargs):
@@ -66,6 +70,8 @@ class WDInterrogator(BaseInterrogator):
                 providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
                 self.model = ort.InferenceSession(model_path, providers=providers)
 
+            # Drop the cached input name so it is re-read from the new session.
+            self.input_name = None
             self.is_loaded = True
 
             import logging
@@ -79,6 +85,19 @@ class WDInterrogator(BaseInterrogator):
         except Exception as e:
             raise RuntimeError(f"Failed to load WD model: {e}")
     
+    def _get_tag_names(self) -> List[str]:
+        """
+        Resolve the tag-name column for the loaded tag table.
+
+        WD models carry ~10k tags and a DataFrame lookup per tag dominates
+        interrogate(), so the column is materialized once and cached until
+        self.tags is replaced.
+        """
+        if self._tag_names_source is not self.tags:
+            self._tag_names = self.tags['name'].tolist()
+            self._tag_names_source = self.tags
+        return self._tag_names
+
     def preprocess_image(self, image_path: str) -> np.ndarray:
         """
         Preprocess image for WD tagger.
@@ -135,19 +154,22 @@ class WDInterrogator(BaseInterrogator):
         
         # Run inference
         try:
-            input_name = self.model.get_inputs()[0].name
-            probs = self.model.run(None, {input_name: image_array})[0][0]
+            if self.input_name is None:
+                self.input_name = self.model.get_inputs()[0].name
+            probs = self.model.run(None, {self.input_name: image_array})[0][0]
         except Exception as e:
             raise RuntimeError(f"Model inference failed: {e}")
-        
-        # Filter by threshold and create results
-        tags_with_scores = {}
-        
-        for i, prob in enumerate(probs):
-            if prob >= threshold:
-                tag_name = self.tags.iloc[i]['name']
-                tags_with_scores[tag_name] = float(prob)
-        
+
+        # Filter by threshold and create results. The threshold test is
+        # vectorized so only tags that actually pass cost Python time.
+        tag_names = self._get_tag_names()
+        limit = min(len(probs), len(tag_names))
+
+        tags_with_scores = {
+            tag_names[i]: float(probs[i])
+            for i in np.flatnonzero(probs[:limit] >= threshold)
+        }
+
         # Sort by confidence (descending)
         sorted_items = sorted(tags_with_scores.items(), key=lambda x: x[1], reverse=True)
         tags = [tag for tag, _ in sorted_items]
@@ -166,4 +188,7 @@ class WDInterrogator(BaseInterrogator):
         """Unload model from memory."""
         self.model = None
         self.tags = None
+        self.input_name = None
+        self._tag_names_source = None
+        self._tag_names = []
         self.is_loaded = False
