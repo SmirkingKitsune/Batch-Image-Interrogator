@@ -2,7 +2,7 @@
 
 import json
 from core.base_interrogator import BaseInterrogator
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from PIL import Image
 import numpy as np
 
@@ -76,9 +76,13 @@ class CamieInterrogator(BaseInterrogator):
         self.target_size = 512
         # Camie uses specific padding color (124, 116, 104) - grey-brown
         self.pad_color = (124, 116, 104)
-        # ImageNet normalization values
-        self.mean = np.array([0.485, 0.456, 0.406])
-        self.std = np.array([0.229, 0.224, 0.225])
+        # ImageNet normalization values. float32 keeps preprocessing from
+        # promoting the whole image array to float64 and back.
+        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        # Per-index tag lookup derived from tags_data (see _get_tag_lookup).
+        self._tag_lookup_source = None
+        self._tag_lookup = ([], [], [], np.empty(0, dtype=np.intp))
 
     def load_model(self, threshold: float = 0.5, device: str = 'cuda',
                    threshold_profile: str = 'overall',
@@ -272,6 +276,47 @@ class CamieInterrogator(BaseInterrogator):
 
         return self._convert_tag_index_format(metadata)
 
+    def _get_tag_lookup(self) -> Tuple[List[str], List[str], List[str], np.ndarray]:
+        """
+        Resolve per-index tag names and categories for the loaded metadata.
+
+        Camie models carry ~70k tags, so walking tags_data on every image costs
+        more than inference itself. The result is cached until tags_data is
+        replaced.
+
+        Returns:
+            Tuple of (tag_names, tag_categories, category_order, category_ids),
+            where category_ids indexes into category_order.
+        """
+        if self._tag_lookup_source is not self.tags_data:
+            tags_data = self.tags_data or {}
+            tags_list = tags_data.get('tags', [])
+            tag_to_category = tags_data.get('tag_to_category', {})
+
+            names: List[str] = []
+            categories: List[str] = []
+            for i, tag_info in enumerate(tags_list):
+                if isinstance(tag_info, dict):
+                    names.append(tag_info.get('name', f'tag_{i}'))
+                    categories.append(tag_info.get('category', 'general'))
+                else:
+                    tag_name = str(tag_info)
+                    names.append(tag_name)
+                    categories.append(tag_to_category.get(tag_name, 'general'))
+
+            category_order = list(dict.fromkeys(categories))
+            category_index = {cat: idx for idx, cat in enumerate(category_order)}
+            category_ids = np.fromiter(
+                (category_index[cat] for cat in categories),
+                dtype=np.intp,
+                count=len(categories),
+            )
+
+            self._tag_lookup = (names, categories, category_order, category_ids)
+            self._tag_lookup_source = self.tags_data
+
+        return self._tag_lookup
+
     def preprocess_image(self, image_path: str) -> np.ndarray:
         """
         Preprocess image for Camie Tagger.
@@ -363,31 +408,33 @@ class CamieInterrogator(BaseInterrogator):
         category_breakdown = {cat: [] for cat in self.CATEGORIES}
 
         # Get tags based on metadata format
-        tags_list = self.tags_data.get('tags', [])
-        tag_to_category = self.tags_data.get('tag_to_category', {})
+        tag_names, tag_categories, category_order, category_ids = self._get_tag_lookup()
+        limit = min(len(probs), len(tag_names))
 
-        for i, prob in enumerate(probs):
-            if i >= len(tags_list):
-                break
+        # Build one threshold per category, then fan it out across tags so the
+        # threshold test runs in numpy. Disabled categories get an unreachable
+        # threshold rather than a per-tag membership check.
+        enabled = set(self.enabled_categories)
+        category_cutoffs = np.array(
+            [
+                self.category_thresholds.get(category, self.threshold)
+                if category in enabled
+                else np.inf
+                for category in category_order
+            ],
+            dtype=np.float32,
+        )
+        cutoffs = category_cutoffs[category_ids[:limit]]
 
-            tag_info = tags_list[i]
-            if isinstance(tag_info, dict):
-                tag_name = tag_info.get('name', f'tag_{i}')
-                category = tag_info.get('category', 'general')
-            else:
-                tag_name = str(tag_info)
-                category = tag_to_category.get(tag_name, 'general')
-
-            # Get threshold for this category
-            cat_threshold = self.category_thresholds.get(category, self.threshold)
-
-            # Check if category is enabled and tag passes threshold
-            if category in self.enabled_categories and prob >= cat_threshold:
-                tags_with_scores[tag_name] = float(prob)
-                category_breakdown[category].append({
-                    'tag': tag_name,
-                    'confidence': float(prob)
-                })
+        # Only tags that pass need per-tag Python work.
+        for i in np.flatnonzero(probs[:limit] >= cutoffs):
+            tag_name = tag_names[i]
+            confidence = float(probs[i])
+            tags_with_scores[tag_name] = confidence
+            category_breakdown[tag_categories[i]].append({
+                'tag': tag_name,
+                'confidence': confidence
+            })
 
         # Sort by confidence (descending)
         sorted_items = sorted(tags_with_scores.items(), key=lambda x: x[1], reverse=True)
@@ -420,6 +467,8 @@ class CamieInterrogator(BaseInterrogator):
         """Unload model from memory."""
         self.model = None
         self.tags_data = None
+        self._tag_lookup_source = None
+        self._tag_lookup = ([], [], [], np.empty(0, dtype=np.intp))
         self.is_loaded = False
 
     @classmethod

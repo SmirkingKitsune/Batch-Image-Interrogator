@@ -256,8 +256,12 @@ class LlamaCppInterrogator(BaseInterrogator):
                     f"First response keys: {first_keys}"
                 ) from fallback_error or primary_error
 
+        # Only keep the raw text when the parse needed repair, retry, or a
+        # fallback. A clean primary parse is already faithfully represented by
+        # `parsed`, and the transcript view only surfaces raw text for unusual
+        # parses -- persisting it for every turn dominated the database size.
         debug_raw = (fallback_content or retry_content or primary_content or "").strip()
-        if debug_raw:
+        if debug_raw and parse_mode != "primary_json":
             parsed["_debug_raw_response"] = debug_raw[:20000]
         parsed["_parse_mode"] = parse_mode
         if task == "audit":
