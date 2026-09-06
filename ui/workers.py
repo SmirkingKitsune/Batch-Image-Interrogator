@@ -5,7 +5,8 @@ import json
 import os
 import uuid
 from contextlib import nullcontext
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, Qt, QSize, pyqtSignal
+from PyQt6.QtGui import QImage, QImageReader
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from core import (
@@ -18,6 +19,81 @@ try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
+
+
+def decode_thumbnail(image_path: str, target_size: QSize) -> Optional[QImage]:
+    """Decode an image straight to thumbnail size.
+
+    Returns None when the file cannot be read. QImage is used rather than
+    QPixmap so this is safe to call from a worker thread; only the GUI thread
+    may build the QPixmap.
+    """
+    reader = QImageReader(image_path)
+    scaled_size = reader.size()
+    decoded_scaled = scaled_size.isValid()
+    if decoded_scaled:
+        scaled_size.scale(target_size, Qt.AspectRatioMode.KeepAspectRatio)
+        reader.setScaledSize(scaled_size)
+
+    image = reader.read()
+    if image.isNull():
+        return None
+
+    if not decoded_scaled:
+        # Formats that cannot report their size up front still need scaling.
+        image = image.scaled(
+            target_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation
+        )
+    return image
+
+
+class ThumbnailLoadWorker(QThread):
+    """Worker thread for decoding gallery thumbnails without blocking the UI."""
+
+    # Signals
+    thumbnails_ready = pyqtSignal(list)  # [(image_path, QImage or None), ...]
+    progress = pyqtSignal(int, int)      # decoded, total
+
+    # Emitting one signal per image floods the event loop on large galleries.
+    BATCH_SIZE = 24
+
+    def __init__(self, image_paths: List[str], target_size: QSize):
+        super().__init__()
+        self.image_paths = list(image_paths)
+        self.target_size = QSize(target_size)
+        self.is_cancelled = False
+
+    def cancel(self):
+        """Cancel the operation."""
+        self.is_cancelled = True
+
+    def run(self):
+        """Decode thumbnails, emitting them in batches.
+
+        Unreadable files are reported with a None image so the gallery can drop
+        them, matching the inline path which never adds them at all.
+        """
+        total = len(self.image_paths)
+        batch: List[Tuple[str, Optional[QImage]]] = []
+        decoded = 0
+
+        for image_path in self.image_paths:
+            if self.is_cancelled:
+                return
+
+            batch.append((image_path, decode_thumbnail(image_path, self.target_size)))
+            decoded += 1
+
+            if len(batch) >= self.BATCH_SIZE:
+                self.thumbnails_ready.emit(batch)
+                self.progress.emit(decoded, total)
+                batch = []
+
+        if batch:
+            self.thumbnails_ready.emit(batch)
+        self.progress.emit(decoded, total)
 
 
 class InterrogationWorker(QThread):

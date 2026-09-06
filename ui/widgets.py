@@ -11,10 +11,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from interrogators import LlamaCppInterrogator
+from ui.workers import decode_thumbnail
 
 
 class ImageGalleryWidget(QListWidget):
     """Custom image gallery widget with thumbnail display."""
+
+    THUMBNAIL_SIZE = QSize(200, 200)
+    _placeholder = None  # Lazily built; QPixmap needs a live QApplication.
 
     image_selected = pyqtSignal(str)  # Emits image path when selected (single selection)
     multi_selection_changed = pyqtSignal(list)  # Emits list of image paths (multi selection)
@@ -24,7 +28,7 @@ class ImageGalleryWidget(QListWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setViewMode(QListWidget.ViewMode.IconMode)
-        self.setIconSize(QSize(200, 200))
+        self.setIconSize(self.THUMBNAIL_SIZE)
         self.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.setSpacing(10)
         self.setMovement(QListWidget.Movement.Static)
@@ -51,32 +55,62 @@ class ImageGalleryWidget(QListWidget):
             self.clearSelection()
     
     def add_image(self, image_path: str, has_tags: bool = False):
-        """Add an image to the gallery."""
-        path = Path(image_path)
-        
-        # Create thumbnail
-        pixmap = QPixmap(image_path)
-        if pixmap.isNull():
+        """Add an image to the gallery, decoding its thumbnail inline."""
+        image = decode_thumbnail(image_path, self.THUMBNAIL_SIZE)
+        if image is None:
             return
-        
-        # Scale to fit (use FastTransformation for bulk loading performance)
-        scaled_pixmap = pixmap.scaled(
-            200, 200,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.FastTransformation
-        )
-        
-        # Create item
-        item = QListWidgetItem(QIcon(scaled_pixmap), path.name)
+
+        item = self._create_item(image_path, has_tags)
+        item.setIcon(QIcon(QPixmap.fromImage(image)))
+        self.addItem(item)
+        self.image_items[image_path] = item
+
+    def add_image_placeholder(self, image_path: str, has_tags: bool = False):
+        """Add an image with a blank thumbnail, to be filled in later.
+
+        Lets the gallery become scrollable immediately while a worker decodes
+        thumbnails; see set_thumbnail.
+        """
+        item = self._create_item(image_path, has_tags)
+        item.setIcon(self._placeholder_icon())
+        self.addItem(item)
+        self.image_items[image_path] = item
+
+    def set_thumbnail(self, image_path: str, image):
+        """Attach a decoded thumbnail to an already-added image.
+
+        Silently ignores paths that are no longer in the gallery, so results
+        arriving from a superseded load are harmless.
+        """
+        item = self.image_items.get(image_path)
+        if item is not None:
+            item.setIcon(QIcon(QPixmap.fromImage(image)))
+
+    def remove_image(self, image_path: str):
+        """Remove an image from the gallery."""
+        item = self.image_items.pop(image_path, None)
+        if item is not None:
+            self.takeItem(self.row(item))
+
+    def _create_item(self, image_path: str, has_tags: bool) -> QListWidgetItem:
+        """Build a gallery item without its thumbnail."""
+        item = QListWidgetItem(Path(image_path).name)
         item.setData(Qt.ItemDataRole.UserRole, image_path)
-        
+
         # Visual indicator for tagged images
         if has_tags:
             item.setBackground(Qt.GlobalColor.lightGray)
-        
-        self.addItem(item)
-        self.image_items[image_path] = item
-    
+        return item
+
+    @classmethod
+    def _placeholder_icon(cls) -> QIcon:
+        """Transparent icon that reserves the thumbnail's space."""
+        if cls._placeholder is None:
+            pixmap = QPixmap(cls.THUMBNAIL_SIZE)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            cls._placeholder = QIcon(pixmap)
+        return cls._placeholder
+
     def update_image_status(self, image_path: str, has_tags: bool):
         """Update visual status of an image."""
         if image_path in self.image_items:

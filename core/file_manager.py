@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from typing import List, Set, Optional, Tuple
+import os
 import shutil
 
 
@@ -26,12 +27,23 @@ class FileManager:
         if not dir_path.exists() or not dir_path.is_dir():
             return []
 
+        # One traversal with an extension test, rather than a glob pass per
+        # extension per case. This also matches mixed-case suffixes such as
+        # ".JpG", which globbing only the lower and upper forms misses.
         images = []
-        glob_pattern = '**/*' if recursive else '*'
-
-        for ext in FileManager.SUPPORTED_EXTENSIONS:
-            images.extend(dir_path.glob(f'{glob_pattern}{ext}'))
-            images.extend(dir_path.glob(f'{glob_pattern}{ext.upper()}'))
+        if recursive:
+            for root, _dirs, files in os.walk(dir_path):
+                root_path = Path(root)
+                for name in files:
+                    if os.path.splitext(name)[1].lower() in FileManager.SUPPORTED_EXTENSIONS:
+                        images.append(root_path / name)
+        else:
+            with os.scandir(dir_path) as entries:
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    if os.path.splitext(entry.name)[1].lower() in FileManager.SUPPORTED_EXTENSIONS:
+                        images.append(Path(entry.path))
 
         return sorted(set(images))  # Remove duplicates and sort
     
