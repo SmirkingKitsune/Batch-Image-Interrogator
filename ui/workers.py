@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from core import (
     InterrogationDatabase, hash_image_content, get_image_metadata,
-    FileManager, TagFilterSettings, DatabaseBusyError, DatabaseQueuedError
+    FileManager, TagFilterSettings, DatabaseBusyError, DatabaseQueuedError,
+    ProvisionConfig
 )
 from core.base_interrogator import BaseInterrogator
 from ui.thumbnail_cache import ThumbnailCache
@@ -1194,3 +1195,57 @@ class TensorRTConversionWorker(QThread):
                 error_count += 1
 
         self.finished.emit(success_count, error_count)
+
+
+class LlamaProvisionWorker(QThread):
+    """Worker thread for installing or building llama-server.
+
+    A source build runs for minutes, so the plan executes here and reports each
+    step back to the UI. Output is streamed rather than buffered: the CUDA and
+    CMake errors worth reading arrive long before the process exits.
+    """
+
+    # Signals
+    progress = pyqtSignal(int, int, str, float)  # step, total_steps, label, fraction
+    log = pyqtSignal(str, bool)  # line, is_stderr
+    finished = pyqtSignal(str, str)  # binary_path ("" on failure), error_message
+
+    def __init__(self, config: ProvisionConfig):
+        """Initialize the provisioning worker.
+
+        Args:
+            config: ProvisionConfig describing the desired runtime.
+        """
+        super().__init__()
+        self.config = config
+        self.is_cancelled = False
+        self.build_log_path: Optional[str] = None
+        # Non-empty when the ladder settled for a weaker backend than requested.
+        self.target_mismatch = ""
+
+    def cancel(self):
+        """Request cancellation; the current step stops at its next checkpoint."""
+        self.is_cancelled = True
+
+    def run(self):
+        """Execute the install plan."""
+        from core.llama_provisioner import LlamaProvisioner, ProvisionCancelled
+
+        provisioner = None
+        try:
+            provisioner = LlamaProvisioner(
+                config=self.config,
+                log_sink=lambda line, is_stderr: self.log.emit(line, is_stderr),
+                progress_sink=lambda p: self.progress.emit(p.step, p.total, p.label, p.fraction),
+                cancel_check=lambda: self.is_cancelled,
+            )
+            binary = provisioner.ensure_runtime()
+            self.build_log_path = str(provisioner.build_log_path or "")
+            self.target_mismatch = provisioner.target_mismatch
+            self.finished.emit(str(binary), "")
+        except ProvisionCancelled:
+            self.build_log_path = str(provisioner.build_log_path or "") if provisioner else ""
+            self.finished.emit("", "Provisioning cancelled.")
+        except Exception as exc:
+            self.build_log_path = str(provisioner.build_log_path or "") if provisioner else ""
+            self.finished.emit("", str(exc))

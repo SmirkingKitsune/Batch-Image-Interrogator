@@ -54,8 +54,9 @@ class InquiryTab(QWidget):
 
     DGX_TIMEOUT_HINT = (
         "Hint: On NVIDIA ARM64 systems (for example DGX Spark), prebuilt llama.cpp "
-        "binaries can be unstable for multimodal inference. Build llama.cpp from source "
-        "with CUDA support and set Inquiry -> llama-server Path to that compiled binary."
+        "binaries can be unstable for multimodal inference. Use Inquiry -> llama-server "
+        "Path -> Provision... with Install Method 'Source build only' to compile a "
+        "CUDA build matched to this GPU."
     )
 
     model_loaded = pyqtSignal(str)

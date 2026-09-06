@@ -5,15 +5,25 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QComboBox, QDoubleSpinBox, QPushButton,
                              QFormLayout, QGroupBox, QCheckBox, QLineEdit,
                              QTabWidget, QWidget, QProgressBar, QMessageBox,
-                             QListWidget, QListWidgetItem, QScrollArea,
+                             QListWidget, QListWidgetItem,
                              QFileDialog, QSpinBox)
+from PyQt6.QtWidgets import QPlainTextEdit
 from PyQt6.QtCore import Qt
-from typing import Dict
+from typing import Dict, Optional
 from pathlib import Path
 from core.clip_model_loader import get_categorized_models
-from core import FileManager
+from core import FileManager, ProvisionConfig
 from core.gguf_metadata import get_gguf_context_length
-from ui.workers import OrganizationWorker
+from core.llama_provisioner import (
+    ACCELERATORS,
+    current_arch,
+    current_platform,
+    cuda_cmake_architectures,
+    detect_accelerator,
+    detect_cuda_arch,
+    read_active_runtime,
+)
+from ui.workers import LlamaProvisionWorker, OrganizationWorker
 
 logger = logging.getLogger(__name__)
 
@@ -626,6 +636,262 @@ def create_camie_config_widget(camie_config: Dict, parent=None) -> tuple:
     return widget, references
 
 
+DEFAULT_PROVISION_DIR = Path(__file__).resolve().parents[1] / "cache" / "llama_cpp"
+
+
+class LlamaProvisionDialog(QDialog):
+    """Installs or compiles llama-server without leaving the app.
+
+    A matched official release is tried first; a source build is the fallback
+    for the platform/accelerator combinations upstream does not publish, which
+    is the only way Inquiry works on, for example, aarch64 + CUDA.
+    """
+
+    def __init__(self, parent=None, provision_dir: Optional[Path] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Provision llama-server")
+        self.setMinimumSize(760, 560)
+
+        self.provision_dir = Path(provision_dir or DEFAULT_PROVISION_DIR)
+        self.worker: Optional[LlamaProvisionWorker] = None
+        self.installed_path = ""
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._create_target_group())
+        layout.addWidget(self._create_progress_group(), stretch=1)
+        layout.addLayout(self._create_buttons())
+
+        self._refresh_environment()
+
+    def _create_target_group(self) -> QGroupBox:
+        group = QGroupBox("Build Target")
+        form = QFormLayout()
+
+        self.environment_label = QLabel("")
+        self.environment_label.setWordWrap(True)
+        form.addRow("Detected:", self.environment_label)
+
+        self.accelerator_combo = QComboBox()
+        self.accelerator_combo.addItem("Auto-detect", "")
+        for backend in ACCELERATORS:
+            self.accelerator_combo.addItem(backend, backend)
+        self.accelerator_combo.currentIndexChanged.connect(self._refresh_environment)
+        form.addRow("Accelerator:", self.accelerator_combo)
+
+        self.method_combo = QComboBox()
+        self.method_combo.addItem("Auto (release, then source build)", "auto")
+        self.method_combo.addItem("Official release only", "release")
+        self.method_combo.addItem("Source build only", "source")
+        form.addRow("Install Method:", self.method_combo)
+
+        self.version_edit = QLineEdit("latest")
+        self.version_edit.setPlaceholderText("latest, or a release tag / git ref such as b6000")
+        form.addRow("Version:", self.version_edit)
+
+        self.cuda_arch_edit = QLineEdit("")
+        self.cuda_arch_edit.setPlaceholderText("Auto-detected compute capability, e.g. 121")
+        self.cuda_arch_edit.textChanged.connect(self._update_cuda_hint)
+        form.addRow("CUDA Architecture:", self.cuda_arch_edit)
+
+        self.cuda_hint_label = QLabel("")
+        self.cuda_hint_label.setWordWrap(True)
+        form.addRow("", self.cuda_hint_label)
+
+        self.bypass_checkbox = QCheckBox(
+            "Skip prerequisite checks (compile anyway)"
+        )
+        self.bypass_checkbox.setToolTip(
+            "The preflight probes catch a missing or too-old CUDA Toolkit in seconds "
+            "instead of twenty minutes into a compile. Only skip them if you know the "
+            "check is wrong about your machine."
+        )
+        form.addRow("", self.bypass_checkbox)
+
+        group.setLayout(form)
+        return group
+
+    def _create_progress_group(self) -> QGroupBox:
+        group = QGroupBox("Progress")
+        layout = QVBoxLayout()
+
+        self.step_label = QLabel("Idle.")
+        layout.addWidget(self.step_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(5000)
+        self.log_view.setPlaceholderText("Build output appears here.")
+        layout.addWidget(self.log_view, stretch=1)
+
+        group.setLayout(layout)
+        return group
+
+    def _create_buttons(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        row.addWidget(self.status_label, stretch=1)
+
+        self.start_button = QPushButton("Install")
+        self.start_button.clicked.connect(self._start)
+        row.addWidget(self.start_button)
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self._cancel)
+        row.addWidget(self.cancel_button)
+
+        self.close_button = QPushButton("Close")
+        self.close_button.clicked.connect(self.reject)
+        row.addWidget(self.close_button)
+        return row
+
+    def _selected_accelerator(self) -> str:
+        chosen = self.accelerator_combo.currentData() or ""
+        return chosen or detect_accelerator()
+
+    def _refresh_environment(self):
+        """Describe the host and pre-fill anything that can be detected."""
+        accelerator = self._selected_accelerator()
+        active = read_active_runtime(self.provision_dir)
+        parts = [f"{current_platform()}/{current_arch()}", f"backend {accelerator}"]
+        if active.get("executable"):
+            parts.append(f"installed: {active.get('version', 'unknown')} ({active.get('method', '?')})")
+        self.environment_label.setText(" · ".join(parts))
+
+        is_cuda = accelerator == "cuda"
+        self.cuda_arch_edit.setEnabled(is_cuda)
+        if is_cuda and not self.cuda_arch_edit.text().strip():
+            self.cuda_arch_edit.setText(detect_cuda_arch())
+        self._update_cuda_hint()
+
+    def _update_cuda_hint(self):
+        if not self.cuda_arch_edit.isEnabled():
+            self.cuda_hint_label.setText("")
+            return
+        raw = self.cuda_arch_edit.text().strip()
+        if not raw:
+            self.cuda_hint_label.setText(
+                "No GPU detected. Enter a compute capability, e.g. 121 for a DGX Spark."
+            )
+            self.cuda_hint_label.setStyleSheet("color: orange;")
+            return
+        mapped = cuda_cmake_architectures(raw)
+        if not mapped:
+            self.cuda_hint_label.setText(
+                "Invalid compute capability. Use digits such as 86, 120, or 121."
+            )
+            self.cuda_hint_label.setStyleSheet("color: orange;")
+            return
+        self.cuda_hint_label.setText(f"CMAKE_CUDA_ARCHITECTURES={mapped}")
+        self.cuda_hint_label.setStyleSheet("color: gray;")
+
+    def _build_config(self) -> ProvisionConfig:
+        return ProvisionConfig(
+            provision_dir=self.provision_dir,
+            install_method=self.method_combo.currentData(),
+            version=self.version_edit.text().strip() or "latest",
+            accelerator=self.accelerator_combo.currentData() or "",
+            cuda_arch=self.cuda_arch_edit.text().strip(),
+            bypass_environment_checks=self.bypass_checkbox.isChecked(),
+        )
+
+    def _start(self):
+        if self.worker is not None and self.worker.isRunning():
+            return
+
+        self.log_view.clear()
+        self.progress_bar.setValue(0)
+        self.status_label.setText("")
+        self.status_label.setStyleSheet("")
+        self._set_inputs_enabled(False)
+
+        self.worker = LlamaProvisionWorker(self._build_config())
+        self.worker.progress.connect(self._on_progress)
+        self.worker.log.connect(self._on_log)
+        self.worker.finished.connect(self._on_finished)
+        self.worker.start()
+
+    def _cancel(self):
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel()
+            self.cancel_button.setEnabled(False)
+            self.step_label.setText("Cancelling after the current step...")
+
+    def _set_inputs_enabled(self, enabled: bool):
+        for widget in (
+            self.accelerator_combo,
+            self.method_combo,
+            self.version_edit,
+            self.bypass_checkbox,
+            self.start_button,
+            self.close_button,
+        ):
+            widget.setEnabled(enabled)
+        self.cuda_arch_edit.setEnabled(enabled and self._selected_accelerator() == "cuda")
+        self.cancel_button.setEnabled(not enabled)
+
+    def _on_progress(self, step: int, total: int, label: str, fraction: float):
+        self.step_label.setText(f"Step {step}/{total}: {label}")
+        if fraction >= 0.0:
+            # Weight the in-step fraction inside this step's share of the plan.
+            overall = ((step - 1) + fraction) / max(1, total)
+        else:
+            overall = (step - 1) / max(1, total)
+        self.progress_bar.setValue(int(overall * 100))
+
+    def _on_log(self, line: str, is_stderr: bool):
+        self.log_view.appendPlainText(f"! {line}" if is_stderr else line)
+
+    def _on_finished(self, binary_path: str, error: str):
+        self._set_inputs_enabled(True)
+        log_path = getattr(self.worker, "build_log_path", "") or ""
+
+        if binary_path:
+            self.installed_path = binary_path
+            self.progress_bar.setValue(100)
+            self.step_label.setText("Done.")
+
+            mismatch = getattr(self.worker, "target_mismatch", "") or ""
+            if mismatch:
+                # A silent downgrade to CPU looks like success until inference
+                # is inexplicably slow, so make the user acknowledge it.
+                self.status_label.setText(f"Installed with fallback: {binary_path}")
+                self.status_label.setStyleSheet("color: orange;")
+                QMessageBox.warning(self, "Installed a fallback runtime", mismatch)
+            else:
+                self.status_label.setText(f"Installed: {binary_path}")
+                self.status_label.setStyleSheet("color: green;")
+            self.accept()
+            return
+
+        self.step_label.setText("Failed.")
+        self.status_label.setText(error or "Provisioning failed.")
+        self.status_label.setStyleSheet("color: red;")
+        if log_path:
+            self._on_log(f"Full build log: {log_path}", False)
+
+    def closeEvent(self, event):
+        """Stop an in-flight build rather than orphaning the thread."""
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel()
+            if not self.worker.wait(10000):
+                self.step_label.setText("Cancelling after the current step...")
+                self.status_label.setText(
+                    "The active download or build step is still stopping. "
+                    "This window will remain open until the worker exits."
+                )
+                self.status_label.setStyleSheet("color: orange;")
+                event.ignore()
+                return
+        super().closeEvent(event)
+
+
 def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     """
     Create llama.cpp multimodal configuration widget.
@@ -660,6 +926,21 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
         lambda: _browse_path(binary_path_edit, "Select llama-server binary")
     )
     binary_layout.addWidget(binary_btn)
+
+    provision_btn = QPushButton("Provision...")
+    provision_btn.setToolTip(
+        "Download a matched llama.cpp release, or build one from source for "
+        "platforms with no published binary."
+    )
+
+    def _provision():
+        dialog = LlamaProvisionDialog(parent)
+        if dialog.exec() and dialog.installed_path:
+            binary_path_edit.setText(dialog.installed_path)
+
+    provision_btn.clicked.connect(_provision)
+    binary_layout.addWidget(provision_btn)
+
     binary_widget = QWidget()
     binary_widget.setLayout(binary_layout)
     form_layout.addRow("llama-server Path:", binary_widget)
@@ -761,9 +1042,9 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     desc_group = QGroupBox("llama.cpp Notes")
     desc_layout = QVBoxLayout()
     desc_layout.addWidget(QLabel(
-        "Use CUDA-capable binaries from ggml-org/llama.cpp GitHub releases.\n"
+        "Provision... installs a matched llama.cpp release, and falls back to a source\n"
+        "build for platforms with no published binary (notably Linux CUDA, including aarch64).\n"
         "Package manager builds (brew/nix/winget) may not include CUDA support.\n"
-        "setup.sh/setup.bat auto-downloads llama-server to cache/llama_cpp/bin when missing.\n"
         "Model path is required; mmproj path is optional and model-dependent."
     ))
     desc_group.setLayout(desc_layout)
