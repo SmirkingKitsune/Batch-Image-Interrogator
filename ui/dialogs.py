@@ -18,11 +18,16 @@ from ui.workers import OrganizationWorker
 logger = logging.getLogger(__name__)
 
 
-def _populate_clip_models_combo(clip_model_combo: QComboBox):
-    """Populate CLIP model combo box with categorized models."""
+def _populate_clip_models_combo(clip_model_combo: QComboBox, models_dict=None):
+    """Populate CLIP model combo box with categorized models.
+
+    Pass models_dict to reuse an already-loaded list; otherwise it is fetched
+    here, which imports open_clip and blocks the caller.
+    """
     try:
         # Get categorized models
-        models_dict = get_categorized_models()
+        if models_dict is None:
+            models_dict = get_categorized_models()
 
         current_idx = 0
 
