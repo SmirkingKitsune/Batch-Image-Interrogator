@@ -9,6 +9,13 @@ from .db_queue import DatabaseOperationQueue, QueuedOperation
 from .onnx_providers import ONNXProviderSettings, ProviderPreference
 from .model_cache import ModelCacheManager, ModelCacheInfo
 from .llama_cpp_runtime import LlamaCppRuntimeManager, LlamaCppRuntimeError
+from .llama_provisioner import (
+    LlamaProvisioner,
+    ProvisionCancelled,
+    ProvisionConfig,
+    ProvisionError,
+    StepProgress,
+)
 from .inquiry_settings import InquirySettings
 
 __all__ = [
@@ -28,5 +35,10 @@ __all__ = [
     'ModelCacheInfo',
     'LlamaCppRuntimeManager',
     'LlamaCppRuntimeError',
+    'LlamaProvisioner',
+    'ProvisionCancelled',
+    'ProvisionConfig',
+    'ProvisionError',
+    'StepProgress',
     'InquirySettings',
 ]

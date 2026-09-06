@@ -495,9 +495,9 @@ else
         echo -e "${YELLOW}      $LLAMA_MESSAGE${NC}"
     fi
     echo "      Manual fallback: https://github.com/ggml-org/llama.cpp/releases"
-    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-        echo "      Tip: Run ./build_llama_cpp_arm64.sh to compile llama.cpp with CUDA from source."
-    fi
+    echo "      Tip: retry with build output using:"
+    echo "        python3 provision_llama_server.py --cache-dir \"$SCRIPT_DIR/cache/llama_cpp\" --method source --verbose"
+    echo "      Or provision from the app: Inquiry -> llama-server Path -> Provision..."
 fi
 echo ""
 

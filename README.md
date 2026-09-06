@@ -151,16 +151,13 @@ pip install -r requirements.txt
 
 Multimodal support requires a local `llama-server` runtime and a user-supplied multimodal model path.
 
-1. Run `setup.sh` or `setup.bat` to auto-download `llama-server` from [ggml-org/llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) when missing.
-   - Build selection policy:
-     - Prefer highest exact CUDA/ROCm toolkit version match.
-     - If exact match is unavailable, use the highest `llama.cpp` GPU build lower than the installed toolkit version.
-     - If no compatible GPU build exists (for example, toolkit older than the minimum published CUDA build), fall back to CPU and emit a warning.
-   - On NVIDIA ARM64 systems (for example DGX Spark), you can also compile llama.cpp from source with:
-     ```bash
-     chmod +x build_llama_cpp_arm64.sh
-     ./build_llama_cpp_arm64.sh
-     ```
+1. Provision the runtime, either way round:
+   - **In the app**: open the **Inquiry** tab and click **llama-server Path -> Provision...**. Pick an accelerator (or leave it on auto-detect) and press Install. Progress, live build output, and cancellation are all in the dialog.
+   - **At setup time**: `setup.sh` / `setup.bat` provision `llama-server` automatically when it is missing.
+   - Acquisition ladder, tried in order:
+     1. The newest official [ggml-org/llama.cpp runtime release](https://github.com/ggml-org/llama.cpp/releases) matching this OS, architecture, and accelerator. Metadata-only stable releases are skipped in favor of their binary-bearing nightly release. For CUDA, the newest build the installed driver can load; on Windows, the CPU base plus the backend and `cudart` archives.
+     2. A source build, for combinations with no published binary — notably Linux CUDA and NVIDIA ARM64 (DGX Spark, `sm_121`). Prerequisites, `nvcc` architecture support, and a CUDA probe compile are all checked before the build starts, so a bad toolchain fails in seconds rather than mid-compile.
+     3. A CPU runtime as a last resort, reported as a fallback rather than passed off as the requested backend.
 2. Optional: set `LLAMA_CPP_VERSION=<release-tag>` before setup to pin a specific release (default is latest).
 3. Download a multimodal GGUF model (and optional `mmproj` file if the model requires it).
 4. Open the **Inquiry** tab and set:
@@ -706,19 +703,24 @@ The build script will:
 
 #### Building llama.cpp from Source for ARM64 (DGX Spark Path)
 
-For NVIDIA ARM64 systems where prebuilt `llama-server` binaries are unstable or slow, build llama.cpp locally:
-This helper is based on NVIDIA's DGX Spark walkthrough: https://build.nvidia.com/spark/llama-cpp/instructions
+For Linux NVIDIA ARM64 systems, upstream publishes no CUDA `llama-server` release, so the runtime is compiled locally. This is automatic: **Inquiry -> llama-server Path -> Provision...** detects `aarch64` + CUDA, finds no matching release, and falls back to a source build. To force it, set **Install Method** to `Source build only`.
+
+From the command line:
 
 ```bash
-chmod +x build_llama_cpp_arm64.sh
-./build_llama_cpp_arm64.sh
+python3 provision_llama_server.py --cache-dir cache/llama_cpp \
+    --accelerator cuda --method source --verbose
 ```
 
-The script follows NVIDIA’s DGX Spark flow (`GGML_CUDA=ON`, CUDA architecture targeting, source build), then installs the runtime to:
+The build follows NVIDIA's DGX Spark flow (`GGML_CUDA=ON`, CUDA architecture targeting) and installs to:
 
 - `cache/llama_cpp/bin/llama-server`
 
-After the build completes, use that path in **Inquiry -> llama-server Path**.
+The compute capability is detected from `nvidia-smi` and mapped to the correct CMake target. This mapping matters: llama.cpp's Blackwell MXFP4 kernels use architecture-specific tensor-core instructions, so a detected `sm_121` is compiled as `121a-real`. The baseline `sm_121` target cannot assemble those instructions. Override with `--cuda-arch` if detection is wrong.
+
+Before compiling, the provisioner verifies `git`, `cmake`, a C++ compiler, and `nvcc`, checks that `nvcc` supports the requested architecture, and runs a probe compile to confirm `nvcc` and `ptxas` come from the same toolkit. Note that the CUDA version reported by `nvidia-smi` is *driver compatibility*, not the installed compiler version — a source build needs the CUDA Toolkit installed, not just a driver.
+
+The managed provisioning design is ported from [Mantic-Mind's llama.cpp provisioner](https://github.com/SmirkingKitsune/Mantic-Mind). DGX Spark build details also follow [NVIDIA's llama.cpp walkthrough](https://build.nvidia.com/spark/llama-cpp/instructions).
 
 #### Verification
 
