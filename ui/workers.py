@@ -119,6 +119,108 @@ class ThumbnailLoadWorker(QThread):
         self.progress.emit(decoded, total)
 
 
+def context_source_key(model_name: Optional[str], model_type: Optional[str]) -> str:
+    """Stable key identifying a prior-result source."""
+    return f"{model_type or ''}\u001f{model_name or ''}"
+
+
+class ClipModelListWorker(QThread):
+    """Worker thread for loading the list of available CLIP models.
+
+    Only model names are needed, but reaching them imports open_clip, which
+    pulls in torch and builds a tokenizer -- over a second of work that would
+    otherwise run on the GUI thread at startup.
+    """
+
+    # Signals
+    completed = pyqtSignal(dict)  # categorized model lists
+    failed = pyqtSignal(str)      # error message
+
+    def run(self):
+        """Import open_clip and categorize the available models."""
+        try:
+            from core.clip_model_loader import get_categorized_models
+            self.completed.emit(get_categorized_models())
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class BatchContextScanWorker(QThread):
+    """Worker thread for finding prior interrogation sources across a queue.
+
+    Each image has to be hashed, which means reading the whole file, and then
+    looked up in the database. Running that inline blocks the GUI for tens of
+    seconds on a large directory.
+    """
+
+    # Signals
+    completed = pyqtSignal(list)  # sorted source dicts
+    progress = pyqtSignal(int, int)  # scanned, total
+
+    def __init__(self, image_paths: List[str], database: InterrogationDatabase):
+        super().__init__()
+        self.image_paths = list(image_paths)
+        self.database = database
+        self.is_cancelled = False
+
+    def cancel(self):
+        """Cancel the operation."""
+        self.is_cancelled = True
+
+    def run(self):
+        """Collect prior-result sources for every queued image."""
+        total = len(self.image_paths)
+        sources: Dict[str, Dict[str, Any]] = {}
+        last_percent = -1
+
+        for index, image_path in enumerate(self.image_paths):
+            if self.is_cancelled:
+                return
+
+            try:
+                file_hash = hash_image_content(image_path)
+                rows = self.database.get_all_interrogations_for_image(file_hash) or []
+            except Exception:
+                continue
+
+            for interrog in rows:
+                source_key = context_source_key(
+                    interrog.get("model_name"),
+                    interrog.get("model_type"),
+                )
+                source = sources.setdefault(
+                    source_key,
+                    {
+                        "source_key": source_key,
+                        "model_name": interrog.get("model_name"),
+                        "model_type": interrog.get("model_type"),
+                        "image_hashes": set(),
+                        "latest_at": interrog.get("interrogated_at") or "",
+                    },
+                )
+                source["image_hashes"].add(file_hash)
+                latest_at = interrog.get("interrogated_at") or ""
+                if latest_at > (source.get("latest_at") or ""):
+                    source["latest_at"] = latest_at
+
+            percent = int(((index + 1) / total) * 100) if total else 100
+            if percent != last_percent:
+                last_percent = percent
+                self.progress.emit(index + 1, total)
+
+        if self.is_cancelled:
+            return
+
+        self.completed.emit(sorted(
+            sources.values(),
+            key=lambda src: (
+                -(len(src.get("image_hashes") or [])),
+                str(src.get("model_type") or ""),
+                str(src.get("model_name") or ""),
+            ),
+        ))
+
+
 class InterrogationWorker(QThread):
     """Worker thread for batch image interrogation."""
     

@@ -12,7 +12,7 @@ from typing import Optional, Dict
 from core import InterrogationDatabase, FileManager, TagFilterSettings, ONNXProviderSettings
 from ui.tabs import InterrogationTab, InquiryTab, GalleryTab, SettingsTab
 from ui.dialogs_database import DatabaseBusyDialog, QueueProcessingDialog
-from ui.workers import DatabaseQueueWorker
+from ui.workers import ClipModelListWorker, DatabaseQueueWorker
 
 
 class MainWindow(QMainWindow):
@@ -41,6 +41,8 @@ class MainWindow(QMainWindow):
         self.tag_filters = TagFilterSettings()
         self.provider_settings = ONNXProviderSettings()
         self.current_interrogator = None
+        # Background load of the CLIP model list (see populate_model_lists).
+        self._clip_model_worker = None
         self.current_model_type = "WD"
         self.current_directory = None
         self.current_image = None
@@ -113,25 +115,31 @@ class MainWindow(QMainWindow):
 
         Called via QTimer.singleShot() from main.py after window.show().
         """
+        self.statusBar().showMessage("Loading model lists...")
+
+        # Get reference to CLIP model combo box
+        clip_combo = self.interrogation_tab.clip_config_refs['clip_model_combo']
+
+        # Show loading state
+        clip_combo.clear()
+        clip_combo.addItem("Loading...")
+        clip_combo.setEnabled(False)
+
+        # Reading the model list imports open_clip, which takes over a second;
+        # do it in the background so the window stays responsive.
+        worker = ClipModelListWorker()
+        worker.completed.connect(self._on_clip_models_loaded)
+        worker.failed.connect(self._on_clip_models_failed)
+        self._clip_model_worker = worker
+        worker.start()
+
+    def _on_clip_models_loaded(self, models_dict: dict):
+        """Fill the CLIP model combo box from a completed background load."""
+        clip_combo = self.interrogation_tab.clip_config_refs['clip_model_combo']
         try:
-            self.statusBar().showMessage("Loading model lists...")
-
-            # Get reference to CLIP model combo box
-            clip_combo = self.interrogation_tab.clip_config_refs['clip_model_combo']
-
-            # Clear placeholder
-            clip_combo.clear()
-            clip_combo.addItem("Loading...")
-            clip_combo.setEnabled(False)
-
-            # Force UI update to show loading state
-            from PyQt6.QtWidgets import QApplication as QApp
-            QApp.processEvents()
-
-            # Populate CLIP models (this triggers open_clip import)
             from ui.dialogs import _populate_clip_models_combo
             clip_combo.clear()
-            _populate_clip_models_combo(clip_combo)
+            _populate_clip_models_combo(clip_combo, models_dict)
 
             # Restore selected CLIP model
             current_clip_model = self.clip_config.get('clip_model', 'ViT-L-14/openai')
@@ -143,29 +151,31 @@ class MainWindow(QMainWindow):
                 from ui.dialogs import _select_first_valid_clip_model
                 _select_first_valid_clip_model(clip_combo)
 
-            # Enable combo box
             clip_combo.setEnabled(True)
             self.statusBar().showMessage("Model lists loaded successfully", 3000)
-
         except Exception as e:
-            import logging
-            logging.error(f"Error populating model lists: {e}")
+            self._on_clip_models_failed(str(e))
 
-            # Show error in status bar
-            self.statusBar().showMessage(
-                f"Warning: Could not load CLIP models - {str(e)}",
-                10000
-            )
+    def _on_clip_models_failed(self, message: str):
+        """Fall back to a minimal model list when loading fails."""
+        import logging
+        logging.error(f"Error populating model lists: {message}")
 
-            # Re-enable combo box with fallback list
-            clip_combo.setEnabled(True)
-            if clip_combo.count() == 0:
-                # Add minimal fallback list
-                clip_combo.addItems([
-                    'ViT-L-14/openai',
-                    'ViT-H-14/laion2b_s32b_b79k',
-                    'ViT-B-32/openai'
-                ])
+        clip_combo = self.interrogation_tab.clip_config_refs['clip_model_combo']
+        self.statusBar().showMessage(
+            f"Warning: Could not load CLIP models - {message}",
+            10000
+        )
+
+        # Re-enable combo box with fallback list
+        clip_combo.setEnabled(True)
+        if clip_combo.count() == 0 or clip_combo.itemText(0) == "Loading...":
+            clip_combo.clear()
+            clip_combo.addItems([
+                'ViT-L-14/openai',
+                'ViT-H-14/laion2b_s32b_b79k',
+                'ViT-B-32/openai'
+            ])
 
     def setup_ui(self):
         """Setup the main UI with tabs."""
@@ -492,9 +502,13 @@ class MainWindow(QMainWindow):
         if self.current_interrogator:
             self.current_interrogator.unload_model()
 
-        # Stop background thumbnail decoding before the widgets go away.
+        # Stop background workers before the widgets go away.
         if hasattr(self, "gallery_tab") and self.gallery_tab:
             self.gallery_tab._stop_thumbnail_worker()
+        if hasattr(self, "inquiry_tab") and self.inquiry_tab:
+            self.inquiry_tab._stop_batch_context_scan()
+        if self._clip_model_worker is not None and self._clip_model_worker.isRunning():
+            self._clip_model_worker.wait(5000)
 
         if self.database:
             self.database.close()

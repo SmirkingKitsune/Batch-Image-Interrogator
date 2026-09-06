@@ -1,5 +1,6 @@
 """Inquiry Tab - dedicated llama.cpp multimodal workflows."""
 
+import os
 import platform
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -45,7 +46,7 @@ from interrogators import LlamaCppInterrogator
 from ui.dialogs import create_llama_config_widget
 from ui.dialogs_advanced import AdvancedImageInspectionDialog
 from ui.widgets import InquiryTranscriptWidget
-from ui.workers import MultimodalInterrogationWorker
+from ui.workers import BatchContextScanWorker, MultimodalInterrogationWorker
 
 
 class InquiryTab(QWidget):
@@ -97,6 +98,8 @@ class InquiryTab(QWidget):
         self.active_batch_prompt = ""
         self.last_non_audit_txt_output_mode = "merge"
         self.saved_batch_context_source_keys: List[str] = []
+        # Background scan for prior-result sources across the batch queue.
+        self._batch_context_worker = None
         self.has_saved_batch_context_source_keys = False
         self.saved_batch_included_model_types: List[str] = ["CLIP", "WD", "Camie"]
 
@@ -652,13 +655,18 @@ class InquiryTab(QWidget):
             self.batch_inquiry_button.setEnabled(False)
 
     def _to_display_name(self, image_path: str) -> str:
-        path = Path(image_path)
+        """Path relative to the loaded directory, else the bare filename.
+
+        Called once per queued image. Path.relative_to() normalizes and
+        compares path components, which costs about 0.6s across a few thousand
+        images; a prefix test is equivalent here and effectively free.
+        """
         if self.current_directory:
-            try:
-                return str(path.relative_to(self.current_directory))
-            except ValueError:
-                return path.name
-        return path.name
+            # os.path.join with "" guarantees the trailing separator.
+            base = os.path.join(str(self.current_directory), "")
+            if os.path.normcase(image_path).startswith(os.path.normcase(base)):
+                return image_path[len(base):]
+        return os.path.basename(image_path)
 
     def _append_timeout_hint_if_needed(self, error_text: str) -> str:
         """Append DGX Spark guidance for timeout failures on ARM64 NVIDIA systems."""
@@ -866,43 +874,48 @@ class InquiryTab(QWidget):
             and bool(legacy_types)
         )
 
-        sources: Dict[str, Dict[str, Any]] = {}
-        for image_path in self.loaded_image_paths:
-            try:
-                file_hash = hash_image_content(image_path)
-                rows = self.database.get_all_interrogations_for_image(file_hash) or []
-            except Exception:
-                continue
+        # Scanning means hashing every queued image, which reads each file in
+        # full. Doing that inline froze the window for ~30s on a large
+        # directory, so it runs in the background and fills the table on
+        # completion.
+        self._stop_batch_context_scan()
 
-            for interrog in rows:
-                source_key = self._context_source_key(
-                    interrog.get("model_name"),
-                    interrog.get("model_type"),
-                )
-                source = sources.setdefault(
-                    source_key,
-                    {
-                        "source_key": source_key,
-                        "model_name": interrog.get("model_name"),
-                        "model_type": interrog.get("model_type"),
-                        "image_hashes": set(),
-                        "latest_at": interrog.get("interrogated_at") or "",
-                    },
-                )
-                source["image_hashes"].add(file_hash)
-                latest_at = interrog.get("interrogated_at") or ""
-                if latest_at > (source.get("latest_at") or ""):
-                    source["latest_at"] = latest_at
+        if not self.loaded_image_paths:
+            self._populate_batch_context_sources(
+                [], selected_keys, use_legacy_type_selection, legacy_types
+            )
+            return
 
-        sorted_sources = sorted(
-            sources.values(),
-            key=lambda src: (
-                -(len(src.get("image_hashes") or [])),
-                str(src.get("model_type") or ""),
-                str(src.get("model_name") or ""),
-            ),
+        worker = BatchContextScanWorker(list(self.loaded_image_paths), self.database)
+        worker.completed.connect(
+            lambda sources: self._populate_batch_context_sources(
+                sources, selected_keys, use_legacy_type_selection, legacy_types
+            )
         )
+        self._batch_context_worker = worker
+        worker.start()
 
+    def closeEvent(self, event):
+        """Stop background work before the widget goes away."""
+        self._stop_batch_context_scan()
+        super().closeEvent(event)
+
+    def _stop_batch_context_scan(self):
+        """Cancel any in-flight batch context scan."""
+        worker = self._batch_context_worker
+        self._batch_context_worker = None
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            worker.wait(5000)
+
+    def _populate_batch_context_sources(
+        self,
+        sorted_sources: List[Dict[str, Any]],
+        selected_keys: set,
+        use_legacy_type_selection: bool,
+        legacy_types: set,
+    ):
+        """Fill the batch context table from a completed scan."""
         self.batch_context_sources_table.blockSignals(True)
         self.batch_context_sources_table.setRowCount(0)
         for source in sorted_sources:

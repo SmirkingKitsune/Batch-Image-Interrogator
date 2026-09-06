@@ -80,6 +80,9 @@ class InquiryTabAuditControlsTests(unittest.TestCase):
                 self.assertEqual(tab.image_queue.item(1).text(), "second.png")
                 self.assertEqual(tab.image_queue.item(2).text(), "third.png")
             finally:
+                # The tab owns a background context scan; stop it before the
+                # temporary directory (and its database) is removed.
+                tab.close()
                 os.chdir(old_cwd)
 
 
