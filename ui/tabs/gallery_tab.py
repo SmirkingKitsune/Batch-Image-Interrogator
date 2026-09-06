@@ -26,9 +26,18 @@ class TagFilterWidget(QWidget):
     sort_changed = pyqtSignal(str)  # sort_mode: 'name', 'date', 'size'
     show_changed = pyqtSignal(str)  # show_mode: 'all', 'tagged', 'untagged'
 
+    # Laying out a checkbox per tag does not scale: a library with ~8000
+    # distinct tags spends ~17s laying them out and ~71s rebuilding them, which
+    # freezes the window. Show the most common ones and let search reach the
+    # rest.
+    MAX_VISIBLE_TAGS = 200
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.tag_checkboxes = {}  # tag -> QCheckBox
+        self.tag_checkboxes = {}  # tag -> QCheckBox, for currently shown tags
+        self._all_tag_counts = {}  # every known tag -> count
+        self._selected_tags = set()  # survives re-listing and searching
+        self._checkbox_pool = []  # reused widgets, never destroyed
         self.setup_ui()
 
     def setup_ui(self):
@@ -58,6 +67,12 @@ class TagFilterWidget(QWidget):
         scroll.setWidget(self.tag_list_widget)
 
         layout.addWidget(scroll, 1)
+
+        # Shown when the tag list is truncated
+        self.tag_overflow_label = QLabel()
+        self.tag_overflow_label.setWordWrap(True)
+        self.tag_overflow_label.setVisible(False)
+        layout.addWidget(self.tag_overflow_label)
 
         # Clear all button
         self.clear_button = QPushButton("Clear All Filters")
@@ -99,43 +114,82 @@ class TagFilterWidget(QWidget):
         Args:
             tags_with_counts: Dict of tag -> count
         """
-        # Clear existing checkboxes
-        for checkbox in self.tag_checkboxes.values():
-            checkbox.deleteLater()
+        self._all_tag_counts = dict(tags_with_counts)
+        # Drop selections for tags that no longer exist anywhere.
+        self._selected_tags &= set(self._all_tag_counts)
+        self._refresh_visible_tags()
+
+    def _refresh_visible_tags(self):
+        """Show the most common tags matching the search, reusing widgets.
+
+        Widgets are updated in place rather than destroyed and recreated;
+        rebuilding the list is what made saving tags freeze the window.
+        """
+        search_text = self.search_box.text().strip().lower()
+
+        def matches(tag: str) -> bool:
+            return not search_text or search_text in tag.lower()
+
+        # Selected tags always stay listed, so a filter can always be undone.
+        selected = sorted(tag for tag in self._selected_tags if matches(tag))
+        remaining = sorted(
+            (tag for tag in self._all_tag_counts
+             if matches(tag) and tag not in self._selected_tags),
+            key=lambda tag: (-self._all_tag_counts[tag], tag)
+        )
+        room = max(self.MAX_VISIBLE_TAGS - len(selected), 0)
+        visible = selected + remaining[:room]
+
         self.tag_checkboxes.clear()
-
-        # Sort tags by count (descending)
-        sorted_tags = sorted(tags_with_counts.items(), key=lambda x: x[1], reverse=True)
-
-        # Create checkboxes
-        for tag, count in sorted_tags:
-            checkbox = QCheckBox(f"{tag} ({count})")
+        for index, tag in enumerate(visible):
+            checkbox = self._checkbox_at(index)
+            # Reusing a widget means its state changes; don't report those as
+            # the user touching the filter.
+            checkbox.blockSignals(True)
+            checkbox.setText(f"{tag} ({self._all_tag_counts.get(tag, 0)})")
             checkbox.setObjectName(tag)
+            checkbox.setChecked(tag in self._selected_tags)
+            checkbox.blockSignals(False)
+            checkbox.setVisible(True)
+            self.tag_checkboxes[tag] = checkbox
+
+        for checkbox in self._checkbox_pool[len(visible):]:
+            checkbox.setVisible(False)
+
+        hidden = len(remaining) - len(remaining[:room])
+        self.tag_overflow_label.setVisible(hidden > 0)
+        if hidden > 0:
+            self.tag_overflow_label.setText(f"+{hidden:,} more - search to narrow")
+
+    def _checkbox_at(self, index: int) -> QCheckBox:
+        """Return the pooled checkbox at index, creating it on first use."""
+        while index >= len(self._checkbox_pool):
+            checkbox = QCheckBox()
             checkbox.stateChanged.connect(self._on_filter_changed)
             self.tag_list_layout.addWidget(checkbox)
-            self.tag_checkboxes[tag] = checkbox
+            self._checkbox_pool.append(checkbox)
+        return self._checkbox_pool[index]
 
     def _on_search_changed(self, text: str):
         """Handle search box text change."""
-        search_text = text.lower()
-        for tag, checkbox in self.tag_checkboxes.items():
-            if search_text in tag.lower():
-                checkbox.setVisible(True)
-            else:
-                checkbox.setVisible(False)
+        self._refresh_visible_tags()
 
     def _on_filter_changed(self):
         """Handle filter checkbox change."""
-        selected_tags = [
-            tag for tag, checkbox in self.tag_checkboxes.items()
-            if checkbox.isChecked()
-        ]
-        self.filter_changed.emit(selected_tags)
+        for tag, checkbox in self.tag_checkboxes.items():
+            if checkbox.isChecked():
+                self._selected_tags.add(tag)
+            else:
+                self._selected_tags.discard(tag)
+        self.filter_changed.emit(sorted(self._selected_tags))
 
     def _on_clear_filters(self):
         """Clear all tag filters."""
-        for checkbox in self.tag_checkboxes.values():
-            checkbox.setChecked(False)
+        if not self._selected_tags:
+            return
+        self._selected_tags.clear()
+        self._refresh_visible_tags()
+        self.filter_changed.emit([])
 
     def _on_sort_changed(self, text: str):
         """Handle sort mode change."""

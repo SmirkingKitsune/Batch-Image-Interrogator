@@ -568,6 +568,7 @@ class InterrogationTab(QWidget):
         # Initialize batch state
         self._batch_index = 0
         self._batch_size = 100  # Process 100 items per batch
+        self._last_progress_percent = -1
 
         # Clear and prepare queue for batch loading
         self.image_queue.clear()
@@ -615,10 +616,13 @@ class InterrogationTab(QWidget):
 
         self._batch_index = end_index
 
-        # Update progress bar and label
+        # Repaint progress only when the whole percentage moves, rather than
+        # once per fixed-size batch.
         percent = int((end_index / total) * 100)
-        self.progress_bar.setValue(end_index)
-        self.progress_label.setText(f"Loading {end_index}/{total} images ({percent}%)")
+        if percent != self._last_progress_percent or end_index >= total:
+            self._last_progress_percent = percent
+            self.progress_bar.setValue(end_index)
+            self.progress_label.setText(f"Loading {end_index}/{total} images ({percent}%)")
 
         # Schedule next batch or finish
         if self._batch_index < total:

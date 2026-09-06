@@ -14,6 +14,10 @@ from core import (
     FileManager, TagFilterSettings, DatabaseBusyError, DatabaseQueuedError
 )
 from core.base_interrogator import BaseInterrogator
+from ui.thumbnail_cache import ThumbnailCache
+
+# Shared by the gallery widget and the thumbnail worker.
+thumbnail_cache = ThumbnailCache()
 
 try:
     from tqdm.auto import tqdm
@@ -21,13 +25,27 @@ except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
 
-def decode_thumbnail(image_path: str, target_size: QSize) -> Optional[QImage]:
-    """Decode an image straight to thumbnail size.
+def decode_thumbnail(image_path: str, target_size: QSize,
+                     use_cache: bool = True) -> Optional[QImage]:
+    """Decode an image to thumbnail size, using the on-disk cache.
 
     Returns None when the file cannot be read. QImage is used rather than
     QPixmap so this is safe to call from a worker thread; only the GUI thread
     may build the QPixmap.
     """
+    if use_cache:
+        cached = thumbnail_cache.get(image_path, target_size)
+        if cached is not None:
+            return cached
+
+    image = _decode_thumbnail_uncached(image_path, target_size)
+    if image is not None and use_cache:
+        thumbnail_cache.store(image_path, target_size, image)
+    return image
+
+
+def _decode_thumbnail_uncached(image_path: str, target_size: QSize) -> Optional[QImage]:
+    """Decode an image straight to thumbnail size, bypassing the cache."""
     reader = QImageReader(image_path)
     scaled_size = reader.size()
     decoded_scaled = scaled_size.isValid()
@@ -78,6 +96,7 @@ class ThumbnailLoadWorker(QThread):
         total = len(self.image_paths)
         batch: List[Tuple[str, Optional[QImage]]] = []
         decoded = 0
+        last_percent = -1
 
         for image_path in self.image_paths:
             if self.is_cancelled:
@@ -88,8 +107,12 @@ class ThumbnailLoadWorker(QThread):
 
             if len(batch) >= self.BATCH_SIZE:
                 self.thumbnails_ready.emit(batch)
-                self.progress.emit(decoded, total)
                 batch = []
+                # Report only when the whole percentage moves.
+                percent = int((decoded / total) * 100) if total else 100
+                if percent != last_percent:
+                    last_percent = percent
+                    self.progress.emit(decoded, total)
 
         if batch:
             self.thumbnails_ready.emit(batch)
