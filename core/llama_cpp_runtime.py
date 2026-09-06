@@ -61,6 +61,16 @@ class LlamaCppRuntimeManager:
     _instance: Optional["LlamaCppRuntimeManager"] = None
     _instance_lock = threading.Lock()
 
+    # Log retention. llama-server inherits the log file descriptor and writes to
+    # it directly, so size is bounded here rather than by filtering the stream:
+    # routing stdout through a pipe would mean a stalled reader thread fills the
+    # 64 KiB pipe buffer and blocks inference itself.
+    LOG_KEEP_FILES = 5
+    LOG_KEEP_TOTAL_BYTES = 128 * 1024 * 1024
+    LOG_MAX_BYTES = 32 * 1024 * 1024
+    LOG_TAIL_BYTES = 4 * 1024 * 1024
+    LOG_CHECK_INTERVAL = 30.0
+
     def __init__(self):
         self._lock = threading.Lock()
         self._process: Optional[subprocess.Popen] = None
@@ -70,6 +80,8 @@ class LlamaCppRuntimeManager:
         self._base_url: Optional[str] = None
         self._ref_count = 0
         self._model_alias = "local-llama-cpp"
+        self._log_watchdog: Optional[threading.Thread] = None
+        self._log_watchdog_stop: Optional[threading.Event] = None
 
     @classmethod
     def get_instance(cls) -> "LlamaCppRuntimeManager":
@@ -149,10 +161,15 @@ class LlamaCppRuntimeManager:
             try:
                 log_dir = Path(__file__).resolve().parents[1] / "cache" / "llama_cpp" / "logs"
                 log_dir.mkdir(parents=True, exist_ok=True)
+                self._prune_logs(log_dir)
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 log_path = log_dir / f"llama-server-{resolved_port}-{timestamp}.log"
                 process_env = self._build_process_env(binary.parent)
-                self._log_handle = log_path.open("w", encoding="utf-8", errors="replace")
+                # Append mode, so the file descriptor the server inherits carries
+                # O_APPEND. That is what lets the watchdog truncate a runaway log
+                # without the next write landing at a stale offset and leaving a
+                # sparse file behind.
+                self._log_handle = log_path.open("a", encoding="utf-8", errors="replace")
                 self._log_handle.write(f"# Started at {datetime.now().isoformat()}\n")
                 self._log_handle.write("# Command:\n")
                 self._log_handle.write(" ".join(cmd) + "\n\n")
@@ -169,7 +186,9 @@ class LlamaCppRuntimeManager:
                     stdin=subprocess.DEVNULL,
                     env=process_env,
                 )
-            except OSError as exc:
+                self._start_log_watchdog(log_path)
+            except (OSError, RuntimeError) as exc:
+                self._stop_locked()
                 raise LlamaCppRuntimeError(f"Failed to start llama-server: {exc}") from exc
 
             self._config_key = config_key
@@ -180,6 +199,7 @@ class LlamaCppRuntimeManager:
                 if not self._is_process_running():
                     logs = self._read_recent_logs_from_path(self._log_file_path, max_lines=80)
                     details = f"\nRecent logs:\n{logs}" if logs else ""
+                    self._stop_locked()
                     raise LlamaCppRuntimeError(f"llama-server exited during startup{details}")
                 if self._check_health(base_url):
                     self._ref_count = 1
@@ -259,6 +279,140 @@ class LlamaCppRuntimeManager:
         raise LlamaCppRuntimeError(
             f"No available llama-server port found near {requested} on host {host}"
         )
+
+    @classmethod
+    def _prune_logs(cls, log_dir: Path) -> None:
+        """Delete old run logs that exceed the retention budget.
+
+        Called before a new log is opened, so the budget leaves room for the run
+        about to start. Failures are ignored: losing a diagnostic log is never a
+        reason to refuse to start the server.
+        """
+        try:
+            logs = sorted(
+                (
+                    path
+                    for path in log_dir.glob("llama-server-*.log")
+                    if path.is_file() and not path.is_symlink()
+                ),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return
+
+        # Reserve both one file slot and one full live-log allowance for the run
+        # that is about to start. Otherwise four 32 MiB historical logs plus a
+        # new 32 MiB log can exceed the advertised 128 MiB total budget.
+        keep_files = max(0, cls.LOG_KEEP_FILES - 1)
+        keep_bytes = max(0, cls.LOG_KEEP_TOTAL_BYTES - cls.LOG_MAX_BYTES)
+        kept_bytes = 0
+        budget_exhausted = False
+        for index, path in enumerate(logs):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+
+            # A previous unclean shutdown may have left an uncapped log. Keep
+            # its useful tail before applying the historical-log budget.
+            if size > cls.LOG_MAX_BYTES:
+                cls._truncate_log(path)
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+
+            if (
+                not budget_exhausted
+                and index < keep_files
+                and kept_bytes + size <= keep_bytes
+            ):
+                kept_bytes += size
+                continue
+            budget_exhausted = True
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def _start_log_watchdog(self, log_path: Path) -> None:
+        """Begin bounding the size of the live log."""
+        self._stop_log_watchdog()
+        stop_event = threading.Event()
+        watchdog = threading.Thread(
+            target=self._watch_log_size,
+            args=(log_path, stop_event),
+            name="llama-log-watchdog",
+            daemon=True,
+        )
+        self._log_watchdog_stop = stop_event
+        try:
+            watchdog.start()
+        except RuntimeError:
+            self._log_watchdog_stop = None
+            raise
+        self._log_watchdog = watchdog
+
+    def _stop_log_watchdog(self) -> None:
+        """Signal the watchdog to exit. Safe to call when none is running."""
+        watchdog = self._log_watchdog
+        stop_event = self._log_watchdog_stop
+        if stop_event is not None:
+            stop_event.set()
+        if (
+            watchdog is not None
+            and watchdog is not threading.current_thread()
+            and watchdog.is_alive()
+        ):
+            watchdog.join(timeout=5)
+        self._log_watchdog = None
+        self._log_watchdog_stop = None
+
+    def _watch_log_size(self, log_path: Path, stop_event: threading.Event) -> None:
+        """Truncate the live log whenever it outgrows its cap."""
+        while not stop_event.wait(self.LOG_CHECK_INTERVAL):
+            try:
+                if log_path.stat().st_size > self.LOG_MAX_BYTES:
+                    self._truncate_log(log_path)
+            except OSError:
+                return
+
+    @classmethod
+    def _truncate_log(cls, log_path: Path) -> None:
+        """Drop the head of an oversized live log, keeping the recent tail.
+
+        The server holds this file open in append mode, so truncating to zero
+        and writing the tail back is safe: every subsequent write still lands at
+        the new end of file. Lines written by the server during the swap can be
+        lost, which is the deliberate trade for keeping a runaway log bounded.
+        Only the tail is ever read back (see `_read_recent_logs_from_path`).
+        """
+        try:
+            with log_path.open("rb") as handle:
+                handle.seek(-cls.LOG_TAIL_BYTES, os.SEEK_END)
+                tail = handle.read()
+        except OSError:
+            return
+
+        # The tail almost certainly starts mid-line; drop the partial one.
+        newline = tail.find(b"\n")
+        if newline != -1:
+            tail = tail[newline + 1:]
+
+        marker = (
+            f"# [log truncated at {datetime.now().isoformat(timespec='seconds')}; "
+            f"kept trailing {len(tail)} bytes]\n"
+        ).encode("utf-8")
+        try:
+            os.truncate(log_path, 0)
+            with log_path.open("ab") as handle:
+                handle.write(marker)
+                handle.write(tail)
+        except OSError:
+            # Windows can refuse truncation while the server holds the file
+            # open. Leaving the log oversized beats interrupting inference.
+            return
 
     @staticmethod
     def _read_recent_logs_from_path(log_path: Optional[str], max_lines: int = 120) -> str:
@@ -397,6 +551,10 @@ class LlamaCppRuntimeManager:
 
     def _stop_locked(self) -> None:
         """Stop process and clear runtime state. Must be called under lock."""
+        # Before the process, so the watchdog cannot truncate a log belonging to
+        # the next run. It never takes self._lock, so signalling it here is safe.
+        self._stop_log_watchdog()
+
         if self._process and self._process.poll() is None:
             self._process.terminate()
             try:

@@ -722,6 +722,8 @@ Before compiling, the provisioner verifies `git`, `cmake`, a C++ compiler, and `
 
 The managed provisioning design is ported from [Mantic-Mind's llama.cpp provisioner](https://github.com/SmirkingKitsune/Mantic-Mind). DGX Spark build details also follow [NVIDIA's llama.cpp walkthrough](https://build.nvidia.com/spark/llama-cpp/instructions).
 
+Runtime diagnostics are written to `cache/llama_cpp/logs`. The manager keeps at most five `llama-server` run logs within a 128 MiB total budget. A live log is trimmed to its most recent 4 MiB whenever it grows beyond 32 MiB; provisioning logs are kept separately.
+
 #### Verification
 
 After setup (without building ONNX Runtime):
