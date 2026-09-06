@@ -491,7 +491,11 @@ class MainWindow(QMainWindow):
             self.inquiry_tab.current_interrogator.unload_model()
         if self.current_interrogator:
             self.current_interrogator.unload_model()
-        
+
+        # Stop background thumbnail decoding before the widgets go away.
+        if hasattr(self, "gallery_tab") and self.gallery_tab:
+            self.gallery_tab._stop_thumbnail_worker()
+
         if self.database:
             self.database.close()
         

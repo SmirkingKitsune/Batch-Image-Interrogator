@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
                              QGroupBox, QLabel, QPushButton, QComboBox,
                              QLineEdit, QCheckBox, QScrollArea, QFrame,
                              QTabWidget, QSlider, QMessageBox)
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap
 from pathlib import Path
 from typing import Dict, Optional, List
@@ -13,6 +13,7 @@ from datetime import datetime
 from core import InterrogationDatabase, FileManager
 from core.hashing import hash_image_content
 from ui.widgets import ImageGalleryWidget, TagEditorWidget, ResultsTableWidget
+from ui.workers import ThumbnailLoadWorker
 from ui.dialogs import OrganizeDialog
 from ui.dialogs_advanced import AdvancedImageInspectionDialog
 
@@ -409,6 +410,15 @@ class GalleryTab(QWidget):
             'show': 'all'
         }
 
+        # Tag-count state, so a single tag save does not have to re-read every
+        # sidecar in the directory. _image_tags is None until first counted.
+        self._tag_counts = {}
+        self._image_tags = None
+        self._tag_pool = {}
+
+        # Background thumbnail decoding for the current gallery contents.
+        self._thumbnail_worker = None
+
         # Setup UI
         self.setup_ui()
         self.setup_connections()
@@ -583,12 +593,57 @@ class GalleryTab(QWidget):
 
         # Collect all tags from all images in directory
         tag_counts = {}
+        image_tags = {}
+        pool = {}
         for image_path in self.all_images:
-            tags = FileManager.read_tags_from_file(Path(image_path))
+            # Pooling the tag strings keeps the per-image cache proportional to
+            # the number of distinct tags rather than to total tag occurrences.
+            tags = tuple(
+                pool.setdefault(tag, tag)
+                for tag in FileManager.read_tags_from_file(Path(image_path))
+            )
+            image_tags[image_path] = tags
             for tag in tags:
                 tag_counts[tag] = tag_counts.get(tag, 0) + 1
 
+        self._tag_counts = tag_counts
+        self._image_tags = image_tags
+        self._tag_pool = pool
         self.tag_filter.update_tag_list(tag_counts)
+
+    def _update_tag_filter_for(self, image_paths: List[str]):
+        """Adjust tag counts for images whose sidecars just changed.
+
+        Re-reading every sidecar in the directory is the dominant cost of
+        saving tags, and it scales with the gallery rather than with the number
+        of images actually edited.
+        """
+        if not self.current_directory:
+            return
+
+        if self._image_tags is None:
+            # Nothing counted yet, so there is no baseline to adjust.
+            self._update_tag_filter()
+            return
+
+        counts = self._tag_counts
+        for image_path in image_paths:
+            for tag in self._image_tags.get(image_path, ()):
+                remaining = counts.get(tag, 0) - 1
+                if remaining > 0:
+                    counts[tag] = remaining
+                else:
+                    counts.pop(tag, None)
+
+            tags = tuple(
+                self._tag_pool.setdefault(tag, tag)
+                for tag in FileManager.read_tags_from_file(Path(image_path))
+            )
+            self._image_tags[image_path] = tags
+            for tag in tags:
+                counts[tag] = counts.get(tag, 0) + 1
+
+        self.tag_filter.update_tag_list(counts)
 
     def _apply_filters(self):
         """Apply current filters and update gallery display."""
@@ -631,57 +686,67 @@ class GalleryTab(QWidget):
         return images
 
     def _update_gallery_display(self):
-        """Update the gallery widget with filtered images - start batched loading."""
+        """Populate the gallery, then decode its thumbnails in the background."""
+        self._stop_thumbnail_worker()
         self.image_gallery.clear_gallery()
-
-        # Store batch loading ID to detect stale batches
-        self._gallery_batch_id = id(self.filtered_images)
-
-        # Initialize batch state
-        self._gallery_batch_index = 0
-        self._gallery_batch_size = 50  # Smaller batches since image loading is expensive
-
-        total = len(self.filtered_images)
-        if total > 0:
-            self.image_gallery.setUpdatesEnabled(False)
-            self.image_count_label.setText(f"Loading 0/{total} images (0%)")
-            # Start batch processing
-            QTimer.singleShot(0, self._add_gallery_batch)
-        else:
-            self.image_count_label.setText("0 images")
-
-    def _add_gallery_batch(self):
-        """Add a batch of images to the gallery, then schedule next batch."""
-        # Check if this batch is stale (filters changed during loading)
-        if not hasattr(self, '_gallery_batch_id') or self._gallery_batch_id != id(self.filtered_images):
-            return
 
         images = self.filtered_images
         total = len(images)
-        end_index = min(self._gallery_batch_index + self._gallery_batch_size, total)
+        if total == 0:
+            self.image_count_label.setText("0 images")
+            return
 
-        # Add batch of images
-        for i in range(self._gallery_batch_index, end_index):
-            image_path = images[i]
-            has_tags = FileManager.has_text_file(Path(image_path))
-            self.image_gallery.add_image(image_path, has_tags)
-
-        self._gallery_batch_index = end_index
-
-        # Update progress with percentage
-        percent = int((end_index / total) * 100)
-        self.image_count_label.setText(f"Loading {end_index}/{total} images ({percent}%)")
-
-        # Schedule next batch or finish
-        if self._gallery_batch_index < total:
-            QTimer.singleShot(0, self._add_gallery_batch)
-        else:
-            self._finish_gallery_display()
-
-    def _finish_gallery_display(self):
-        """Complete gallery display after all batches processed."""
+        # Items are cheap to create, so add them all up front. The gallery is
+        # scrollable straight away and thumbnails fill in as they arrive.
+        self.image_gallery.setUpdatesEnabled(False)
+        for image_path in images:
+            self.image_gallery.add_image_placeholder(
+                image_path,
+                FileManager.has_text_file(Path(image_path))
+            )
         self.image_gallery.setUpdatesEnabled(True)
-        self.image_count_label.setText(f"{len(self.filtered_images)} images")
+
+        self.image_count_label.setText(f"{total} images (loading thumbnails...)")
+        self._start_thumbnail_worker(images)
+
+    def _start_thumbnail_worker(self, image_paths: List[str]):
+        """Decode thumbnails for the current gallery off the GUI thread."""
+        worker = ThumbnailLoadWorker(image_paths, ImageGalleryWidget.THUMBNAIL_SIZE)
+        worker.thumbnails_ready.connect(self._on_thumbnails_ready)
+        worker.progress.connect(self._on_thumbnail_progress)
+        self._thumbnail_worker = worker
+        worker.start()
+
+    def _stop_thumbnail_worker(self):
+        """Cancel any in-flight thumbnail decoding and wait for it to stop."""
+        worker = self._thumbnail_worker
+        self._thumbnail_worker = None
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            worker.wait(5000)
+
+    def _on_thumbnails_ready(self, thumbnails: List[tuple]):
+        """Attach a batch of decoded thumbnails to their gallery items."""
+        if self.sender() is not self._thumbnail_worker:
+            return  # Results from a load that has since been superseded.
+        for image_path, image in thumbnails:
+            if image is None:
+                # Unreadable file; drop it rather than leave a blank tile.
+                self.image_gallery.remove_image(image_path)
+            else:
+                self.image_gallery.set_thumbnail(image_path, image)
+
+    def _on_thumbnail_progress(self, decoded: int, total: int):
+        """Show thumbnail decoding progress in the image count label."""
+        if self.sender() is not self._thumbnail_worker:
+            return
+        if decoded >= total:
+            self.image_count_label.setText(f"{total} images")
+        else:
+            percent = int((decoded / total) * 100)
+            self.image_count_label.setText(
+                f"{total} images (loading thumbnails {percent}%)"
+            )
 
     def _on_filter_changed(self, selected_tags: List[str]):
         """Handle tag filter change."""
@@ -746,7 +811,7 @@ class GalleryTab(QWidget):
             self.image_gallery.update_image_status(self.current_image, len(tags) > 0)
 
             # Update tag filter counts
-            self._update_tag_filter()
+            self._update_tag_filter_for([self.current_image])
 
             # Emit signal
             self.tags_saved.emit(self.current_image, tags)
@@ -795,7 +860,7 @@ class GalleryTab(QWidget):
         self.image_gallery.update_image_status(image_path, len(tags) > 0)
 
         # Update tag filter counts
-        self._update_tag_filter()
+        self._update_tag_filter_for([image_path])
 
         # If it's the current image, refresh the display
         if self.current_image == image_path:
@@ -888,8 +953,8 @@ class GalleryTab(QWidget):
         for image_path, tags in saved_results:
             self.image_gallery.update_image_status(image_path, len(tags) > 0)
 
-        # Update tag filter counts ONCE (expensive operation)
-        self._update_tag_filter()
+        # Update tag filter counts for just the images that changed
+        self._update_tag_filter_for([path for path, _tags in saved_results])
 
         # If current image was in the batch, refresh its display
         if self.current_image:
