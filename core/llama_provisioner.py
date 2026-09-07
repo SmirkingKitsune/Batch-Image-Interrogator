@@ -600,6 +600,155 @@ def select_release_candidate(
 
 
 # ---------------------------------------------------------------------------
+# Update checking
+# ---------------------------------------------------------------------------
+
+BUILD_TAG_RE = re.compile(r"\bb(\d+)\b", re.IGNORECASE)
+
+
+def release_build_number(text: str) -> Optional[int]:
+    """The `bNNNN` build number in a tag or version string, if there is one."""
+    match = BUILD_TAG_RE.search(text or "")
+    return int(match.group(1)) if match else None
+
+
+def installed_version_is_current(installed: str, latest_tag: str) -> bool:
+    """Whether an installed runtime is already at least as new as `latest_tag`.
+
+    Upstream tags are `bNNNN`, and the recorded version varies by install
+    method: a release stores the tag, while a source build stores a
+    `git describe` such as `b10828-2-g465e49b9c`. Comparing build numbers
+    rather than strings matters for the source case, where a build from master
+    is routinely *ahead* of the newest tagged release — string inequality alone
+    would report an update forever.
+    """
+    if not installed or not latest_tag:
+        return False
+
+    latest_build = release_build_number(latest_tag)
+    installed_build = release_build_number(installed)
+    if latest_build is not None and installed_build is not None:
+        return installed_build >= latest_build
+    return installed.strip() == latest_tag.strip()
+
+
+@dataclass
+class UpdateStatus:
+    """Result of an update check."""
+
+    current_version: str = ""
+    latest_version: str = ""
+    update_available: bool = False
+    # release: a matched asset exists. compile: a source rebuild is required.
+    # unavailable: no asset, and the configured method forbids compiling.
+    action: str = ""
+    warning: str = ""
+    release_alternatives: List[str] = field(default_factory=list)
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+
+def check_for_update(
+    cfg: ProvisionConfig,
+    installed_version: str,
+    timeout: float = 30.0,
+) -> UpdateStatus:
+    """Ask upstream whether a newer llama.cpp runtime exists for this host.
+
+    Reports not just *that* an update exists but what taking it would cost:
+    downloading a release is a minute, recompiling is twenty. The two are worth
+    distinguishing before the user commits to one.
+    """
+    cfg = cfg.normalized()
+    status = UpdateStatus(current_version=installed_version)
+
+    try:
+        releases = fetch_releases("latest", timeout)
+    except Exception as exc:
+        status.error = f"Could not reach the llama.cpp release API: {exc}"
+        return status
+    if not releases:
+        status.error = "GitHub returned no llama.cpp releases"
+        return status
+
+    # The API collection currently puts a metadata-only stable release ahead
+    # of the nightly bNNNN builds that contain llama-server. Update currency is
+    # defined by those build tags, just like provisioning, so skip unrelated
+    # release entries rather than comparing a bNNNN install with e.g. v0.4.0.
+    newest = next(
+        (
+            release
+            for release in releases
+            if release_build_number(str(release.get("tag_name", ""))) is not None
+        ),
+        None,
+    )
+    if newest is None:
+        status.error = "GitHub returned no tagged llama.cpp runtime builds"
+        return status
+    status.latest_version = str(newest.get("tag_name", "")).strip()
+
+    if installed_version_is_current(installed_version, status.latest_version):
+        return status
+
+    status.update_available = True
+    asset_names = [str(asset.get("name", "")) for asset in newest.get("assets") or []]
+    available = release_accelerators(asset_names, cfg)
+    status.release_alternatives = [a for a in available if a != cfg.accelerator]
+
+    try:
+        select_release_assets(
+            asset_names,
+            cfg,
+            detect_driver_cuda_version() if cfg.accelerator == "cuda" else None,
+        )
+        matched_release = True
+    except ProvisionError:
+        # A backend name in the asset list is not sufficient on its own. CUDA
+        # releases must also fit the installed driver (and Windows builds need
+        # their matching cudart archive), exactly as provisioning requires.
+        matched_release = False
+
+    release_present = cfg.accelerator in available
+    if matched_release and cfg.install_method != "source":
+        status.action = "release"
+    elif cfg.install_method == "release":
+        status.action = "unavailable"
+        reason = "No compatible official" if release_present else "No official"
+        status.warning = (
+            f"{reason} {cfg.platform}/{cfg.arch}/{cfg.accelerator} asset exists for "
+            f"{status.latest_version}, and the install method is restricted to releases."
+        )
+    else:
+        status.action = "compile"
+        if cfg.install_method == "source":
+            reason = "This runtime was installed from source."
+        elif release_present:
+            reason = (
+                f"No official {cfg.platform}/{cfg.arch}/{cfg.accelerator} asset for "
+                f"{status.latest_version} is compatible with this system."
+            )
+        else:
+            reason = (
+                f"No official {cfg.platform}/{cfg.arch}/{cfg.accelerator} asset exists for "
+                f"{status.latest_version}."
+            )
+        status.warning = (
+            f"{reason} Updating will compile llama-server from source, "
+            "which can take several minutes."
+        )
+
+    if status.release_alternatives and not release_present:
+        status.warning += (
+            f" Official releases do exist for: {', '.join(status.release_alternatives)}."
+        )
+    return status
+
+
+# ---------------------------------------------------------------------------
 # Install steps
 # ---------------------------------------------------------------------------
 

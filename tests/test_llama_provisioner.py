@@ -7,6 +7,7 @@ a toolchain, a GPU, or network access.
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -19,11 +20,14 @@ from core.llama_provisioner import (  # noqa: E402
     choose_cuda_release,
     cuda_arch_targets,
     cuda_cmake_architectures,
+    check_for_update,
     cuda_feature_target,
+    installed_version_is_current,
     nvcc_supports_arch,
     parse_progress_fraction,
     read_active_runtime,
     release_accelerators,
+    release_build_number,
     release_asset_patterns,
     select_release_candidate,
     select_release_assets,
@@ -329,6 +333,149 @@ class TestActiveRuntimeState(unittest.TestCase):
             active = read_active_runtime(Path(tmp))
             self.assertEqual(active["version"], "b9082 (source build)")
             self.assertEqual(active["method"], "legacy")
+
+
+class TestVersionCurrency(unittest.TestCase):
+    """Whether an installed runtime is already at least as new as a tag."""
+
+    def test_exact_release_tag_is_current(self):
+        self.assertTrue(installed_version_is_current("b10850", "b10850"))
+
+    def test_source_build_containing_the_tag_is_current(self):
+        self.assertTrue(
+            installed_version_is_current("b10850-0-gabc1234 (source, cuda)", "b10850")
+        )
+
+    def test_older_source_build_is_not_current(self):
+        self.assertFalse(
+            installed_version_is_current("b10828-2-g465e49b9c (source, cuda)", "b10850")
+        )
+
+    def test_source_build_ahead_of_the_newest_tag_is_current(self):
+        """A build from master routinely outruns the newest tagged release.
+
+        String inequality alone would report an update available forever, and
+        each "update" would recompile to something older.
+        """
+        self.assertTrue(
+            installed_version_is_current("b10900-5-gabcdef0 (source, cuda)", "b10850")
+        )
+
+    def test_unparseable_version_is_not_assumed_current(self):
+        self.assertFalse(installed_version_is_current("some-custom-build", "b10850"))
+
+    def test_build_tag_prefix_is_not_assumed_current(self):
+        self.assertFalse(installed_version_is_current("b1085", "b10850"))
+
+    def test_matching_unparseable_versions_are_current(self):
+        self.assertTrue(installed_version_is_current("custom-release", "custom-release"))
+
+    def test_missing_inputs_are_not_current(self):
+        self.assertFalse(installed_version_is_current("", "b10850"))
+        self.assertFalse(installed_version_is_current("b10850", ""))
+
+    def test_build_number_extraction(self):
+        self.assertEqual(release_build_number("b10828-2-g465e49b9c"), 10828)
+        self.assertEqual(release_build_number("b10850"), 10850)
+        self.assertIsNone(release_build_number("no-build-number-here"))
+
+
+class TestUpdateCheck(unittest.TestCase):
+    """check_for_update reports the cost of an update, not just its existence."""
+
+    # Mirrors what upstream actually publishes: x64 gets a CUDA archive,
+    # arm64 gets CPU and Vulkan but never CUDA.
+    ASSETS = [
+        {"name": "llama-b10850-bin-ubuntu-x64.tar.gz"},
+        {"name": "llama-b10850-bin-ubuntu-vulkan-x64.tar.gz"},
+        {"name": "llama-b10850-bin-ubuntu-cuda-12.4-x64.tar.gz"},
+        {"name": "llama-b10850-bin-ubuntu-arm64.tar.gz"},
+        {"name": "llama-b10850-bin-ubuntu-vulkan-arm64.tar.gz"},
+    ]
+
+    def _check(self, cfg, installed, releases=None):
+        payload = releases if releases is not None else [
+            {"tag_name": "b10850", "assets": self.ASSETS}
+        ]
+        with patch("core.llama_provisioner.fetch_releases", return_value=payload):
+            return check_for_update(cfg, installed)
+
+    def test_current_runtime_reports_no_update(self):
+        status = self._check(config(accelerator="cuda"), "b10850")
+        self.assertFalse(status.update_available)
+        self.assertEqual(status.latest_version, "b10850")
+        self.assertTrue(status.ok)
+
+    def test_published_backend_updates_via_release(self):
+        status = self._check(config(accelerator="cuda"), "b10800")
+        self.assertTrue(status.update_available)
+        self.assertEqual(status.action, "release")
+        self.assertEqual(status.warning, "")
+
+    def test_unpublished_backend_requires_a_rebuild_and_says_so(self):
+        # The DGX Spark case: an update exists but costs twenty minutes.
+        status = self._check(config(arch="arm64", accelerator="cuda"), "b10800")
+        self.assertTrue(status.update_available)
+        self.assertEqual(status.action, "compile")
+        self.assertIn("compile llama-server from source", status.warning)
+
+    def test_release_only_method_reports_an_unavailable_update(self):
+        status = self._check(
+            config(arch="arm64", accelerator="cuda", install_method="release"), "b10800"
+        )
+        self.assertEqual(status.action, "unavailable")
+        self.assertIn("restricted to releases", status.warning)
+
+    def test_alternatives_are_offered_when_the_target_has_no_release(self):
+        status = self._check(config(arch="arm64", accelerator="cuda"), "b10800")
+        self.assertIn("cpu", status.release_alternatives)
+        self.assertIn("Official releases do exist", status.warning)
+
+    def test_source_install_method_always_compiles(self):
+        # Even where a release exists: switching a source install to a release
+        # binary silently discards a build tuned for this machine.
+        status = self._check(config(accelerator="cuda", install_method="source"), "b10800")
+        self.assertEqual(status.action, "compile")
+
+    def test_cuda_release_too_new_for_driver_requires_compile(self):
+        with patch(
+            "core.llama_provisioner.detect_driver_cuda_version",
+            return_value=(11, 8),
+        ):
+            status = self._check(config(accelerator="cuda"), "b10800")
+        self.assertEqual(status.action, "compile")
+        self.assertIn("compile llama-server from source", status.warning)
+
+    def test_network_failure_is_reported_not_raised(self):
+        with patch("core.llama_provisioner.fetch_releases", side_effect=OSError("no route to host")):
+            status = check_for_update(config(accelerator="cuda"), "b10800")
+        self.assertFalse(status.ok)
+        self.assertIn("no route to host", status.error)
+        self.assertFalse(status.update_available)
+
+    def test_empty_release_list_is_an_error_not_an_update(self):
+        status = self._check(config(accelerator="cuda"), "b10800", releases=[])
+        self.assertFalse(status.ok)
+        self.assertFalse(status.update_available)
+
+    def test_metadata_only_release_is_skipped(self):
+        status = self._check(
+            config(accelerator="cuda"),
+            "b10800",
+            releases=[
+                {"tag_name": "v0.4.0", "assets": []},
+                {"tag_name": "b10850", "assets": self.ASSETS},
+            ],
+        )
+        self.assertTrue(status.ok)
+        self.assertEqual(status.latest_version, "b10850")
+        self.assertEqual(status.action, "release")
+
+    def test_release_list_without_a_build_tag_is_an_error(self):
+        status = self._check(
+            config(accelerator="cuda"), "b10800", releases=[{"tag_name": "", "assets": []}]
+        )
+        self.assertFalse(status.ok)
 
 
 class TestProgressParsing(unittest.TestCase):

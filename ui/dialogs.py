@@ -23,6 +23,11 @@ from core.llama_provisioner import (
     detect_cuda_arch,
     read_active_runtime,
 )
+from ui.llama_runtime import (
+    RUNTIME_MODE_CUSTOM,
+    LlamaRuntimeCard,
+    runtime_mode,
+)
 from ui.workers import LlamaProvisionWorker, OrganizationWorker
 
 logger = logging.getLogger(__name__)
@@ -894,11 +899,19 @@ class LlamaProvisionDialog(QDialog):
 
 def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     """
-    Create llama.cpp multimodal configuration widget.
+    Create the llama.cpp configuration widget for the Inquiry tab.
+
+    Grouped into Runtime, Model, and Inference rather than one flat form,
+    because the three have very different lifetimes: the runtime is installed
+    once, the model changes occasionally, and the inference parameters are
+    tuned constantly. A flat list gave them all equal weight and made the
+    engine look like just another path to fill in.
 
     Returns:
         Tuple of (widget, references_dict) where references_dict contains:
         {
+            'runtime_card': LlamaRuntimeCard,
+            'custom_binary_check': QCheckBox,
             'binary_path_edit': QLineEdit,
             'model_path_edit': QLineEdit,
             'mmproj_path_edit': QLineEdit,
@@ -911,39 +924,56 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     """
     widget = QWidget(parent)
     layout = QVBoxLayout(widget)
-    form_layout = QFormLayout()
+    layout.setContentsMargins(0, 0, 0, 0)
 
     def _browse_path(line_edit: QLineEdit, title: str):
         path, _ = QFileDialog.getOpenFileName(parent, title, str(Path.home()))
         if path:
             line_edit.setText(path)
 
+    # ---- Runtime -----------------------------------------------------------
+    runtime_card = LlamaRuntimeCard(parent=widget)
+
+    custom_binary_check = QCheckBox("Use a custom llama-server binary")
+    custom_binary_check.setToolTip(
+        "Point at a llama-server you built or installed yourself. The managed "
+        "runtime is used otherwise, and stays current through Install/Update."
+    )
+
     binary_path_edit = QLineEdit(llama_config.get("llama_binary_path", ""))
-    binary_layout = QHBoxLayout()
-    binary_layout.addWidget(binary_path_edit)
-    binary_btn = QPushButton("Browse...")
-    binary_btn.clicked.connect(
+    binary_browse_btn = QPushButton("Browse...")
+    binary_browse_btn.clicked.connect(
         lambda: _browse_path(binary_path_edit, "Select llama-server binary")
     )
-    binary_layout.addWidget(binary_btn)
+    custom_row = QWidget()
+    custom_layout = QHBoxLayout(custom_row)
+    custom_layout.setContentsMargins(0, 0, 0, 0)
+    custom_layout.addWidget(QLabel("Path:"))
+    custom_layout.addWidget(binary_path_edit)
+    custom_layout.addWidget(binary_browse_btn)
 
-    provision_btn = QPushButton("Provision...")
-    provision_btn.setToolTip(
-        "Download a matched llama.cpp release, or build one from source for "
-        "platforms with no published binary."
-    )
+    def _apply_runtime_mode():
+        use_custom = custom_binary_check.isChecked()
+        custom_row.setVisible(use_custom)
+        # The card describes the managed runtime, which is not what will launch
+        # while a custom binary is selected.
+        runtime_card.setEnabled(not use_custom)
 
-    def _provision():
-        dialog = LlamaProvisionDialog(parent)
-        if dialog.exec() and dialog.installed_path:
-            binary_path_edit.setText(dialog.installed_path)
+    custom_binary_check.toggled.connect(lambda _: _apply_runtime_mode())
+    custom_binary_check.setChecked(runtime_mode(llama_config) == RUNTIME_MODE_CUSTOM)
+    _apply_runtime_mode()
 
-    provision_btn.clicked.connect(_provision)
-    binary_layout.addWidget(provision_btn)
+    runtime_group = QGroupBox("Runtime")
+    runtime_layout = QVBoxLayout()
+    runtime_layout.addWidget(runtime_card)
+    runtime_layout.addWidget(custom_binary_check)
+    runtime_layout.addWidget(custom_row)
+    runtime_group.setLayout(runtime_layout)
+    layout.addWidget(runtime_group)
 
-    binary_widget = QWidget()
-    binary_widget.setLayout(binary_layout)
-    form_layout.addRow("llama-server Path:", binary_widget)
+    # ---- Model -------------------------------------------------------------
+    model_group = QGroupBox("Model")
+    model_form = QFormLayout()
 
     model_path_edit = QLineEdit(llama_config.get("llama_model_path", ""))
     model_layout = QHBoxLayout()
@@ -954,7 +984,7 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     model_layout.addWidget(model_metadata_btn)
     model_widget = QWidget()
     model_widget.setLayout(model_layout)
-    form_layout.addRow("Model Path (required):", model_widget)
+    model_form.addRow("Model Path (required):", model_widget)
 
     mmproj_path_edit = QLineEdit(llama_config.get("llama_mmproj_path", "") or "")
     mmproj_layout = QHBoxLayout()
@@ -966,37 +996,62 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     mmproj_layout.addWidget(mmproj_btn)
     mmproj_widget = QWidget()
     mmproj_widget.setLayout(mmproj_layout)
-    form_layout.addRow("MMProj Path (optional):", mmproj_widget)
+    model_form.addRow("MMProj Path (optional):", mmproj_widget)
+
+    metadata_status_label = QLabel("")
+    metadata_status_label.setWordWrap(True)
+    model_form.addRow("Model Metadata:", metadata_status_label)
+
+    # These hold long absolute paths that the field shows only the tail of.
+    for path_edit in (model_path_edit, mmproj_path_edit, binary_path_edit):
+        path_edit.setToolTip(path_edit.text())
+        path_edit.textChanged.connect(
+            lambda text, edit=path_edit: edit.setToolTip(text)
+        )
+
+    model_group.setLayout(model_form)
+    layout.addWidget(model_group)
+
+    # ---- Inference ---------------------------------------------------------
+    inference_group = QGroupBox("Inference")
+    inference_form = QFormLayout()
 
     ctx_size_spin = QSpinBox()
     ctx_size_spin.setRange(256, 131072)
     ctx_size_spin.setSingleStep(512)
     default_ctx_size = int(llama_config.get("ctx_size", 8192))
     ctx_size_spin.setValue(default_ctx_size)
-    form_layout.addRow("Context Size:", ctx_size_spin)
+    inference_form.addRow("Context Size:", ctx_size_spin)
 
     gpu_layers_spin = QSpinBox()
     gpu_layers_spin.setRange(-1, 999)
     gpu_layers_spin.setValue(int(llama_config.get("gpu_layers", -1)))
-    form_layout.addRow("GPU Layers:", gpu_layers_spin)
+    gpu_layers_spin.setToolTip("-1 offloads every layer the runtime can fit on the GPU.")
+    inference_form.addRow("GPU Layers:", gpu_layers_spin)
 
     temperature_spin = QDoubleSpinBox()
     temperature_spin.setRange(0.0, 2.0)
     temperature_spin.setSingleStep(0.05)
     temperature_spin.setDecimals(2)
     temperature_spin.setValue(float(llama_config.get("temperature", 0.0)))
-    form_layout.addRow("Temperature:", temperature_spin)
+    inference_form.addRow("Temperature:", temperature_spin)
 
     max_tokens_spin = QSpinBox()
     max_tokens_spin.setRange(16, 131072)
     max_tokens_spin.setSingleStep(32)
     max_tokens_spin.setValue(int(llama_config.get("max_tokens", default_ctx_size)))
-    form_layout.addRow("Max Tokens:", max_tokens_spin)
+    inference_form.addRow("Max Tokens:", max_tokens_spin)
 
-    metadata_status_label = QLabel("")
-    metadata_status_label.setWordWrap(True)
-    form_layout.addRow("Model Metadata:", metadata_status_label)
+    server_port_spin = QSpinBox()
+    server_port_spin.setRange(1024, 65535)
+    server_port_spin.setValue(int(llama_config.get("server_port", 8080)))
+    server_port_spin.setToolTip("Reassigned automatically when the port is already in use.")
+    inference_form.addRow("Server Port:", server_port_spin)
 
+    inference_group.setLayout(inference_form)
+    layout.addWidget(inference_group)
+
+    # ---- Model metadata wiring --------------------------------------------
     def _apply_model_metadata():
         model_path = model_path_edit.text().strip()
         if not model_path:
@@ -1032,27 +1087,21 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     model_metadata_btn.clicked.connect(_apply_model_metadata)
     model_path_edit.editingFinished.connect(_apply_model_metadata)
 
-    server_port_spin = QSpinBox()
-    server_port_spin.setRange(1024, 65535)
-    server_port_spin.setValue(int(llama_config.get("server_port", 8080)))
-    form_layout.addRow("Server Port:", server_port_spin)
+    # ---- Provisioning ------------------------------------------------------
+    def _provision():
+        dialog = LlamaProvisionDialog(parent)
+        dialog.exec()
+        # Refresh regardless of the result: a cancelled or failed run can still
+        # have replaced the runtime on an earlier rung of the ladder.
+        runtime_card.refresh()
 
-    layout.addLayout(form_layout)
-
-    desc_group = QGroupBox("llama.cpp Notes")
-    desc_layout = QVBoxLayout()
-    desc_layout.addWidget(QLabel(
-        "Provision... installs a matched llama.cpp release, and falls back to a source\n"
-        "build for platforms with no published binary (notably Linux CUDA, including aarch64).\n"
-        "Package manager builds (brew/nix/winget) may not include CUDA support.\n"
-        "Model path is required; mmproj path is optional and model-dependent."
-    ))
-    desc_group.setLayout(desc_layout)
-    layout.addWidget(desc_group)
+    runtime_card.provision_requested.connect(_provision)
 
     layout.addStretch()
 
     references = {
+        "runtime_card": runtime_card,
+        "custom_binary_check": custom_binary_check,
         "binary_path_edit": binary_path_edit,
         "model_path_edit": model_path_edit,
         "mmproj_path_edit": mmproj_path_edit,
@@ -1063,7 +1112,6 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
         "server_port_spin": server_port_spin,
     }
     return widget, references
-  
 
 class ModelConfigDialog(QDialog):
     """Unified configuration dialog for CLIP and WD models with tabs."""
