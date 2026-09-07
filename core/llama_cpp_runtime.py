@@ -23,6 +23,15 @@ class LlamaCppRuntimeError(RuntimeError):
     """Raised when llama.cpp runtime operations fail."""
 
 
+def _absolute_keep_symlinks(path: str) -> Path:
+    """Absolute, lexically normalized, with symlinks left intact.
+
+    `Path.resolve()` would also follow them, which destroys the filename a
+    split GGUF is located by.
+    """
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
 def is_llama_timeout_error(value: Any) -> bool:
     """Return True when error content indicates a request timeout."""
     stack: List[Any] = [value]
@@ -112,9 +121,16 @@ class LlamaCppRuntimeManager:
         Returns:
             Base URL for OpenAI-compatible server endpoint.
         """
+        # Model paths are normalized WITHOUT following symlinks. llama.cpp finds
+        # the remaining parts of a split GGUF by pattern-matching the filename it
+        # is given, and a HuggingFace snapshot entry is a symlink to an opaque
+        # content-addressed blob: resolving it renames
+        # `Model-00001-of-00002.gguf` to a sha256 and the load fails with
+        # "invalid split file name". The binary is still fully resolved, where
+        # following symlinks is harmless and locates co-located libraries.
         binary = Path(binary_path).expanduser().resolve()
-        model = Path(model_path).expanduser().resolve()
-        mmproj = Path(mmproj_path).expanduser().resolve() if mmproj_path else None
+        model = _absolute_keep_symlinks(model_path)
+        mmproj = _absolute_keep_symlinks(mmproj_path) if mmproj_path else None
 
         if not binary.exists():
             raise LlamaCppRuntimeError(f"llama-server binary not found: {binary}")

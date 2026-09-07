@@ -63,3 +63,41 @@ class TestLlamaCppRuntimePortResolution(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestModelPathNormalization(unittest.TestCase):
+    """Model paths must reach llama-server with their symlinks intact.
+
+    llama.cpp locates the remaining parts of a split GGUF by pattern-matching
+    the filename it is given. A HuggingFace snapshot entry is a symlink to a
+    content-addressed blob, so dereferencing it renames
+    `Model-00001-of-00002.gguf` to a sha256 and the load fails with
+    "invalid split file name" — pointing at a path the user never chose.
+    """
+
+    def test_symlinked_model_path_is_not_dereferenced(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blob = root / "blobs" / ("aa" * 32)
+            blob.parent.mkdir(parents=True)
+            blob.write_bytes(b"GGUF")
+
+            snapshot = root / "snapshots" / "rev"
+            snapshot.mkdir(parents=True)
+            link = snapshot / "Model-BF16-00001-of-00002.gguf"
+            link.symlink_to(blob)
+
+            normalized = MODULE._absolute_keep_symlinks(str(link))
+            self.assertEqual(normalized, link)
+            self.assertTrue(normalized.name.endswith("-00001-of-00002.gguf"))
+            self.assertNotEqual(normalized, blob)
+            # Still reaches the bytes, so existence checks keep working.
+            self.assertTrue(normalized.exists())
+
+    def test_relative_and_user_paths_are_made_absolute(self):
+        normalized = MODULE._absolute_keep_symlinks("~/models/../models/x.gguf")
+        self.assertTrue(normalized.is_absolute())
+        self.assertNotIn("..", normalized.parts)
+        self.assertNotIn("~", str(normalized))
