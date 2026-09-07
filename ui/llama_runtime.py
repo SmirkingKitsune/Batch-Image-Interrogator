@@ -242,9 +242,17 @@ class LlamaRuntimeCard(QWidget):
         if status.error:
             self._show_update_text(status.error, "#b00020")
             return
-        if not status.update_available:
+        if status.is_current:
+            self._show_update_text(f"Up to date ({status.latest_version}).", "#1a7f37")
+            return
+        if status.below_threshold:
+            # Behind, but not enough to be worth acting on. Saying "up to date"
+            # here would be false, and reporting it as an update would make the
+            # signal meaningless — upstream tags a dozen builds a day.
             self._show_update_text(
-                f"Up to date ({status.latest_version}).", "#1a7f37"
+                f"Close to current — {status.latest_version} is "
+                f"{status.behind} build{'s' if status.behind != 1 else ''} ahead.",
+                "#666",
             )
             return
 
@@ -256,6 +264,8 @@ class LlamaRuntimeCard(QWidget):
             "unavailable": "has no installable build for this configuration",
         }.get(status.action, "")
         headline = f"Update available: {status.latest_version}"
+        if status.behind:
+            headline += f" — {status.behind} builds behind"
         if cost:
             headline += f" — {cost}"
         text = headline if not status.warning else f"{headline}\n{status.warning}"

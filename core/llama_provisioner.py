@@ -605,11 +605,38 @@ def select_release_candidate(
 
 BUILD_TAG_RE = re.compile(r"\bb(\d+)\b", re.IGNORECASE)
 
+# How far behind upstream a runtime must fall before an update is worth
+# reporting. llama.cpp tags roughly a dozen nightly builds a day, so any
+# smaller number means a source install tracking master reports an update
+# permanently — and the signal stops meaning anything. 100 builds is about a
+# week of upstream activity at that cadence, which is a reasonable floor for
+# spending twenty minutes on a recompile.
+UPDATE_BUILD_THRESHOLD = 100
+
 
 def release_build_number(text: str) -> Optional[int]:
     """The `bNNNN` build number in a tag or version string, if there is one."""
     match = BUILD_TAG_RE.search(text or "")
     return int(match.group(1)) if match else None
+
+
+def builds_behind(installed: str, latest_tag: str) -> Optional[int]:
+    """How many upstream builds separate an installed runtime from `latest_tag`.
+
+    0 means current or ahead. None means the comparison could not be made —
+    a custom build string with no recognisable build number — in which case
+    callers should report the update rather than silently hide it.
+    """
+    if not installed or not latest_tag:
+        return None
+    if latest_tag in installed:
+        return 0
+
+    latest_build = release_build_number(latest_tag)
+    installed_build = release_build_number(installed)
+    if latest_build is None or installed_build is None:
+        return None
+    return max(0, latest_build - installed_build)
 
 
 def installed_version_is_current(installed: str, latest_tag: str) -> bool:
@@ -638,7 +665,13 @@ class UpdateStatus:
 
     current_version: str = ""
     latest_version: str = ""
+    # Past the reporting threshold. A runtime can be behind without this being
+    # True; `behind` carries the raw distance either way.
     update_available: bool = False
+    # Builds between the installed runtime and upstream. None when the versions
+    # could not be compared, 0 when current or ahead.
+    behind: Optional[int] = None
+    threshold: int = UPDATE_BUILD_THRESHOLD
     # release: a matched asset exists. compile: a source rebuild is required.
     # unavailable: no asset, and the configured method forbids compiling.
     action: str = ""
@@ -650,20 +683,34 @@ class UpdateStatus:
     def ok(self) -> bool:
         return not self.error
 
+    @property
+    def is_current(self) -> bool:
+        """Level with upstream, or ahead of it."""
+        return self.behind == 0
+
+    @property
+    def below_threshold(self) -> bool:
+        """Behind, but not far enough to be worth acting on."""
+        return bool(self.behind) and not self.update_available
+
 
 def check_for_update(
     cfg: ProvisionConfig,
     installed_version: str,
     timeout: float = 30.0,
+    threshold: int = UPDATE_BUILD_THRESHOLD,
 ) -> UpdateStatus:
     """Ask upstream whether a newer llama.cpp runtime exists for this host.
 
     Reports not just *that* an update exists but what taking it would cost:
     downloading a release is a minute, recompiling is twenty. The two are worth
     distinguishing before the user commits to one.
+
+    `threshold` suppresses the report until the runtime is meaningfully behind;
+    pass 0 to report any difference at all.
     """
     cfg = cfg.normalized()
-    status = UpdateStatus(current_version=installed_version)
+    status = UpdateStatus(current_version=installed_version, threshold=threshold)
 
     try:
         releases = fetch_releases("latest", timeout)
@@ -691,7 +738,12 @@ def check_for_update(
         return status
     status.latest_version = str(newest.get("tag_name", "")).strip()
 
-    if installed_version_is_current(installed_version, status.latest_version):
+    status.behind = builds_behind(installed_version, status.latest_version)
+    if status.behind == 0:
+        return status
+    # An uncomparable version (None) is reported rather than hidden: failing to
+    # parse a custom build string is not evidence that it is current.
+    if status.behind is not None and status.behind < threshold:
         return status
 
     status.update_available = True
