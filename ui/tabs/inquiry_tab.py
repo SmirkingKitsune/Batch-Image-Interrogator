@@ -3,7 +3,7 @@
 import os
 import platform
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
@@ -43,6 +43,7 @@ from core import (
 from core.device_detector import get_device_detector
 from core.llama_cpp_runtime import is_llama_timeout_error
 from core.llama_provisioner import detect_accelerator
+from core.model_paths import resolve_model_path
 from interrogators import LlamaCppInterrogator
 from ui.dialogs import LlamaProvisionDialog, create_llama_config_widget
 from ui.llama_runtime import (
@@ -737,6 +738,29 @@ class InquiryTab(QWidget):
         self.refresh_runtime_card()
         return resolve_runtime_binary(self.get_llama_config())
 
+    def _resolve_model_paths(self, config: Dict[str, Any]) -> Tuple[str, Optional[str], List[str]]:
+        """Return (model, mmproj, notes) with HuggingFace blob paths named.
+
+        Browsing into a hub cache yields `blobs/<sha256>`, which loads fine for
+        a single-file model and fails with "invalid split file name" for a
+        multi-part one, because llama.cpp finds sibling parts by filename. Both
+        paths are the same file, so preferring the snapshot name costs nothing
+        and makes split models work.
+        """
+        notes: List[str] = []
+
+        model_path, note = resolve_model_path(config["llama_model_path"])
+        if note:
+            notes.append(f"Model: {note}")
+
+        mmproj_path = config.get("llama_mmproj_path")
+        if mmproj_path:
+            mmproj_path, note = resolve_model_path(mmproj_path)
+            if note:
+                notes.append(f"MMProj: {note}")
+
+        return model_path, mmproj_path, notes
+
     def refresh_runtime_card(self):
         """Repaint the runtime card after provisioning changed something."""
         if self.llama_config_refs:
@@ -751,6 +775,7 @@ class InquiryTab(QWidget):
                 return
             if not config.get("llama_model_path"):
                 raise ValueError("Multimodal model path is required")
+            model_path, mmproj_path, path_notes = self._resolve_model_paths(config)
             self._save_inquiry_options()
 
             self.load_model_button.setEnabled(False)
@@ -762,8 +787,8 @@ class InquiryTab(QWidget):
             self.current_interrogator = LlamaCppInterrogator(model_name="LlamaCpp")
             self.current_interrogator.load_model(
                 llama_binary_path=binary_path,
-                llama_model_path=config["llama_model_path"],
-                llama_mmproj_path=config.get("llama_mmproj_path"),
+                llama_model_path=model_path,
+                llama_mmproj_path=mmproj_path,
                 ctx_size=config["ctx_size"],
                 gpu_layers=config["gpu_layers"],
                 temperature=config["temperature"],
@@ -781,14 +806,18 @@ class InquiryTab(QWidget):
                     self.llama_config_refs["server_port_spin"].setValue(resolved_port)
                 self.inquiry_settings.update_llama_config(self.llama_config)
 
-            model_info = f"LlamaCpp - {Path(config['llama_model_path']).name}"
+            # Report the path actually loaded, which differs from the configured
+            # one when a HuggingFace blob was resolved to its snapshot name.
+            model_info = f"LlamaCpp - {Path(model_path).name}"
             runtime_meta = self.current_interrogator.runtime.get_runtime_metadata()
             runtime_url = runtime_meta.get("base_url") or "http://127.0.0.1:unknown"
             runtime_pid = runtime_meta.get("pid")
             runtime_log = runtime_meta.get("log_path")
-            self.model_status_label.setText(f"Model: {model_info}\nLoaded")
+            status_lines = [f"Model: {model_info}", "Loaded"]
+            status_lines.extend(path_notes)
+            self.model_status_label.setText("\n".join(status_lines))
             self.inquiry_status_label.setText(
-                f"Connected: {Path(config['llama_model_path']).name} at {runtime_url} (pid={runtime_pid})"
+                f"Connected: {Path(model_path).name} at {runtime_url} (pid={runtime_pid})"
             )
             self.inquiry_status_label.setStyleSheet("color: green;")
             if runtime_log:
