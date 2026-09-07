@@ -218,9 +218,35 @@ class TestUpdateDisplay(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_up_to_date_is_reported(self):
-        self.card._on_update_checked(UpdateStatus(latest_version="b10850"))
+        self.card._on_update_checked(UpdateStatus(latest_version="b10850", behind=0))
         self.assertIn("Up to date", self.card.update_label.text())
         self.assertTrue(self.card.update_label.isVisibleTo(self.card))
+
+    def test_slightly_behind_is_neither_current_nor_an_update(self):
+        # Claiming "up to date" while two builds behind would be false; calling
+        # it an update would make the signal meaningless at ~12 builds a day.
+        self.card._on_update_checked(
+            UpdateStatus(latest_version="b10850", behind=2, update_available=False)
+        )
+        text = self.card.update_label.text()
+        self.assertIn("Close to current", text)
+        self.assertIn("2 builds ahead", text)
+        self.assertNotIn("Up to date", text)
+        self.assertNotIn("Update available", text)
+
+    def test_single_build_behind_is_not_pluralised(self):
+        self.card._on_update_checked(
+            UpdateStatus(latest_version="b10850", behind=1, update_available=False)
+        )
+        self.assertIn("1 build ahead", self.card.update_label.text())
+
+    def test_reported_update_states_the_distance(self):
+        self.card._on_update_checked(
+            UpdateStatus(
+                latest_version="b10850", behind=142, update_available=True, action="compile"
+            )
+        )
+        self.assertIn("142 builds behind", self.card.update_label.text())
 
     def test_release_update_names_the_cheap_path(self):
         self.card._on_update_checked(

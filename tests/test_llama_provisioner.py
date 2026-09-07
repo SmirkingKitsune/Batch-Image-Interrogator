@@ -20,6 +20,8 @@ from core.llama_provisioner import (  # noqa: E402
     choose_cuda_release,
     cuda_arch_targets,
     cuda_cmake_architectures,
+    UPDATE_BUILD_THRESHOLD,
+    builds_behind,
     check_for_update,
     cuda_feature_target,
     installed_version_is_current,
@@ -380,6 +382,73 @@ class TestVersionCurrency(unittest.TestCase):
         self.assertIsNone(release_build_number("no-build-number-here"))
 
 
+class TestBuildDistance(unittest.TestCase):
+    def test_exact_tag_is_zero(self):
+        self.assertEqual(builds_behind("b10830", "b10830"), 0)
+        self.assertEqual(builds_behind("b10830-0-gabc (source)", "b10830"), 0)
+
+    def test_distance_is_counted_in_builds(self):
+        self.assertEqual(builds_behind("b10700", "b10830"), 130)
+        self.assertEqual(builds_behind("b10828-2-g465e49b9c", "b10830"), 2)
+
+    def test_a_build_ahead_of_upstream_is_zero_not_negative(self):
+        self.assertEqual(builds_behind("b10900-1-gabc", "b10830"), 0)
+
+    def test_uncomparable_versions_return_none(self):
+        self.assertIsNone(builds_behind("some-custom-build", "b10830"))
+        self.assertIsNone(builds_behind("", "b10830"))
+
+
+class TestUpdateThreshold(unittest.TestCase):
+    """Upstream tags ~12 builds a day; without a floor the signal is noise."""
+
+    def _check(self, installed, **kwargs):
+        releases = [{"tag_name": "b10830", "assets": TestUpdateCheck.ASSETS}]
+        with patch("core.llama_provisioner.fetch_releases", return_value=releases):
+            return check_for_update(config(accelerator="cuda"), installed, **kwargs)
+
+    def test_a_few_builds_behind_is_not_reported(self):
+        status = self._check("b10828-2-g465e49b9c (source, cuda)")
+        self.assertEqual(status.behind, 2)
+        self.assertFalse(status.update_available)
+        self.assertTrue(status.below_threshold)
+        self.assertFalse(status.is_current)
+
+    def test_far_behind_is_reported(self):
+        status = self._check("b10700")
+        self.assertEqual(status.behind, 130)
+        self.assertTrue(status.update_available)
+        self.assertFalse(status.below_threshold)
+
+    def test_exactly_at_the_threshold_is_reported(self):
+        status = self._check("b10730")  # 100 behind
+        self.assertEqual(status.behind, UPDATE_BUILD_THRESHOLD)
+        self.assertTrue(status.update_available)
+
+    def test_one_below_the_threshold_is_not(self):
+        status = self._check("b10731")  # 99 behind
+        self.assertFalse(status.update_available)
+
+    def test_current_runtime_is_neither_behind_nor_below_threshold(self):
+        status = self._check("b10830")
+        self.assertTrue(status.is_current)
+        self.assertFalse(status.below_threshold)
+        self.assertFalse(status.update_available)
+
+    def test_threshold_zero_reports_any_difference(self):
+        status = self._check("b10828-2-g465e49b9c (source, cuda)", threshold=0)
+        self.assertTrue(status.update_available)
+        self.assertEqual(status.behind, 2)
+
+    def test_uncomparable_version_is_reported_rather_than_hidden(self):
+        # Failing to parse a custom build string is not evidence it is current;
+        # suppressing the update there would hide a real one behind a threshold
+        # that was never actually evaluated.
+        status = self._check("my-hand-rolled-llama-server")
+        self.assertIsNone(status.behind)
+        self.assertTrue(status.update_available)
+
+
 class TestUpdateCheck(unittest.TestCase):
     """check_for_update reports the cost of an update, not just its existence."""
 
@@ -397,8 +466,11 @@ class TestUpdateCheck(unittest.TestCase):
         payload = releases if releases is not None else [
             {"tag_name": "b10850", "assets": self.ASSETS}
         ]
+        # threshold=0: these cases are about how an update would be obtained,
+        # not about whether it is far enough behind to mention. The staleness
+        # floor has its own tests.
         with patch("core.llama_provisioner.fetch_releases", return_value=payload):
-            return check_for_update(cfg, installed)
+            return check_for_update(cfg, installed, threshold=0)
 
     def test_current_runtime_reports_no_update(self):
         status = self._check(config(accelerator="cuda"), "b10850")
