@@ -1249,3 +1249,59 @@ class LlamaProvisionWorker(QThread):
         except Exception as exc:
             self.build_log_path = str(provisioner.build_log_path or "") if provisioner else ""
             self.finished.emit("", str(exc))
+
+
+class LlamaUpdateCheckWorker(QThread):
+    """Worker thread for checking whether a newer llama.cpp runtime exists.
+
+    The check hits the GitHub API, so it belongs off the UI thread even though
+    it is far quicker than provisioning itself.
+    """
+
+    # Signals
+    completed = pyqtSignal(object)  # UpdateStatus
+
+    def __init__(self, config: ProvisionConfig, installed_version: str):
+        """Initialize the update check worker.
+
+        Args:
+            config: ProvisionConfig describing the runtime to check.
+            installed_version: Version string recorded for the current install.
+        """
+        super().__init__()
+        self.config = config
+        self.installed_version = installed_version
+
+    def run(self):
+        """Query upstream and report what an update would involve."""
+        from core.llama_provisioner import UpdateStatus, check_for_update
+
+        try:
+            self.completed.emit(check_for_update(self.config, self.installed_version))
+        except Exception as exc:
+            self.completed.emit(
+                UpdateStatus(current_version=self.installed_version, error=str(exc))
+            )
+
+
+class LlamaHealthCheckWorker(QThread):
+    """Worker thread for starting a managed runtime validation probe."""
+
+    completed = pyqtSignal(str)  # Empty string means healthy.
+
+    def __init__(self, binary_path: str):
+        super().__init__()
+        self.binary_path = binary_path
+
+    def run(self):
+        from core.llama_provisioner import ProvisionError, validate_server
+
+        try:
+            validate_server(Path(self.binary_path))
+        except (ProvisionError, OSError) as exc:
+            self.completed.emit(str(exc))
+            return
+        except Exception as exc:
+            self.completed.emit(f"Runtime health check failed: {exc}")
+            return
+        self.completed.emit("")

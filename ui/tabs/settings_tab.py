@@ -7,11 +7,13 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                              QSlider, QProgressBar, QMessageBox, QTextEdit,
                              QTabWidget, QListWidget, QListWidgetItem,
                              QTableWidget, QTableWidgetItem, QFrame)
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QDesktopServices
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from core import FileManager, TagFilterSettings, ONNXProviderSettings, ProviderPreference, ModelCacheManager
+from ui.llama_runtime import DEFAULT_PROVISION_DIR, LlamaRuntimeCard, runtime_summary
 
 
 class DatabaseStatsWidget(QWidget):
@@ -741,6 +743,7 @@ class SettingsTab(QWidget):
         self.tag_filters = tag_filters
         self.provider_settings = provider_settings or ONNXProviderSettings()
         self.current_directory = None
+        self._llama_health_worker = None
 
         # Setup UI
         self.setup_ui()
@@ -853,6 +856,44 @@ class SettingsTab(QWidget):
 
         model_mgr_group.setLayout(model_mgr_layout)
         layout.addWidget(model_mgr_group)
+
+        # === llama.cpp Runtime ===
+        # Sits beside the ONNX provider manager because it answers the same
+        # question for the other engine: which backend is this machine actually
+        # going to execute on.
+        llama_group = QGroupBox("llama.cpp Runtime (Inquiry)")
+        llama_layout = QVBoxLayout()
+
+        llama_info = QLabel(
+            "Install or rebuild the llama-server used by the Inquiry tab. A matched "
+            "official release is used when one exists; otherwise it is compiled from "
+            "source, as required for targets such as NVIDIA ARM64 CUDA."
+        )
+        llama_info.setWordWrap(True)
+        llama_info.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
+        llama_layout.addWidget(llama_info)
+
+        self.llama_runtime_card = LlamaRuntimeCard(parent=self)
+        self.llama_runtime_card.provision_requested.connect(self._manage_llama_runtime)
+        llama_layout.addWidget(self.llama_runtime_card)
+
+        llama_actions = QHBoxLayout()
+        self.llama_health_btn = QPushButton("Check Health")
+        self.llama_health_btn.clicked.connect(self._check_llama_runtime_health)
+        llama_actions.addWidget(self.llama_health_btn)
+
+        self.llama_logs_btn = QPushButton("Open Log Folder")
+        self.llama_logs_btn.clicked.connect(self._open_llama_log_folder)
+        llama_actions.addWidget(self.llama_logs_btn)
+        llama_actions.addStretch()
+        llama_layout.addLayout(llama_actions)
+
+        self.llama_health_label = QLabel("")
+        self.llama_health_label.setWordWrap(True)
+        llama_layout.addWidget(self.llama_health_label)
+
+        llama_group.setLayout(llama_layout)
+        layout.addWidget(llama_group)
 
         # === Model Cache Management ===
         cache_group = QGroupBox("Model Cache Management")
@@ -982,6 +1023,56 @@ class SettingsTab(QWidget):
             )
         except Exception as e:
             self.cache_summary_label.setText(f"Total cache: error calculating ({e})")
+
+    def _manage_llama_runtime(self):
+        """Install, rebuild, or switch the backend of the llama.cpp runtime."""
+        from ui.dialogs import LlamaProvisionDialog
+
+        dialog = LlamaProvisionDialog(self)
+        dialog.exec()
+        # Refresh regardless of outcome: a cancelled run can still have replaced
+        # the runtime on an earlier rung of the acquisition ladder.
+        self.llama_runtime_card.refresh()
+        self.llama_health_label.setText("")
+
+    def _check_llama_runtime_health(self):
+        """Start the installed runtime off-thread to confirm it actually runs."""
+        if self._llama_health_worker is not None and self._llama_health_worker.isRunning():
+            return
+
+        summary = runtime_summary()
+        if not summary["installed"]:
+            self.llama_health_label.setText("No runtime installed.")
+            self.llama_health_label.setStyleSheet("color: #b00020;")
+            return
+
+        from ui.workers import LlamaHealthCheckWorker
+
+        self.llama_health_btn.setEnabled(False)
+        self.llama_health_label.setText("Checking...")
+        self.llama_health_label.setStyleSheet("color: #666;")
+        self._llama_health_worker = LlamaHealthCheckWorker(summary["executable"])
+        self._llama_health_worker.completed.connect(self._on_llama_health_checked)
+        self._llama_health_worker.finished.connect(self._on_llama_health_worker_finished)
+        self._llama_health_worker.start()
+
+    def _on_llama_health_checked(self, failure: str):
+        self.llama_health_btn.setEnabled(True)
+        if failure:
+            self.llama_health_label.setText(failure)
+            self.llama_health_label.setStyleSheet("color: #b00020;")
+        else:
+            self.llama_health_label.setText("Runtime started successfully.")
+            self.llama_health_label.setStyleSheet("color: #1a7f37;")
+
+    def _on_llama_health_worker_finished(self):
+        self._llama_health_worker = None
+
+    def _open_llama_log_folder(self):
+        """Reveal the provisioning and server logs in the file manager."""
+        log_dir = DEFAULT_PROVISION_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_dir)))
 
     def _open_cache_manager(self):
         """Open the Model Cache Manager dialog."""

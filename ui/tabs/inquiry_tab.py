@@ -42,8 +42,15 @@ from core import (
 )
 from core.device_detector import get_device_detector
 from core.llama_cpp_runtime import is_llama_timeout_error
+from core.llama_provisioner import detect_accelerator
 from interrogators import LlamaCppInterrogator
-from ui.dialogs import create_llama_config_widget
+from ui.dialogs import LlamaProvisionDialog, create_llama_config_widget
+from ui.llama_runtime import (
+    RUNTIME_MODE_CUSTOM,
+    RUNTIME_MODE_MANAGED,
+    resolve_runtime_binary,
+    runtime_mode,
+)
 from ui.dialogs_advanced import AdvancedImageInspectionDialog
 from ui.widgets import InquiryTranscriptWidget
 from ui.workers import BatchContextScanWorker, MultimodalInterrogationWorker
@@ -152,12 +159,10 @@ class InquiryTab(QWidget):
         source_group.setLayout(source_layout)
         layout.addWidget(source_group)
 
-        config_group = QGroupBox("LlamaCpp Configuration")
-        config_layout = QVBoxLayout()
+        # No wrapping group box: the widget supplies its own Runtime / Model /
+        # Inference sections, and a fourth frame around them is just nesting.
         config_widget, self.llama_config_refs = create_llama_config_widget(self.llama_config, self)
-        config_layout.addWidget(config_widget)
-        config_group.setLayout(config_layout)
-        layout.addWidget(config_group)
+        layout.addWidget(config_widget)
 
         model_group = QGroupBox("Model Actions")
         model_layout = QVBoxLayout()
@@ -412,6 +417,9 @@ class InquiryTab(QWidget):
 
         for key in ("binary_path_edit", "model_path_edit", "mmproj_path_edit"):
             self.llama_config_refs[key].textChanged.connect(lambda *_: self._save_inquiry_options())
+        self.llama_config_refs["custom_binary_check"].toggled.connect(
+            lambda *_: self._save_inquiry_options()
+        )
         for key in ("ctx_size_spin", "gpu_layers_spin", "temperature_spin", "max_tokens_spin", "server_port_spin"):
             self.llama_config_refs[key].valueChanged.connect(lambda _: self._save_inquiry_options())
         self.single_task_combo.currentTextChanged.connect(lambda *_: self._save_inquiry_options())
@@ -597,8 +605,10 @@ class InquiryTab(QWidget):
         if not self.llama_config_refs:
             return dict(self.llama_config)
 
+        use_custom = self.llama_config_refs["custom_binary_check"].isChecked()
         self.llama_config.update(
             {
+                "llama_runtime_mode": RUNTIME_MODE_CUSTOM if use_custom else RUNTIME_MODE_MANAGED,
                 "llama_binary_path": self.llama_config_refs["binary_path_edit"].text().strip(),
                 "llama_model_path": self.llama_config_refs["model_path_edit"].text().strip(),
                 "llama_mmproj_path": self.llama_config_refs["mmproj_path_edit"].text().strip() or None,
@@ -688,12 +698,57 @@ class InquiryTab(QWidget):
             return error_text
         return f"{error_text}\n\n{self.DGX_TIMEOUT_HINT}"
 
+    def _resolve_runtime_or_offer_install(self, config: Dict[str, Any]) -> str:
+        """Return the llama-server to launch, offering to install one if absent.
+
+        Returns "" when the caller should abort, which covers both a declined
+        install and one that did not produce a runtime. A source build can run
+        for twenty minutes, so it never starts without an explicit yes.
+        """
+        binary_path = resolve_runtime_binary(config)
+        if binary_path and Path(binary_path).exists():
+            return binary_path
+
+        if runtime_mode(config) == RUNTIME_MODE_CUSTOM:
+            raise ValueError(
+                f"Custom llama-server not found: {binary_path or '(no path set)'}"
+            )
+
+        detected = detect_accelerator()
+        answer = QMessageBox.question(
+            self,
+            "Install llama.cpp runtime?",
+            "No llama.cpp runtime is installed.\n\n"
+            f"Detected accelerator: {detected}.\n\n"
+            "Install one now? A matched release is downloaded when available; "
+            "otherwise it is built from source, which can take several minutes.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.inquiry_status_label.setText(
+                "No llama.cpp runtime installed. Use Runtime -> Install Runtime to set one up."
+            )
+            self.inquiry_status_label.setStyleSheet("color: #b36b00;")
+            return ""
+
+        dialog = LlamaProvisionDialog(self)
+        dialog.exec()
+        self.refresh_runtime_card()
+        return resolve_runtime_binary(self.get_llama_config())
+
+    def refresh_runtime_card(self):
+        """Repaint the runtime card after provisioning changed something."""
+        if self.llama_config_refs:
+            self.llama_config_refs["runtime_card"].refresh()
+
     def load_model(self):
         """Load llama.cpp interrogator with current config."""
         try:
             config = self.get_llama_config()
-            if not config.get("llama_binary_path"):
-                raise ValueError("llama-server path is required")
+            binary_path = self._resolve_runtime_or_offer_install(config)
+            if not binary_path:
+                return
             if not config.get("llama_model_path"):
                 raise ValueError("Multimodal model path is required")
             self._save_inquiry_options()
@@ -706,7 +761,7 @@ class InquiryTab(QWidget):
 
             self.current_interrogator = LlamaCppInterrogator(model_name="LlamaCpp")
             self.current_interrogator.load_model(
-                llama_binary_path=config["llama_binary_path"],
+                llama_binary_path=binary_path,
                 llama_model_path=config["llama_model_path"],
                 llama_mmproj_path=config.get("llama_mmproj_path"),
                 ctx_size=config["ctx_size"],

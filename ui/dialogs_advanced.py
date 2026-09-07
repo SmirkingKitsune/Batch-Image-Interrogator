@@ -19,6 +19,7 @@ from core.hashing import hash_image_content
 from core.device_detector import get_device_detector
 from core.llama_cpp_runtime import LlamaCppRuntimeManager, is_llama_timeout_error
 from interrogators import LlamaCppInterrogator
+from ui.llama_runtime import resolve_runtime_binary
 from ui.widgets import InquiryTranscriptWidget, TagEditorWidget, ResultsTableWidget
 
 logger = logging.getLogger(__name__)
@@ -1000,6 +1001,11 @@ class AdvancedImageInspectionDialog(QDialog):
                     pass
             parent = parent.parent()
 
+        # The Inquiry tab stores the custom path separately from managed mode.
+        # Resolve the effective binary here as well as in its primary Load
+        # Model action so the advanced inspector cannot fall back to a stale or
+        # empty pre-provisioner path.
+        config["llama_binary_path"] = resolve_runtime_binary(config)
         self.llama_config = config
         return config
 
