@@ -30,6 +30,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from core.log_retention import RetentionPolicy, prune_logs
+
 REPO_URL = "https://github.com/ggml-org/llama.cpp"
 API_BASE = "https://api.github.com/repos/ggml-org/llama.cpp"
 USER_AGENT = "batch-image-interrogator-llama-provisioner/1.0"
@@ -59,6 +61,20 @@ BACKEND_TOOLS: Dict[str, Tuple[str, str]] = {
 }
 
 PROGRESS_RE = re.compile(r"\[\s*(\d+)\s*%\]")
+
+BUILD_LOG_GLOB = "llama-provision-*.log"
+
+# Build logs share a directory with the far larger server logs but keep their
+# own budget, so one long inference run cannot evict the record of a failed
+# install. Sized generously in file count and modestly in bytes: a failed build
+# is diagnosed from the log the dialog names, and several attempts often sit
+# between noticing a problem and fixing it.
+BUILD_LOG_RETENTION = RetentionPolicy(
+    keep_files=10,
+    keep_total_bytes=32 * 1024 * 1024,
+    max_bytes=8 * 1024 * 1024,
+    tail_bytes=1024 * 1024,
+)
 
 
 class ProvisionError(RuntimeError):
@@ -1305,6 +1321,7 @@ class LlamaProvisioner:
         log_dir = Path(self.config.provision_dir) / "logs"
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
+            prune_logs(log_dir, BUILD_LOG_GLOB, BUILD_LOG_RETENTION)
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             path = log_dir / f"llama-provision-{stamp}.log"
             cfg = self.config

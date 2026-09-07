@@ -14,6 +14,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib import request, error
 from urllib.parse import urlparse
 
+from core.log_retention import RetentionPolicy, prune_logs, truncate_log
+
+SERVER_LOG_GLOB = "llama-server-*.log"
+
 
 class LlamaCppRuntimeError(RuntimeError):
     """Raised when llama.cpp runtime operations fail."""
@@ -281,60 +285,19 @@ class LlamaCppRuntimeManager:
         )
 
     @classmethod
+    def _retention_policy(cls) -> RetentionPolicy:
+        """Server-log limits, read from the class so tests can patch them."""
+        return RetentionPolicy(
+            keep_files=cls.LOG_KEEP_FILES,
+            keep_total_bytes=cls.LOG_KEEP_TOTAL_BYTES,
+            max_bytes=cls.LOG_MAX_BYTES,
+            tail_bytes=cls.LOG_TAIL_BYTES,
+        )
+
+    @classmethod
     def _prune_logs(cls, log_dir: Path) -> None:
-        """Delete old run logs that exceed the retention budget.
-
-        Called before a new log is opened, so the budget leaves room for the run
-        about to start. Failures are ignored: losing a diagnostic log is never a
-        reason to refuse to start the server.
-        """
-        try:
-            logs = sorted(
-                (
-                    path
-                    for path in log_dir.glob("llama-server-*.log")
-                    if path.is_file() and not path.is_symlink()
-                ),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-        except OSError:
-            return
-
-        # Reserve both one file slot and one full live-log allowance for the run
-        # that is about to start. Otherwise four 32 MiB historical logs plus a
-        # new 32 MiB log can exceed the advertised 128 MiB total budget.
-        keep_files = max(0, cls.LOG_KEEP_FILES - 1)
-        keep_bytes = max(0, cls.LOG_KEEP_TOTAL_BYTES - cls.LOG_MAX_BYTES)
-        kept_bytes = 0
-        budget_exhausted = False
-        for index, path in enumerate(logs):
-            try:
-                size = path.stat().st_size
-            except OSError:
-                continue
-
-            # A previous unclean shutdown may have left an uncapped log. Keep
-            # its useful tail before applying the historical-log budget.
-            if size > cls.LOG_MAX_BYTES:
-                cls._truncate_log(path)
-                try:
-                    size = path.stat().st_size
-                except OSError:
-                    continue
-
-            if (
-                not budget_exhausted
-                and index < keep_files
-                and kept_bytes + size <= keep_bytes
-            ):
-                kept_bytes += size
-                continue
-            budget_exhausted = True
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        """Bring the server logs within their retention budget."""
+        prune_logs(log_dir, SERVER_LOG_GLOB, cls._retention_policy())
 
     def _start_log_watchdog(self, log_path: Path) -> None:
         """Begin bounding the size of the live log."""
@@ -380,39 +343,12 @@ class LlamaCppRuntimeManager:
 
     @classmethod
     def _truncate_log(cls, log_path: Path) -> None:
-        """Drop the head of an oversized live log, keeping the recent tail.
+        """Cap a live server log, keeping its recent tail.
 
-        The server holds this file open in append mode, so truncating to zero
-        and writing the tail back is safe: every subsequent write still lands at
-        the new end of file. Lines written by the server during the swap can be
-        lost, which is the deliberate trade for keeping a runaway log bounded.
-        Only the tail is ever read back (see `_read_recent_logs_from_path`).
+        Only the tail is ever read back (see `_read_recent_logs_from_path`), so
+        discarding the head costs nothing the caller uses.
         """
-        try:
-            with log_path.open("rb") as handle:
-                handle.seek(-cls.LOG_TAIL_BYTES, os.SEEK_END)
-                tail = handle.read()
-        except OSError:
-            return
-
-        # The tail almost certainly starts mid-line; drop the partial one.
-        newline = tail.find(b"\n")
-        if newline != -1:
-            tail = tail[newline + 1:]
-
-        marker = (
-            f"# [log truncated at {datetime.now().isoformat(timespec='seconds')}; "
-            f"kept trailing {len(tail)} bytes]\n"
-        ).encode("utf-8")
-        try:
-            os.truncate(log_path, 0)
-            with log_path.open("ab") as handle:
-                handle.write(marker)
-                handle.write(tail)
-        except OSError:
-            # Windows can refuse truncation while the server holds the file
-            # open. Leaving the log oversized beats interrupting inference.
-            return
+        truncate_log(log_path, cls.LOG_TAIL_BYTES)
 
     @staticmethod
     def _read_recent_logs_from_path(log_path: Optional[str], max_lines: int = 120) -> str:
