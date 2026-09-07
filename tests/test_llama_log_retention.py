@@ -16,6 +16,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.llama_cpp_runtime import LlamaCppRuntimeManager  # noqa: E402
+from core.llama_provisioner import BUILD_LOG_GLOB, BUILD_LOG_RETENTION  # noqa: E402
+from core.log_retention import RetentionPolicy, prune_logs  # noqa: E402
 
 
 def write_log(directory: Path, name: str, size: int, mtime: float) -> Path:
@@ -204,6 +206,122 @@ class TestWatchdogLifecycle(unittest.TestCase):
             self.assertFalse(first_watchdog.is_alive())
             self.assertIsNot(manager._log_watchdog, first_watchdog)
             manager._stop_log_watchdog()
+
+
+class TestRetentionPolicyReservation(unittest.TestCase):
+    """Both budgets reserve room for the run that is about to start."""
+
+    def test_one_file_slot_is_reserved(self):
+        policy = RetentionPolicy(keep_files=5, keep_total_bytes=100, max_bytes=10, tail_bytes=2)
+        self.assertEqual(policy.historical_files(), 4)
+
+    def test_one_full_log_allowance_is_reserved(self):
+        policy = RetentionPolicy(keep_files=5, keep_total_bytes=100, max_bytes=10, tail_bytes=2)
+        self.assertEqual(policy.historical_bytes(), 90)
+
+    def test_reservations_never_go_negative(self):
+        policy = RetentionPolicy(keep_files=1, keep_total_bytes=4, max_bytes=16, tail_bytes=2)
+        self.assertEqual(policy.historical_files(), 0)
+        self.assertEqual(policy.historical_bytes(), 0)
+
+
+class TestBuildLogRetention(unittest.TestCase):
+    """Provisioning build logs are budgeted separately from server logs."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _build_logs(self, count: int, size: int = 1024):
+        return [
+            write_log(self.log_dir, f"llama-provision-2026010{i}-000000.log", size, 1_700_000_000 + i)
+            for i in range(count)
+        ]
+
+    def test_old_build_logs_are_pruned(self):
+        paths = self._build_logs(20)
+        prune_logs(self.log_dir, BUILD_LOG_GLOB, BUILD_LOG_RETENTION)
+        survivors = sorted(p.name for p in self.log_dir.glob(BUILD_LOG_GLOB))
+        self.assertEqual(len(survivors), BUILD_LOG_RETENTION.historical_files())
+        self.assertIn(paths[-1].name, survivors, "newest build log must survive")
+        self.assertNotIn(paths[0].name, survivors)
+
+    def test_recent_failed_build_log_survives_several_retries(self):
+        # The dialog prints this path on failure; retrying must not delete the
+        # log the user was just told to read.
+        failed = self._build_logs(1)[0]
+        for attempt in range(3):
+            prune_logs(self.log_dir, BUILD_LOG_GLOB, BUILD_LOG_RETENTION)
+            write_log(
+                self.log_dir,
+                f"llama-provision-20260201-00000{attempt}.log",
+                1024,
+                1_700_001_000 + attempt,
+            )
+        self.assertTrue(failed.exists(), "the original failure log should still be readable")
+
+    def test_oversized_build_log_is_trimmed_not_deleted(self):
+        big = write_log(
+            self.log_dir,
+            "llama-provision-20260101-000000.log",
+            BUILD_LOG_RETENTION.max_bytes + 4096,
+            1_700_000_000,
+        )
+        prune_logs(self.log_dir, BUILD_LOG_GLOB, BUILD_LOG_RETENTION)
+        self.assertTrue(big.exists())
+        self.assertLessEqual(big.stat().st_size, BUILD_LOG_RETENTION.tail_bytes + 4096)
+
+
+class TestFamiliesAreIndependent(unittest.TestCase):
+    """A huge inference log must not evict build logs, or vice versa."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_server_pruning_leaves_build_logs_alone(self):
+        build = write_log(self.log_dir, "llama-provision-20260101-000000.log", 2048, 1_700_000_000)
+        for i in range(12):
+            write_log(self.log_dir, f"llama-server-8080-2026010{i}-000000.log", 4096, 1_700_000_100 + i)
+
+        LlamaCppRuntimeManager._prune_logs(self.log_dir)
+
+        self.assertTrue(build.exists(), "a build log is not a server log")
+        self.assertEqual(
+            len(list(self.log_dir.glob("llama-server-*.log"))),
+            LlamaCppRuntimeManager.LOG_KEEP_FILES - 1,
+        )
+
+    def test_build_pruning_leaves_server_logs_alone(self):
+        server = write_log(self.log_dir, "llama-server-8080-20260101-000000.log", 2048, 1_700_000_000)
+        for i in range(20):
+            write_log(self.log_dir, f"llama-provision-2026010{i}-000000.log", 4096, 1_700_000_100 + i)
+
+        prune_logs(self.log_dir, BUILD_LOG_GLOB, BUILD_LOG_RETENTION)
+
+        self.assertTrue(server.exists(), "a server log is not a build log")
+
+    def test_a_giant_server_log_cannot_starve_the_build_log_budget(self):
+        # The reason the budgets are per-family rather than one shared pool.
+        write_log(
+            self.log_dir,
+            "llama-server-8080-20260201-000000.log",
+            LlamaCppRuntimeManager.LOG_MAX_BYTES,
+            1_700_001_000,
+        )
+        builds = [
+            write_log(self.log_dir, f"llama-provision-2026010{i}-000000.log", 4096, 1_700_000_000 + i)
+            for i in range(3)
+        ]
+        prune_logs(self.log_dir, BUILD_LOG_GLOB, BUILD_LOG_RETENTION)
+        for path in builds:
+            self.assertTrue(path.exists(), f"{path.name} evicted by an unrelated server log")
 
 
 if __name__ == "__main__":
