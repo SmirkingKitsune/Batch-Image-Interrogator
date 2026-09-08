@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from core.base_interrogator import BaseInterrogator
 from core.llama_cpp_runtime import (
@@ -99,10 +99,16 @@ class LlamaCppInterrogator(BaseInterrogator):
         included_tables: Optional[List[Dict[str, Any]]] = None,
         included_transcripts: Optional[List[Dict[str, Any]]] = None,
         sidecar_tags: Optional[List[str]] = None,
+        on_stream_delta: Optional[Callable[[str], None]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
         Interrogate image using llama.cpp multimodal model.
+
+        Args:
+            on_stream_delta: Called with the accumulated raw response text as it
+                streams back. Only the first attempt streams; a reparse retry
+                calls it with an empty string to reset any partial display.
 
         Returns:
             Dict with 'tags', 'confidence_scores', 'raw_output', and parsed response.
@@ -139,6 +145,8 @@ class LlamaCppInterrogator(BaseInterrogator):
         }
         messages.append(user_message)
 
+        on_delta = self._build_stream_relay(on_stream_delta)
+
         try:
             response = self._chat_completion_with_timeout_retry(
                 messages=messages,
@@ -150,6 +158,7 @@ class LlamaCppInterrogator(BaseInterrogator):
                     "type": "function",
                     "function": {"name": self.RESPONSE_TOOL_NAME},
                 },
+                on_delta=on_delta,
             )
         except LlamaCppRuntimeError as exc:
             raise RuntimeError(f"Multimodal inference failed: {exc}") from exc
@@ -170,6 +179,10 @@ class LlamaCppInterrogator(BaseInterrogator):
         retry_error: Optional[Exception] = None
         retry_messages: Optional[List[Dict[str, Any]]] = None
         if parsed is None:
+            if on_stream_delta is not None:
+                # The streamed text is being discarded; clear the live view so
+                # it does not sit there looking like a finished answer.
+                on_stream_delta("")
             # Retry with an explicit JSON format example for lightweight models.
             try:
                 retry_user_text = self._build_user_prompt(
@@ -333,10 +346,11 @@ class LlamaCppInterrogator(BaseInterrogator):
         response_format: Optional[Dict[str, Any]] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Dict[str, Any]] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         """Run completion with one timeout-specific retry at a longer timeout."""
         try:
-            return self.runtime.chat_completion(
+            response = self.runtime.chat_completion(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -344,7 +358,21 @@ class LlamaCppInterrogator(BaseInterrogator):
                 tools=tools,
                 tool_choice=tool_choice,
                 timeout=self.REQUEST_TIMEOUT_SECONDS,
+                on_delta=on_delta,
             )
+            if on_delta is not None and self._is_empty_completion(response):
+                # Not every llama.cpp build emits tool-call deltas over SSE.
+                # Fall back to the buffered endpoint rather than lose the turn.
+                return self.runtime.chat_completion(
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    timeout=self.REQUEST_TIMEOUT_SECONDS,
+                )
+            return response
         except LlamaCppRuntimeError as exc:
             if not is_llama_timeout_error(exc):
                 raise
@@ -367,6 +395,100 @@ class LlamaCppInterrogator(BaseInterrogator):
                     f"{int(self.REQUEST_TIMEOUT_RETRY_SECONDS)}s): {retry_exc}"
                 ) from retry_exc
             raise
+
+    @staticmethod
+    def _build_stream_relay(
+        on_stream_delta: Optional[Callable[[str], None]],
+    ) -> Optional[Callable[[str], None]]:
+        """Turn per-fragment callbacks into running-total callbacks."""
+        if on_stream_delta is None:
+            return None
+
+        state = {"text": ""}
+
+        def relay(fragment: str) -> None:
+            state["text"] += fragment
+            on_stream_delta(state["text"])
+
+        return relay
+
+    @staticmethod
+    def _is_empty_completion(response: Dict[str, Any]) -> bool:
+        """True when a completion carries no assistant text at all."""
+        try:
+            LlamaCppInterrogator._extract_assistant_content(response)
+        except Exception:
+            return True
+        return False
+
+    @classmethod
+    def extract_stream_preview(cls, raw_text: str) -> str:
+        """Pull readable prose out of a partially streamed response.
+
+        Responses arrive as JSON tool arguments, so the raw stream is mostly
+        scaffolding. This surfaces the `comment` value as it is being written
+        and shows nothing until there is something worth reading.
+        """
+        text = (raw_text or "").strip()
+        if not text:
+            return ""
+
+        comment = cls._partial_json_string_value(raw_text, "comment")
+        if comment is None:
+            comment = cls._partial_json_string_value(raw_text, "answer")
+        if comment is not None:
+            return comment
+
+        if text.startswith("{") or text.startswith("[") or '"' in text[:40]:
+            # Structured output that has not reached the comment field yet.
+            return ""
+        return text
+
+    @staticmethod
+    def _partial_json_string_value(raw_text: str, key: str) -> Optional[str]:
+        """Read a possibly-unterminated JSON string value for `key`.
+
+        Returns None when the key has not been streamed yet, so callers can
+        tell "no value yet" apart from "value is still empty".
+        """
+        marker = f'"{key}"'
+        start = raw_text.find(marker)
+        if start == -1:
+            return None
+
+        index = start + len(marker)
+        length = len(raw_text)
+        while index < length and raw_text[index] in " \t\r\n":
+            index += 1
+        if index >= length or raw_text[index] != ":":
+            return None
+        index += 1
+        while index < length and raw_text[index] in " \t\r\n":
+            index += 1
+        if index >= length or raw_text[index] != '"':
+            return None
+        index += 1
+
+        chunk: List[str] = []
+        while index < length:
+            char = raw_text[index]
+            if char == "\\":
+                # An escape split across chunks resolves on the next update.
+                if index + 1 >= length:
+                    break
+                chunk.append(raw_text[index : index + 2])
+                index += 2
+                continue
+            if char == '"':
+                break
+            chunk.append(char)
+            index += 1
+
+        candidate = "".join(chunk)
+        try:
+            return json.loads(f'"{candidate}"')
+        except json.JSONDecodeError:
+            return candidate
 
     @classmethod
     def _build_system_prompt(cls) -> str:

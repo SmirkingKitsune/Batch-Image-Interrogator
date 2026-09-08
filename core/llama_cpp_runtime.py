@@ -10,7 +10,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib import request, error
 from urllib.parse import urlparse
 
@@ -440,19 +440,29 @@ class LlamaCppRuntimeManager:
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Dict[str, Any]] = None,
         timeout: float = 120.0,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
-        """Send an OpenAI-compatible chat completion request to llama-server."""
+        """Send an OpenAI-compatible chat completion request to llama-server.
+
+        Passing `on_delta` switches the request to server-sent events and calls
+        the callback with each text fragment as it arrives. The return value has
+        the same shape either way, so callers that only want the final response
+        do not care which transport was used.
+        """
         with self._lock:
             base_url = self._base_url
             if not base_url or not self._is_process_running():
                 raise LlamaCppRuntimeError("llama-server is not running")
 
+        streaming = on_delta is not None
         payload: Dict[str, Any] = {
             "model": self._model_alias,
             "messages": messages,
             "temperature": float(temperature),
             "max_tokens": int(max_tokens),
         }
+        if streaming:
+            payload["stream"] = True
         if response_format:
             payload["response_format"] = response_format
         if tools:
@@ -469,6 +479,8 @@ class LlamaCppRuntimeManager:
         )
         try:
             with request.urlopen(req, timeout=timeout) as resp:
+                if streaming:
+                    return self._read_sse_completion(resp, on_delta)
                 body = resp.read().decode("utf-8")
                 return json.loads(body)
         except error.HTTPError as exc:
@@ -478,6 +490,91 @@ class LlamaCppRuntimeManager:
             raise LlamaCppRuntimeError(f"llama-server request failed: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise LlamaCppRuntimeError(f"Invalid JSON response from llama-server: {exc}") from exc
+
+    @staticmethod
+    def _read_sse_completion(
+        response: Any,
+        on_delta: Callable[[str], None],
+    ) -> Dict[str, Any]:
+        """Consume an SSE chat-completion stream into a non-streaming response.
+
+        Content and forced tool-call arguments both arrive as `delta` fragments;
+        they are reassembled into the `message` shape the non-streaming endpoint
+        returns so response parsing stays in one place.
+        """
+        content_parts: List[str] = []
+        tool_calls: Dict[int, Dict[str, Any]] = {}
+        finish_reason: Optional[str] = None
+
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if not data or data == "[DONE]":
+                if data == "[DONE]":
+                    break
+                continue
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                # A malformed keepalive should not abort a good stream.
+                continue
+
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+
+            fragment = delta.get("content")
+            if isinstance(fragment, str) and fragment:
+                content_parts.append(fragment)
+                on_delta(fragment)
+
+            for call in delta.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                index = int(call.get("index") or 0)
+                entry = tool_calls.setdefault(
+                    index,
+                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                )
+                if call.get("id"):
+                    entry["id"] = call["id"]
+                function_obj = call.get("function")
+                if not isinstance(function_obj, dict):
+                    continue
+                if function_obj.get("name"):
+                    entry["function"]["name"] = function_obj["name"]
+                arguments = function_obj.get("arguments")
+                if isinstance(arguments, str) and arguments:
+                    entry["function"]["arguments"] += arguments
+                    on_delta(arguments)
+
+        message: Dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(content_parts),
+        }
+        if tool_calls:
+            message["tool_calls"] = [tool_calls[key] for key in sorted(tool_calls)]
+
+        return {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
 
     def _is_process_running(self) -> bool:
         """Return True if managed server process is alive."""

@@ -3,18 +3,20 @@
 import hashlib
 import json
 import os
+import time
 import uuid
 from contextlib import nullcontext
 from PyQt6.QtCore import QThread, Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QImage, QImageReader
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Callable, List, Dict, Any, Optional, Tuple
 from core import (
     InterrogationDatabase, hash_image_content, get_image_metadata,
     FileManager, TagFilterSettings, DatabaseBusyError, DatabaseQueuedError,
     ProvisionConfig
 )
 from core.base_interrogator import BaseInterrogator
+from interrogators import LlamaCppInterrogator
 from ui.thumbnail_cache import ThumbnailCache
 
 # Shared by the gallery widget and the thumbnail worker.
@@ -379,6 +381,95 @@ class InterrogationWorker(QThread):
         return True
 
 
+class StreamRelay:
+    """Rate-limits streamed model text before it crosses into the GUI thread.
+
+    llama-server emits a delta per token; forwarding every one of them means a
+    queued signal and a relayout per token. Emitting on a fixed interval keeps
+    the transcript visibly live without drowning the event loop.
+    """
+
+    MIN_INTERVAL_SECONDS = 0.06
+
+    def __init__(self, emit: Callable[[str], None]):
+        self._emit = emit
+        self._last_emit = 0.0
+        self._last_text: Optional[str] = None
+        self._pending: Optional[str] = None
+
+    def __call__(self, raw_text: str) -> None:
+        preview = LlamaCppInterrogator.extract_stream_preview(raw_text)
+        if preview == self._last_text:
+            self._pending = None
+            return
+        now = time.monotonic()
+        # An empty preview is the "discard what you saw" reset; never drop it.
+        if preview and now - self._last_emit < self.MIN_INTERVAL_SECONDS:
+            self._pending = preview
+            return
+        self._send(preview, now)
+
+    def flush(self) -> None:
+        """Emit the newest throttled update, if one is still held back."""
+        if self._pending is not None:
+            self._send(self._pending, time.monotonic())
+
+    def _send(self, preview: str, now: float) -> None:
+        self._pending = None
+        self._last_text = preview
+        self._last_emit = now
+        self._emit(preview)
+
+
+class SingleInquiryWorker(QThread):
+    """Runs one multimodal inquiry off the GUI thread, streaming as it goes."""
+
+    stream_delta = pyqtSignal(str)  # accumulated readable response text
+    completed = pyqtSignal(dict)  # results
+    failed = pyqtSignal(str)  # error message
+
+    def __init__(
+        self,
+        interrogator: BaseInterrogator,
+        image_path: str,
+        task: str,
+        prompt: str,
+        session_key: Optional[str],
+        included_tables: Optional[List[Dict[str, Any]]] = None,
+        included_transcripts: Optional[List[Dict[str, Any]]] = None,
+        sidecar_tags: Optional[List[str]] = None,
+    ):
+        super().__init__()
+        self.interrogator = interrogator
+        self.image_path = image_path
+        self.task = task
+        self.prompt = prompt
+        self.session_key = session_key
+        self.included_tables = included_tables or []
+        self.included_transcripts = included_transcripts or []
+        self.sidecar_tags = sidecar_tags or []
+
+    def run(self):
+        relay = StreamRelay(self.stream_delta.emit)
+        try:
+            results = self.interrogator.interrogate(
+                self.image_path,
+                task=self.task,
+                prompt=self.prompt,
+                session_key=self.session_key,
+                keep_context=True,
+                included_tables=self.included_tables,
+                included_transcripts=self.included_transcripts,
+                sidecar_tags=self.sidecar_tags,
+                on_stream_delta=relay,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc).strip() or repr(exc))
+            return
+        relay.flush()
+        self.completed.emit(results)
+
+
 class MultimodalInterrogationWorker(QThread):
     """Worker thread for llama.cpp multimodal batch interrogation."""
 
@@ -388,6 +479,8 @@ class MultimodalInterrogationWorker(QThread):
 
     # Signals
     progress = pyqtSignal(int, int, str)  # current, total, message
+    turn_started = pyqtSignal(str, dict)  # image_path, pending turn
+    stream_delta = pyqtSignal(str, str)  # image_path, accumulated response text
     result = pyqtSignal(str, dict)  # image_path, results
     error = pyqtSignal(str, str)  # image_path, error_message
     finished = pyqtSignal(bool)  # was_cancelled
@@ -531,6 +624,23 @@ class MultimodalInterrogationWorker(QThread):
                         results = cached
                         self.progress.emit(idx + 1, total, f"Using exact cache: {image_path.name}")
                     else:
+                        # The request half of the turn is fully known now, so
+                        # the transcript can show it while the model works.
+                        self.turn_started.emit(
+                            image_path_str,
+                            {
+                                "prompt_type": self.task,
+                                "prompt_text": self.prompt,
+                                "included_tables": included_tables,
+                                "included_transcripts": included_transcripts,
+                                "sidecar_tags": sidecar_tags,
+                                "model_name": self.interrogator.model_name,
+                                "image_path": image_path_str,
+                            },
+                        )
+                        relay = StreamRelay(
+                            lambda text, path=image_path_str: self.stream_delta.emit(path, text)
+                        )
                         results = self.interrogator.interrogate(
                             image_path_str,
                             task=self.task,
@@ -540,7 +650,9 @@ class MultimodalInterrogationWorker(QThread):
                             included_tables=included_tables,
                             included_transcripts=included_transcripts,
                             sidecar_tags=sidecar_tags,
+                            on_stream_delta=relay,
                         )
+                        relay.flush()
                         if cache_key:
                             self.database.save_interrogation_cache_entry(
                                 image_id=image_id,

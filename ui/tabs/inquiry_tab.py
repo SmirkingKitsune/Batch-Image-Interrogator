@@ -1,11 +1,12 @@
 """Inquiry Tab - dedicated llama.cpp multimodal workflows."""
 
+import copy
 import os
 import platform
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -53,8 +54,12 @@ from ui.llama_runtime import (
     runtime_mode,
 )
 from ui.dialogs_advanced import AdvancedImageInspectionDialog
-from ui.widgets import InquiryTranscriptWidget
-from ui.workers import BatchContextScanWorker, MultimodalInterrogationWorker
+from ui.widgets import InquiryTranscriptWidget, TranscriptTurnHandle
+from ui.workers import (
+    BatchContextScanWorker,
+    MultimodalInterrogationWorker,
+    SingleInquiryWorker,
+)
 
 
 class InquiryTab(QWidget):
@@ -88,6 +93,11 @@ class InquiryTab(QWidget):
 
         self.current_interrogator: Optional[LlamaCppInterrogator] = None
         self.interrogation_worker: Optional[MultimodalInterrogationWorker] = None
+        self.single_inquiry_worker: Optional[SingleInquiryWorker] = None
+        # Live transcript rows waiting on a model response.
+        self.pending_single_card: Optional[TranscriptTurnHandle] = None
+        self.pending_single_request: Optional[Dict[str, Any]] = None
+        self.pending_batch_cards: Dict[str, TranscriptTurnHandle] = {}
         self.loaded_image_paths: List[str] = []
         self.current_directory: Optional[Path] = None
         self.current_recursive = False
@@ -768,6 +778,8 @@ class InquiryTab(QWidget):
 
     def load_model(self):
         """Load llama.cpp interrogator with current config."""
+        if self.single_inquiry_worker is not None:
+            return
         try:
             config = self.get_llama_config()
             binary_path = self._resolve_runtime_or_offer_install(config)
@@ -857,6 +869,8 @@ class InquiryTab(QWidget):
 
     def unload_model(self):
         """Unload current llama model."""
+        if self.single_inquiry_worker is not None:
+            return
         if not self.current_interrogator:
             QMessageBox.information(self, "Info", "No model is currently loaded")
             return
@@ -982,8 +996,20 @@ class InquiryTab(QWidget):
 
     def closeEvent(self, event):
         """Stop background work before the widget goes away."""
+        if not self.single_inquiry_shutdown_ready():
+            event.ignore()
+            QTimer.singleShot(100, self.close)
+            return
         self._stop_batch_context_scan()
         super().closeEvent(event)
+
+    def single_inquiry_shutdown_ready(self) -> bool:
+        """Wait for both inference and queued result persistence before closing.
+
+        Close callers retry through the event loop so streaming and completion
+        slots keep running while the request finishes.
+        """
+        return self.single_inquiry_worker is None
 
     def _stop_batch_context_scan(self):
         """Cancel any in-flight batch context scan."""
@@ -1122,12 +1148,18 @@ class InquiryTab(QWidget):
         return LlamaCppInterrogator.build_transcript_context(history)
 
     def send_single_inquiry(self):
-        """Send one multimodal inquiry turn for selected image."""
+        """Send one multimodal inquiry turn for the selected image.
+
+        The request runs on a worker thread so the transcript can show the
+        prompt and image immediately and stream the response as it arrives.
+        """
         if not self.current_interrogator or not self.current_interrogator.is_loaded:
             QMessageBox.warning(self, "Model Required", "Load a llama model before sending inquiries.")
             return
         if not self.current_image_path:
             QMessageBox.warning(self, "No Image", "Select an image from the shared queue.")
+            return
+        if self.single_inquiry_worker is not None:
             return
 
         try:
@@ -1140,23 +1172,92 @@ class InquiryTab(QWidget):
                 if task == "audit"
                 else []
             )
-            self._save_inquiry_options()
-            self.send_single_button.setEnabled(False)
+            model_name = self.current_interrogator.model_name
+            model_type = self.current_interrogator.get_model_type()
+            model_config = copy.deepcopy(self.current_interrogator.get_config())
+        except Exception as exc:
+            QMessageBox.critical(self, "Inquiry Error", f"Could not build the inquiry request:\n{exc}")
+            return
 
-            results = self.current_interrogator.interrogate(
-                self.current_image_path,
-                task=task,
-                prompt=prompt_text,
-                session_key=self.current_session_key,
-                keep_context=True,
-                included_tables=included_tables,
-                included_transcripts=included_transcripts,
-                sidecar_tags=sidecar_tags,
+        self._save_inquiry_options()
+        self.send_single_button.setEnabled(False)
+        self.reset_context_button.setEnabled(False)
+        self.load_model_button.setEnabled(False)
+        self.unload_model_button.setEnabled(False)
+        self.batch_inquiry_button.setEnabled(False)
+
+        self.pending_single_request = {
+            "task": task,
+            "prompt_text": prompt_text,
+            "included_tables": included_tables,
+            "included_transcripts": included_transcripts,
+            "sidecar_tags": sidecar_tags,
+            "image_path": self.current_image_path,
+            "session_key": self.current_session_key,
+            "image_hash": self.current_image_hash,
+            "model_name": model_name,
+            "model_type": model_type,
+            "model_config": model_config,
+        }
+        pending_turn = {
+            "prompt_type": task,
+            "prompt_text": prompt_text,
+            "included_tables": included_tables,
+            "included_transcripts": included_transcripts,
+            "sidecar_tags": sidecar_tags,
+            "model_name": self.current_interrogator.model_name,
+            "image_path": self.current_image_path,
+        }
+        self.pending_single_card = None
+        if self.mode_tabs.currentIndex() == 0:
+            self.pending_single_card = self.single_transcript.begin_turn_card(
+                pending_turn,
+                image_path=self.current_image_path,
             )
+            self.single_transcript.scrollToBottom()
+        self.progress_label.setText("Waiting for model response...")
 
+        worker = SingleInquiryWorker(
+            interrogator=self.current_interrogator,
+            image_path=self.current_image_path,
+            task=task,
+            prompt=prompt_text,
+            session_key=self.current_session_key,
+            included_tables=included_tables,
+            included_transcripts=included_transcripts,
+            sidecar_tags=sidecar_tags,
+        )
+        worker.stream_delta.connect(self._on_single_stream_delta)
+        worker.completed.connect(self._on_single_inquiry_completed)
+        worker.failed.connect(self._on_single_inquiry_failed)
+        worker.finished.connect(self._on_single_inquiry_finished)
+        self.single_inquiry_worker = worker
+        self.inquiry_started.emit()
+        worker.start()
+
+    def _on_single_stream_delta(self, text: str):
+        """Show partial response text in the pending transcript card."""
+        handle = self.pending_single_card
+        if handle is None or not handle.is_active:
+            return
+        handle.set_stream_text(text)
+        handle.set_status("Streaming response..." if text else "Waiting for model response...")
+
+    def _on_single_inquiry_completed(self, results: Dict[str, Any]):
+        """Persist a finished single inquiry and finalize its transcript card."""
+        request = self.pending_single_request or {}
+        task = request.get("task", "describe")
+        prompt_text = request.get("prompt_text", "")
+        included_tables = request.get("included_tables", []) or []
+        included_transcripts = request.get("included_transcripts", []) or []
+        sidecar_tags = request.get("sidecar_tags", []) or []
+        image_path = request.get("image_path") or self.current_image_path
+        session_key = request.get("session_key") or self.current_session_key
+
+        try:
             if task == "audit":
                 removed_tags, remaining_tags = FileManager.delete_tags_from_file(
-                    Path(self.current_image_path),
+                    Path(image_path),
                     (results.get("multimodal_response") or {}).get("delete_tags", []),
                 )
                 response_json = results.get("multimodal_response", {}) or {}
@@ -1167,19 +1268,19 @@ class InquiryTab(QWidget):
                 results["audit_remaining_tags"] = remaining_tags
                 results["tags"] = remaining_tags
 
-            file_hash = self.current_image_hash or hash_image_content(self.current_image_path)
-            metadata = get_image_metadata(self.current_image_path)
+            file_hash = request.get("image_hash") or hash_image_content(image_path)
+            metadata = get_image_metadata(image_path)
             image_id = self.database.register_image(
-                self.current_image_path,
+                image_path,
                 file_hash,
                 metadata["width"],
                 metadata["height"],
                 metadata["file_size"],
             )
             model_id = self.database.register_model(
-                self.current_interrogator.model_name,
-                self.current_interrogator.get_model_type(),
-                config=self.current_interrogator.get_config(),
+                request["model_name"],
+                request["model_type"],
+                config=request["model_config"],
             )
             self.database.save_interrogation(
                 image_id,
@@ -1193,7 +1294,7 @@ class InquiryTab(QWidget):
                 image_id=image_id,
                 model_id=model_id,
                 mode="single",
-                session_key=self.current_session_key,
+                session_key=session_key,
             )
             response_json = results.get("multimodal_response", {})
             self.database.append_multimodal_turn(
@@ -1208,9 +1309,26 @@ class InquiryTab(QWidget):
                 reasoning_summary=response_json.get("reasoning_summary", ""),
             )
 
-            self.current_interrogations = self.database.get_all_interrogations_for_image(file_hash) or []
-            self._refresh_single_prior_tables()
-            self._refresh_transcript_for_active_mode()
+            self._finalize_single_card(
+                {
+                    "prompt_type": task,
+                    "prompt_text": prompt_text,
+                    "included_tables": included_tables,
+                    "included_transcripts": included_transcripts,
+                    "sidecar_tags": sidecar_tags,
+                    "response_json": response_json,
+                    "tags": results.get("tags", []) or [],
+                    "model_name": request["model_name"],
+                    "image_path": image_path,
+                },
+                image_path,
+            )
+
+            if file_hash == self.current_image_hash:
+                self.current_interrogations = (
+                    self.database.get_all_interrogations_for_image(file_hash) or []
+                )
+                self._refresh_single_prior_tables()
             self.raw_response_view.setPlainText(results.get("raw_output", ""))
 
             warnings = (results.get("multimodal_response") or {}).get("warnings", [])
@@ -1220,23 +1338,78 @@ class InquiryTab(QWidget):
                     f"Audit completed. Removed {len(removed_tags)} sidecar tag(s)."
                 )
             elif warnings:
-                self.progress_label.setText(f"Single-image inquiry completed with warnings: {', '.join(warnings[:2])}")
+                self.progress_label.setText(
+                    f"Single-image inquiry completed with warnings: {', '.join(warnings[:2])}"
+                )
             else:
                 self.progress_label.setText("Single-image inquiry completed.")
         except Exception as exc:
-            recent_logs = self.current_interrogator.runtime.get_recent_logs(max_lines=60)
-            details = f"\n\nRecent llama logs:\n{recent_logs}" if recent_logs else ""
-            error_text = self._append_timeout_hint_if_needed(str(exc))
-            QMessageBox.critical(
-                self,
-                "Inquiry Error",
-                f"Single-image inquiry failed:\n{error_text}{details}",
-            )
-        finally:
-            self.send_single_button.setEnabled(True)
+            self._on_single_inquiry_failed(str(exc))
+
+    def _on_single_inquiry_failed(self, error_text: str):
+        """Surface an inquiry failure in both the card and a dialog."""
+        message = self._append_timeout_hint_if_needed(error_text)
+        handle = self.pending_single_card
+        if handle is not None and handle.is_active:
+            handle.fail(message)
+        self.pending_single_card = None
+        self.progress_label.setText("Single-image inquiry failed.")
+
+        recent_logs = self._recent_runtime_logs()
+        details = f"\n\nRecent llama logs:\n{recent_logs}" if recent_logs else ""
+        QMessageBox.critical(
+            self,
+            "Inquiry Error",
+            f"Single-image inquiry failed:\n{message}{details}",
+        )
+
+    def _recent_runtime_logs(self, max_lines: int = 60) -> str:
+        """Best-effort llama-server log tail for error dialogs."""
+        if not self.current_interrogator:
+            return ""
+        try:
+            return self.current_interrogator.runtime.get_recent_logs(max_lines=max_lines)
+        except Exception:
+            return ""
+
+    def _on_single_inquiry_finished(self):
+        """Restore single-inquiry controls once the worker thread exits."""
+        # QThread.finished can precede thread-local cleanup; join before dropping
+        # the reference or allowing application shutdown to destroy the worker.
+        if self.single_inquiry_worker is not None:
+            self.single_inquiry_worker.wait()
+        self.single_inquiry_worker = None
+        self.pending_single_request = None
+        self.pending_single_card = None
+        self.send_single_button.setEnabled(True)
+        self.reset_context_button.setEnabled(True)
+        self.load_model_button.setEnabled(True)
+        loaded = bool(self.current_interrogator and self.current_interrogator.is_loaded)
+        self.unload_model_button.setEnabled(loaded)
+        self.batch_inquiry_button.setEnabled(loaded and bool(self.loaded_image_paths))
+        self.inquiry_finished.emit()
+
+    def _finalize_single_card(self, turn: Dict[str, Any], image_path: Optional[str]):
+        """Turn the streaming placeholder into the finished card.
+
+        The card is only replaced in place; a full reload would discard the
+        scroll position and any tag edits made on earlier turns.
+        """
+        handle = self.pending_single_card
+        if handle is not None and handle.is_active:
+            handle.complete(turn, image_path=image_path)
+            self.pending_single_card = None
+            self.single_transcript.follow_tail()
+            return
+
+        # The placeholder is gone (image or mode switched mid-request), so fall
+        # back to whatever the active view should be showing now.
+        self._refresh_transcript_for_active_mode()
 
     def reset_single_context(self):
         """Reset current image multimodal session history."""
+        if self.single_inquiry_worker is not None:
+            return
         if not self.current_session_key or not self.current_image_hash:
             return
 
@@ -1259,6 +1432,8 @@ class InquiryTab(QWidget):
 
     def batch_interrogate(self):
         """Start multimodal batch inquiry with shared queue images."""
+        if self.single_inquiry_worker is not None:
+            return
         if not self.current_interrogator or not self.current_interrogator.is_loaded:
             QMessageBox.warning(self, "Model Required", "Load a llama model before batch inquiry.")
             return
@@ -1306,6 +1481,7 @@ class InquiryTab(QWidget):
         self.batch_error_count = 0
         self.last_batch_error = ""
         self.batch_transcript_entries.clear()
+        self.pending_batch_cards.clear()
         self.batch_cancel_requested = False
         self.active_batch_total = len(images)
         self.batch_completed_paths.clear()
@@ -1330,6 +1506,8 @@ class InquiryTab(QWidget):
             use_cache=context_options["use_cache"],
         )
         self.interrogation_worker.progress.connect(self.on_batch_progress)
+        self.interrogation_worker.turn_started.connect(self.on_batch_turn_started)
+        self.interrogation_worker.stream_delta.connect(self.on_batch_stream_delta)
         self.interrogation_worker.result.connect(self.on_batch_result)
         self.interrogation_worker.error.connect(self.on_batch_error)
         self.interrogation_worker.finished.connect(self.on_batch_finished)
@@ -1361,6 +1539,26 @@ class InquiryTab(QWidget):
                 image_path = item.data(Qt.ItemDataRole.UserRole)
                 item.setText(f"Processing - {self._to_display_name(image_path)}")
 
+    def on_batch_turn_started(self, image_path: str, pending_turn: Dict[str, Any]):
+        """Show a batch image's request card as soon as the model is called."""
+        if self.mode_tabs.currentIndex() != 1:
+            return
+        handle = self.single_transcript.begin_turn_card(pending_turn, image_path=image_path)
+        self.pending_batch_cards[image_path] = handle
+        self.single_transcript.follow_tail()
+
+    def on_batch_stream_delta(self, image_path: str, text: str):
+        """Stream a batch response into its pending transcript card."""
+        handle = self.pending_batch_cards.get(image_path)
+        if handle is None or not handle.is_active:
+            return
+        handle.set_stream_text(text)
+        handle.set_status(
+            f"Streaming response for {self._to_display_name(image_path)}..."
+            if text
+            else f"Waiting for {self._to_display_name(image_path)}..."
+        )
+
     def on_batch_result(self, image_path: str, results: Dict[str, Any]):
         """Track batch result and refresh rolling tag frequency table."""
         self.batch_completed_paths.add(image_path)
@@ -1385,9 +1583,14 @@ class InquiryTab(QWidget):
         }
         self.batch_transcript_entries.append(batch_entry)
 
-        if self.mode_tabs.currentIndex() == 1:
+        handle = self.pending_batch_cards.pop(image_path, None)
+        if handle is not None and handle.is_active:
+            handle.complete(batch_entry, image_path=image_path)
+            self.single_transcript.follow_tail()
+        elif self.mode_tabs.currentIndex() == 1:
+            # No placeholder: a cache hit, or the view was cleared mid-batch.
             self._append_transcript_turn_card(batch_entry, image_path=image_path)
-            self.single_transcript.scrollToBottom()
+            self.single_transcript.follow_tail()
 
         if (
             self.current_image_path
@@ -1407,6 +1610,9 @@ class InquiryTab(QWidget):
 
     def on_batch_error(self, image_path: str, error: str):
         """Mark failed batch image rows."""
+        handle = self.pending_batch_cards.pop(image_path, None)
+        if handle is not None and handle.is_active:
+            handle.fail(self._append_timeout_hint_if_needed(error))
         if image_path:
             self.batch_failed_paths.add(image_path)
         for i in range(self.image_queue.count()):
@@ -1420,6 +1626,10 @@ class InquiryTab(QWidget):
 
     def on_batch_finished(self, was_cancelled: bool = False):
         """Reset controls when batch processing completes."""
+        for handle in self.pending_batch_cards.values():
+            if handle.is_active:
+                handle.fail("Batch inquiry ended before this image returned a response.")
+        self.pending_batch_cards.clear()
         self.batch_inquiry_button.setEnabled(bool(self.current_interrogator and self.loaded_image_paths))
         self.cancel_button.setEnabled(False)
         worker_cancelled = bool(was_cancelled)
@@ -1450,9 +1660,7 @@ class InquiryTab(QWidget):
         self._refresh_batch_context_sources()
         self.inquiry_finished.emit()
         if self.batch_error_count > 0:
-            recent_logs = ""
-            if self.current_interrogator:
-                recent_logs = self.current_interrogator.runtime.get_recent_logs(max_lines=60)
+            recent_logs = self._recent_runtime_logs()
             details = f"\n\nRecent llama logs:\n{recent_logs}" if recent_logs else ""
             QMessageBox.warning(
                 self,

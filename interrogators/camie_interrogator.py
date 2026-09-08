@@ -137,7 +137,10 @@ class CamieInterrogator(BaseInterrogator):
         }
 
         try:
-            import onnxruntime as ort
+            # Imported up front purely to fail fast: the model download below
+            # is multi-gigabyte, so a missing dependency should surface before
+            # it rather than after.
+            import onnxruntime  # noqa: F401
             from huggingface_hub import hf_hub_download
 
             # Get correct file names for this model
@@ -157,13 +160,13 @@ class CamieInterrogator(BaseInterrogator):
             with open(metadata_path, 'r') as f:
                 self.tags_data = self._normalize_metadata(json.load(f))
 
-            # Load ONNX model with provider settings if available
-            if provider_settings:
-                self.model = provider_settings.create_inference_session(model_path, device)
-            else:
-                # Fallback to default behavior
-                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
-                self.model = ort.InferenceSession(model_path, providers=providers)
+            # Route every caller through ONNXProviderSettings so the saved
+            # preference (TensorRT/CUDA/CPU-only) and the tuned session options
+            # apply whether or not the UI passed a settings object.
+            if provider_settings is None:
+                from core.onnx_providers import get_default_provider_settings
+                provider_settings = get_default_provider_settings()
+            self.model = provider_settings.create_inference_session(model_path, device)
 
             self.is_loaded = True
 

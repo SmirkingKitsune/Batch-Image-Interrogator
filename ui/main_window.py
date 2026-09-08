@@ -448,9 +448,10 @@ class MainWindow(QMainWindow):
 
     def _on_interrogation_started(self):
         """Handle interrogation start across tabs."""
-        # Show background process indicator
+        # Show background process indicator. Single-image inquiries run in the
+        # background too, so the wording stays neutral between the two.
         self.background_indicator.setText("Interrogating...")
-        self.statusBar().showMessage("Batch processing started...")
+        self.statusBar().showMessage("Processing started...")
 
     def _on_image_interrogated(self, image_path: str):
         """Handle per-image gallery update during batch interrogation."""
@@ -470,7 +471,7 @@ class MainWindow(QMainWindow):
         self.gallery_tab._update_tag_filter()
 
         # Update status bar
-        self.statusBar().showMessage("Batch processing complete", 5000)
+        self.statusBar().showMessage("Processing complete", 5000)
 
     def get_llama_config(self) -> Dict:
         """Expose Inquiry-tab llama configuration for child dialogs."""
@@ -494,6 +495,12 @@ class MainWindow(QMainWindow):
     
     def closeEvent(self, event):
         """Handle application close."""
+        if hasattr(self, "inquiry_tab") and self.inquiry_tab:
+            if not self.inquiry_tab.single_inquiry_shutdown_ready():
+                event.ignore()
+                self.statusBar().showMessage("Waiting for the active inquiry before closing...")
+                QTimer.singleShot(100, self.close)
+                return
         # Cleanup
         if self.interrogation_tab and getattr(self.interrogation_tab, "current_interrogator", None):
             self.interrogation_tab.current_interrogator.unload_model()

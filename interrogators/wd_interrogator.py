@@ -52,7 +52,10 @@ class WDInterrogator(BaseInterrogator):
         }
 
         try:
-            import onnxruntime as ort
+            # Imported up front purely to fail fast: the model download below
+            # is multi-gigabyte, so a missing dependency should surface before
+            # it rather than after.
+            import onnxruntime  # noqa: F401
             from huggingface_hub import hf_hub_download
             import pandas as pd
 
@@ -63,12 +66,13 @@ class WDInterrogator(BaseInterrogator):
             # Load tags
             self.tags = pd.read_csv(tags_path)
 
-            # Load ONNX model with provider settings if available
-            if provider_settings:
-                self.model = provider_settings.create_inference_session(model_path, device)
-            else:
-                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
-                self.model = ort.InferenceSession(model_path, providers=providers)
+            # Route every caller through ONNXProviderSettings so the saved
+            # preference (TensorRT/CUDA/CPU-only) and the tuned session options
+            # apply whether or not the UI passed a settings object.
+            if provider_settings is None:
+                from core.onnx_providers import get_default_provider_settings
+                provider_settings = get_default_provider_settings()
+            self.model = provider_settings.create_inference_session(model_path, device)
 
             # Drop the cached input name so it is re-read from the new session.
             self.input_name = None

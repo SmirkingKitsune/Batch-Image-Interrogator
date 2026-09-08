@@ -401,22 +401,21 @@ ARCH=$(uname -m)
 if [ "$INSTALL_CUDA" = "y" ]; then
     echo "      Installing ONNX Runtime with CUDA support for WD Tagger..."
 
-    # Check if ARM64 - onnxruntime-gpu doesn't provide ARM wheels on PyPI
-    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-        if python3 -c "import onnxruntime as ort; exit(0 if 'CUDAExecutionProvider' in ort.get_available_providers() else 1)" 2>/dev/null; then
-            echo -e "${GREEN}      Existing ONNX Runtime CUDA provider detected on ARM64; keeping current install.${NC}"
-        else
-            echo -e "${YELLOW}      [INFO] ARM64 detected - onnxruntime-gpu wheels not available on PyPI${NC}"
-            echo "      Installing CPU-only ONNX Runtime (WD Tagger will run on CPU)..."
-            echo "      Tip: Run ./build_onnx_arm64.sh to build ONNX Runtime with GPU support."
-            pip install "onnxruntime>=1.16.0" || echo -e "${YELLOW}      [WARNING] Failed to install ONNX Runtime. Continuing anyway...${NC}"
-        fi
+    if python3 -c "import onnxruntime as ort; exit(0 if 'CUDAExecutionProvider' in ort.get_available_providers() else 1)" 2>/dev/null; then
+        echo -e "${GREEN}      Existing ONNX Runtime CUDA provider detected; keeping current install.${NC}"
     else
-        # For x86_64, try GPU version
+        # onnxruntime-gpu publishes manylinux aarch64 wheels as of 1.19, so ARM64
+        # no longer needs a source build. The [cuda,cudnn] extras pull the
+        # matching nvidia-* runtime packages; without cudnn the CUDA provider
+        # loads but fails at the first Conv node.
+        # onnxruntime and onnxruntime-gpu both provide the `onnxruntime` module,
+        # so the CPU build must be removed first or the two shadow each other.
+        pip uninstall -y onnxruntime 2>/dev/null
+
         ONNX_INSTALLED=false
-        if pip install "onnxruntime-gpu>=1.16.0" --extra-index-url https://pypi.nvidia.com 2>/dev/null; then
+        if pip install "onnxruntime-gpu[cuda,cudnn]>=1.19.0" 2>/dev/null; then
             ONNX_INSTALLED=true
-        elif pip install "onnxruntime-gpu>=1.16.0" 2>/dev/null; then
+        elif pip install "onnxruntime-gpu>=1.16.0" --extra-index-url https://pypi.nvidia.com 2>/dev/null; then
             ONNX_INSTALLED=true
         fi
 
