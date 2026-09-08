@@ -177,14 +177,22 @@ class ONNXProviderSettings:
 
         return providers if providers else ['CPUExecutionProvider']
 
-    def get_provider_options(self) -> List[Dict]:
+    def get_provider_options(self, device: str = 'cuda') -> List[Dict]:
         """
         Get provider options for each provider in the chain.
+
+        Args:
+            device: Requested device ('cuda' or 'cpu'). Must match the device
+                passed to get_provider_chain(), since ONNX Runtime pairs
+                options with providers positionally -- building the options
+                from a different chain than the one being used silently hands
+                CUDA options (gpu_mem_limit, cudnn_conv_algo_search) to
+                CPUExecutionProvider.
 
         Returns:
             List of option dicts matching provider chain order
         """
-        chain = self.get_provider_chain()
+        chain = self.get_provider_chain(device)
         options = []
 
         for provider in chain:
@@ -251,7 +259,7 @@ class ONNXProviderSettings:
         import onnxruntime as ort
 
         providers = self.get_provider_chain(device)
-        provider_options = self.get_provider_options()[:len(providers)]
+        provider_options = self.get_provider_options(device)
         sess_options = self.get_session_options()
 
         # Create session with providers and options
@@ -308,3 +316,23 @@ class ONNXProviderSettings:
             'cuda': 'Available' if status['cuda_available'] else 'Not available',
             'providers_count': len(status['all_providers'])
         }
+
+
+# Global singleton instance
+_default_settings = None
+
+
+def get_default_provider_settings() -> ONNXProviderSettings:
+    """
+    Get or create the shared ONNXProviderSettings instance.
+
+    Interrogators used outside the UI (scripts, examples.py, direct API use)
+    have no settings object handed to them. Falling back to this singleton
+    rather than an inline provider list keeps those callers on the same saved
+    preference as the UI, and avoids re-reading the settings file and
+    re-creating the TensorRT cache directory on every model load.
+    """
+    global _default_settings
+    if _default_settings is None:
+        _default_settings = ONNXProviderSettings()
+    return _default_settings

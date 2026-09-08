@@ -12,14 +12,18 @@ clip-interrogator>=0.6.0
 # Note: PyTorch and ONNX Runtime are handled by setup scripts
 # The setup script will automatically install:
 #   - PyTorch with CUDA (if NVIDIA GPU detected), PyTorch with ROCm (if AMD GPU detected on linux) or PyTorch (for CPU-only)
-#   - onnxruntime-gpu (if GPU detected on x86_64) or onnxruntime (CPU-only)
+#   - onnxruntime-gpu (if GPU detected) or onnxruntime (CPU-only)
 #
-# ARM64 Note: onnxruntime-gpu wheels are not available on PyPI for ARM64.
-# WD Tagger will run on CPU. For GPU support, build onnxruntime from source.
-# See: https://onnxruntime.ai/docs/build/eps.html#cuda
+# ARM64 Note: onnxruntime-gpu publishes manylinux aarch64 wheels as of 1.19, so
+# ARM64 GPU support no longer needs a source build (build_onnx_arm64.sh is only
+# a fallback for older versions or unsupported CUDA combinations).
 #
-# Manual installation (x86_64):
+# Manual installation:
 #   GPU: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-#        pip install onnxruntime-gpu>=1.16.0
+#        pip uninstall -y onnxruntime          # both provide the `onnxruntime` module
+#        pip install "onnxruntime-gpu[cuda,cudnn]>=1.19.0"
 #   CPU: pip install torch torchvision
 #        pip install onnxruntime>=1.16.0
+#
+# The [cuda,cudnn] extras matter: without cudnn the CUDA provider still appears
+# in get_available_providers() but every Conv node fails at inference time.

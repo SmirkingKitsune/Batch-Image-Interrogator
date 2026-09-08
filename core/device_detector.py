@@ -82,6 +82,21 @@ class DeviceDetector:
         """Detect ONNX Runtime CUDA availability."""
         try:
             import onnxruntime as ort
+
+            # The pip nvidia-* packages ship only SONAME-versioned libraries
+            # (libcudnn.so.9), but ONNX Runtime dlopens the unversioned
+            # libcudnn.so. Without a preload the CUDA provider still *lists* as
+            # available and then fails at the first Conv node with
+            # "cuDNN is unavailable or disabled". preload_dlls() resolves the
+            # libraries out of site-packages up front. This process is
+            # single-threaded Qt (all workers are QThreads), so preloading once
+            # here covers every session created later.
+            if hasattr(ort, 'preload_dlls'):
+                try:
+                    ort.preload_dlls()
+                except Exception as e:
+                    logger.warning(f"ONNX Runtime dependency preload failed: {e}")
+
             providers = ort.get_available_providers()
             self._onnx_cuda_available = 'CUDAExecutionProvider' in providers
 
