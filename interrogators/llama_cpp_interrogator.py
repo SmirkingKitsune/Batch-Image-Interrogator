@@ -11,6 +11,7 @@ from core.base_interrogator import BaseInterrogator
 from core.llama_cpp_runtime import (
     LlamaCppRuntimeManager,
     LlamaCppRuntimeError,
+    LlamaCppStallError,
     is_llama_timeout_error,
 )
 
@@ -23,12 +24,17 @@ class LlamaCppInterrogator(BaseInterrogator):
     RESPONSE_TOOL_NAME = "submit_multimodal_response"
     REQUEST_TIMEOUT_SECONDS = 120.0
     REQUEST_TIMEOUT_RETRY_SECONDS = 300.0
+    # Generous on purpose. Prompt prefill on a large image runs for tens of
+    # seconds before the first token appears, and that is normal on modest
+    # hardware; only genuine silence should trip this.
+    STREAM_STALL_SECONDS = 180.0
 
     def __init__(self, model_name: str = "LlamaCpp"):
         super().__init__(model_name)
         self.runtime = LlamaCppRuntimeManager.get_instance()
         self.temperature = 0.0
         self.max_tokens = 4096
+        self.disable_reasoning = False
         self.server_url: Optional[str] = None
         self._owns_runtime = False
         self._session_history: Dict[str, List[Dict[str, Any]]] = {}
@@ -44,9 +50,20 @@ class LlamaCppInterrogator(BaseInterrogator):
         max_tokens: Optional[int] = None,
         server_port: int = 8080,
         server_host: str = "127.0.0.1",
+        disable_reasoning: bool = False,
+        no_reasoning_preserve: bool = False,
         **kwargs,
     ):
-        """Start or reuse managed llama.cpp server and load multimodal model."""
+        """Start or reuse managed llama.cpp server and load multimodal model.
+
+        Args:
+            disable_reasoning: Ask the chat template to skip thinking, per
+                request. Models that emit reasoning spend most of their token
+                budget on it and the app keeps only the final JSON, so turning
+                it off is what makes a modest `max_tokens` viable.
+            no_reasoning_preserve: Launch the server with
+                `--no-reasoning-preserve`. Changing it restarts the server.
+        """
         model_path = Path(llama_model_path).expanduser().resolve()
         resolved_port = self.runtime.resolve_server_port(
             host=str(server_host),
@@ -56,6 +73,7 @@ class LlamaCppInterrogator(BaseInterrogator):
         self.model_name = model_label
         self.temperature = float(temperature)
         self.max_tokens = int(max_tokens if max_tokens is not None else ctx_size)
+        self.disable_reasoning = bool(disable_reasoning)
 
         self.config = {
             "llama_binary_path": str(Path(llama_binary_path).expanduser().resolve()),
@@ -71,6 +89,8 @@ class LlamaCppInterrogator(BaseInterrogator):
             "max_tokens": self.max_tokens,
             "server_port": int(resolved_port),
             "server_host": str(server_host),
+            "disable_reasoning": self.disable_reasoning,
+            "no_reasoning_preserve": bool(no_reasoning_preserve),
             **kwargs,
         }
 
@@ -83,6 +103,7 @@ class LlamaCppInterrogator(BaseInterrogator):
                 port=self.config["server_port"],
                 ctx_size=self.config["ctx_size"],
                 gpu_layers=self.config["gpu_layers"],
+                no_reasoning_preserve=self.config["no_reasoning_preserve"],
             )
             self._owns_runtime = True
             self.is_loaded = True
@@ -338,6 +359,19 @@ class LlamaCppInterrogator(BaseInterrogator):
         self.is_loaded = False
         self.server_url = None
 
+    def _build_chat_template_kwargs(self) -> Optional[Dict[str, Any]]:
+        """Template variables for the current reasoning setting.
+
+        `enable_thinking` is the Qwen3-family switch and is the one llama.cpp
+        forwards verbatim to the jinja template. Templates that do not declare
+        it ignore the variable, so sending it is safe across models; returning
+        None when reasoning is left on keeps the payload byte-identical to
+        before this option existed.
+        """
+        if not self.disable_reasoning:
+            return None
+        return {"enable_thinking": False}
+
     def _chat_completion_with_timeout_retry(
         self,
         messages: List[Dict[str, Any]],
@@ -348,7 +382,13 @@ class LlamaCppInterrogator(BaseInterrogator):
         tool_choice: Optional[Dict[str, Any]] = None,
         on_delta: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
-        """Run completion with one timeout-specific retry at a longer timeout."""
+        """Run completion with one timeout-specific retry at a longer timeout.
+
+        A stall is not retried. `LlamaCppStallError` is outside the
+        `is_llama_timeout_error` family precisely so it propagates on the first
+        occurrence instead of buying a wedged generation a second, longer run.
+        """
+        chat_template_kwargs = self._build_chat_template_kwargs()
         try:
             response = self.runtime.chat_completion(
                 messages=messages,
@@ -359,6 +399,8 @@ class LlamaCppInterrogator(BaseInterrogator):
                 tool_choice=tool_choice,
                 timeout=self.REQUEST_TIMEOUT_SECONDS,
                 on_delta=on_delta,
+                chat_template_kwargs=chat_template_kwargs,
+                stall_timeout=self.STREAM_STALL_SECONDS,
             )
             if on_delta is not None and self._is_empty_completion(response):
                 # Not every llama.cpp build emits tool-call deltas over SSE.
@@ -371,8 +413,11 @@ class LlamaCppInterrogator(BaseInterrogator):
                     tools=tools,
                     tool_choice=tool_choice,
                     timeout=self.REQUEST_TIMEOUT_SECONDS,
+                    chat_template_kwargs=chat_template_kwargs,
                 )
             return response
+        except LlamaCppStallError:
+            raise
         except LlamaCppRuntimeError as exc:
             if not is_llama_timeout_error(exc):
                 raise
@@ -386,6 +431,7 @@ class LlamaCppInterrogator(BaseInterrogator):
                 tools=tools,
                 tool_choice=tool_choice,
                 timeout=self.REQUEST_TIMEOUT_RETRY_SECONDS,
+                chat_template_kwargs=chat_template_kwargs,
             )
         except LlamaCppRuntimeError as retry_exc:
             if is_llama_timeout_error(retry_exc):

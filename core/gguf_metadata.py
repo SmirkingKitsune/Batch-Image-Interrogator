@@ -69,8 +69,17 @@ def read_gguf_metadata(model_path: str) -> Dict[str, Any]:
 
 
 def get_gguf_context_length(model_path: str) -> Optional[int]:
-    """Return the model context length from GGUF metadata when present."""
-    metadata = read_gguf_metadata(model_path)
+    """Return the model context length, reading the file at `model_path`."""
+    return context_length_from_metadata(read_gguf_metadata(model_path))
+
+
+def context_length_from_metadata(metadata: Dict[str, Any]) -> Optional[int]:
+    """Return the model context length from already-parsed GGUF metadata.
+
+    Split from `get_gguf_context_length` so callers that already hold the
+    metadata -- sizing code needs the attention shape from the same dict --
+    do not re-read and re-parse the file just to recover this one value.
+    """
     architecture = metadata.get("general.architecture")
     candidate_keys = []
     if isinstance(architecture, str) and architecture:

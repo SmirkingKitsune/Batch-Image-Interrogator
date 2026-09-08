@@ -9,11 +9,22 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QFileDialog, QSpinBox)
 from PyQt6.QtWidgets import QPlainTextEdit
 from PyQt6.QtCore import Qt
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from pathlib import Path
 from core.clip_model_loader import get_categorized_models
 from core import FileManager, ProvisionConfig
-from core.gguf_metadata import get_gguf_context_length
+from core.gguf_metadata import read_gguf_metadata
+from core.context_sizing import (
+    format_bytes,
+    kv_bytes_per_token,
+    model_max_context,
+    suggest_context_size,
+)
+
+# Stand-in for the largest prompt the job is expected to send, until measured
+# `usage.prompt_tokens` is persisted and a real percentile can replace it.
+# Sized from observed multimodal batch prompts, which run 6,000-7,400 tokens.
+DEFAULT_WORKLOAD_PROMPT_TOKENS = 8192
 from core.llama_provisioner import (
     ACCELERATORS,
     current_arch,
@@ -919,7 +930,12 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
             'gpu_layers_spin': QSpinBox,
             'temperature_spin': QDoubleSpinBox,
             'max_tokens_spin': QSpinBox,
-            'server_port_spin': QSpinBox
+            'disable_reasoning_check': QCheckBox,
+            'no_reasoning_preserve_check': QCheckBox,
+            'server_port_spin': QSpinBox,
+            'metadata_status_label': QLabel,
+            'apply_suggestion_btn': QPushButton,
+            'read_metadata_btn': QPushButton
         }
     """
     widget = QWidget(parent)
@@ -1000,7 +1016,19 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
 
     metadata_status_label = QLabel("")
     metadata_status_label.setWordWrap(True)
-    model_form.addRow("Model Metadata:", metadata_status_label)
+    # The suggestion is offered rather than applied. This used to overwrite
+    # Context Size and Max Tokens with the model's trained maximum the moment
+    # metadata was read, which silently replaced tuned values with a ceiling.
+    apply_suggestion_btn = QPushButton("Apply Suggested")
+    apply_suggestion_btn.setEnabled(False)
+    apply_suggestion_btn.setToolTip("Set Context Size to the suggested value.")
+    metadata_layout = QHBoxLayout()
+    metadata_layout.setContentsMargins(0, 0, 0, 0)
+    metadata_layout.addWidget(metadata_status_label, stretch=1)
+    metadata_layout.addWidget(apply_suggestion_btn, alignment=Qt.AlignmentFlag.AlignTop)
+    metadata_widget = QWidget()
+    metadata_widget.setLayout(metadata_layout)
+    model_form.addRow("Model Metadata:", metadata_widget)
 
     # These hold long absolute paths that the field shows only the tail of.
     for path_edit in (model_path_edit, mmproj_path_edit, binary_path_edit):
@@ -1042,6 +1070,28 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     max_tokens_spin.setValue(int(llama_config.get("max_tokens", default_ctx_size)))
     inference_form.addRow("Max Tokens:", max_tokens_spin)
 
+    disable_reasoning_check = QCheckBox("Skip model reasoning")
+    disable_reasoning_check.setChecked(bool(llama_config.get("disable_reasoning", False)))
+    disable_reasoning_check.setToolTip(
+        "Ask the chat template not to emit a thinking block. Reasoning models "
+        "can spend most of their token budget on thinking that this app "
+        "discards, so turning it off cuts time per image sharply and lets a "
+        "smaller Max Tokens finish the JSON. May cost some accuracy on "
+        "ambiguous images. Applies per request; no reload needed."
+    )
+    inference_form.addRow("Reasoning:", disable_reasoning_check)
+
+    no_reasoning_preserve_check = QCheckBox("Do not carry reasoning between turns")
+    no_reasoning_preserve_check.setChecked(
+        bool(llama_config.get("no_reasoning_preserve", False))
+    )
+    no_reasoning_preserve_check.setToolTip(
+        "Passes --no-reasoning-preserve. Stops earlier thinking blocks from "
+        "being replayed into each new turn, which otherwise grows the prompt "
+        "across a multi-turn session. Changing this restarts the server."
+    )
+    inference_form.addRow("", no_reasoning_preserve_check)
+
     server_port_spin = QSpinBox()
     server_port_spin.setRange(1024, 65535)
     server_port_spin.setValue(int(llama_config.get("server_port", 8080)))
@@ -1052,7 +1102,14 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     layout.addWidget(inference_group)
 
     # ---- Model metadata wiring --------------------------------------------
-    def _apply_model_metadata():
+    # Holds the most recent suggestion so the Apply button can act on it.
+    suggestion_holder: Dict[str, Any] = {"ctx": None}
+
+    def _report_model_metadata():
+        """Read the GGUF and report sizing facts. Changes no field by itself."""
+        suggestion_holder["ctx"] = None
+        apply_suggestion_btn.setEnabled(False)
+
         model_path = model_path_edit.text().strip()
         if not model_path:
             metadata_status_label.setText("No model path selected.")
@@ -1060,32 +1117,94 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
             return
 
         try:
-            context_length = get_gguf_context_length(model_path)
+            metadata = read_gguf_metadata(model_path)
         except Exception as exc:
             metadata_status_label.setText(f"Could not read GGUF metadata: {exc}")
             metadata_status_label.setStyleSheet("color: orange;")
             return
 
-        if not context_length:
-            metadata_status_label.setText("No context length found in GGUF metadata.")
+        model_max = model_max_context(metadata)
+        per_token = kv_bytes_per_token(metadata)
+        if not model_max and per_token is None:
+            metadata_status_label.setText(
+                "No context length or attention shape found in GGUF metadata."
+            )
             metadata_status_label.setStyleSheet("color: orange;")
             return
 
-        bounded_context = max(ctx_size_spin.minimum(), min(ctx_size_spin.maximum(), int(context_length)))
-        ctx_size_spin.setValue(bounded_context)
-        max_tokens_spin.setValue(bounded_context)
-        metadata_status_label.setText(
-            f"Detected context length: {context_length}. Context Size and Max Tokens updated."
+        lines = []
+        if model_max:
+            lines.append(f"Trained context: {model_max:,} tokens.")
+
+        current_ctx = ctx_size_spin.value()
+        if per_token:
+            lines.append(
+                f"Dense-attention KV estimate (f16): {format_bytes(per_token)}/token — "
+                f"{format_bytes(per_token * current_ctx)} at the current "
+                f"{current_ctx:,}."
+            )
+
+        # Max Tokens is the reply budget, a property of the task rather than of
+        # the model, so it is an input to the suggestion and never an output.
+        suggestion = suggest_context_size(
+            metadata,
+            prompt_tokens=DEFAULT_WORKLOAD_PROMPT_TOKENS,
+            max_tokens=max_tokens_spin.value(),
+            # Host MemAvailable does not establish available accelerator memory
+            # or account for weights and encoder buffers. Do not claim fit.
+            available_bytes=None,
         )
+        bounded = max(
+            ctx_size_spin.minimum(),
+            min(ctx_size_spin.maximum(), suggestion.suggested_ctx),
+        )
+        lines.append(
+            f"Suggested context: {bounded:,} "
+            f"({format_bytes(per_token * bounded if per_token else None)} estimated KV, "
+            f"bound by {suggestion.bound_by}), assuming prompts up to "
+            f"{DEFAULT_WORKLOAD_PROMPT_TOKENS:,} tokens."
+        )
+        lines.extend(suggestion.notes)
+        lines.append("Estimate excludes weights and compute buffers; hybrid, recurrent, "
+                     "and sliding-window models may allocate differently. Memory fit is unverified.")
+
+        if bounded != current_ctx:
+            suggestion_holder["ctx"] = bounded
+            apply_suggestion_btn.setEnabled(True)
+        else:
+            lines.append("Context Size already matches the suggestion.")
+
+        metadata_status_label.setText(" ".join(lines))
         metadata_status_label.setStyleSheet("color: green;")
+
+    def _apply_suggested_context():
+        suggested = suggestion_holder.get("ctx")
+        if not suggested:
+            return
+        ctx_size_spin.setValue(int(suggested))
+        apply_suggestion_btn.setEnabled(False)
+        suggestion_holder["ctx"] = None
+        metadata_status_label.setText(f"Context Size set to {int(suggested):,}.")
+        metadata_status_label.setStyleSheet("color: green;")
+
+    apply_suggestion_btn.clicked.connect(_apply_suggested_context)
+
+    def _invalidate_suggestion(*_):
+        suggestion_holder["ctx"] = None
+        apply_suggestion_btn.setEnabled(False)
+        metadata_status_label.setText("Settings changed. Read Metadata to refresh the estimate.")
+
+    model_path_edit.textChanged.connect(_invalidate_suggestion)
+    ctx_size_spin.valueChanged.connect(_invalidate_suggestion)
+    max_tokens_spin.valueChanged.connect(_invalidate_suggestion)
 
     def _browse_model_path():
         _browse_path(model_path_edit, "Select multimodal GGUF model")
-        _apply_model_metadata()
+        _report_model_metadata()
 
     model_btn.clicked.connect(_browse_model_path)
-    model_metadata_btn.clicked.connect(_apply_model_metadata)
-    model_path_edit.editingFinished.connect(_apply_model_metadata)
+    model_metadata_btn.clicked.connect(_report_model_metadata)
+    model_path_edit.editingFinished.connect(_report_model_metadata)
 
     # ---- Provisioning ------------------------------------------------------
     def _provision():
@@ -1109,7 +1228,12 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
         "gpu_layers_spin": gpu_layers_spin,
         "temperature_spin": temperature_spin,
         "max_tokens_spin": max_tokens_spin,
+        "disable_reasoning_check": disable_reasoning_check,
+        "no_reasoning_preserve_check": no_reasoning_preserve_check,
         "server_port_spin": server_port_spin,
+        "metadata_status_label": metadata_status_label,
+        "apply_suggestion_btn": apply_suggestion_btn,
+        "read_metadata_btn": model_metadata_btn,
     }
     return widget, references
 

@@ -428,9 +428,14 @@ class InquiryTab(QWidget):
 
         for key in ("binary_path_edit", "model_path_edit", "mmproj_path_edit"):
             self.llama_config_refs[key].textChanged.connect(lambda *_: self._save_inquiry_options())
-        self.llama_config_refs["custom_binary_check"].toggled.connect(
-            lambda *_: self._save_inquiry_options()
-        )
+        for key in (
+            "custom_binary_check",
+            "disable_reasoning_check",
+            "no_reasoning_preserve_check",
+        ):
+            self.llama_config_refs[key].toggled.connect(
+                lambda *_: self._save_inquiry_options()
+            )
         for key in ("ctx_size_spin", "gpu_layers_spin", "temperature_spin", "max_tokens_spin", "server_port_spin"):
             self.llama_config_refs[key].valueChanged.connect(lambda _: self._save_inquiry_options())
         self.single_task_combo.currentTextChanged.connect(lambda *_: self._save_inquiry_options())
@@ -627,6 +632,12 @@ class InquiryTab(QWidget):
                 "gpu_layers": self.llama_config_refs["gpu_layers_spin"].value(),
                 "temperature": self.llama_config_refs["temperature_spin"].value(),
                 "max_tokens": self.llama_config_refs["max_tokens_spin"].value(),
+                "disable_reasoning": self.llama_config_refs[
+                    "disable_reasoning_check"
+                ].isChecked(),
+                "no_reasoning_preserve": self.llama_config_refs[
+                    "no_reasoning_preserve_check"
+                ].isChecked(),
                 "server_port": self.llama_config_refs["server_port_spin"].value(),
             }
         )
@@ -807,6 +818,8 @@ class InquiryTab(QWidget):
                 max_tokens=config["max_tokens"],
                 server_port=config["server_port"],
                 server_host="127.0.0.1",
+                disable_reasoning=config.get("disable_reasoning", False),
+                no_reasoning_preserve=config.get("no_reasoning_preserve", False),
             )
             requested_port = int(config.get("server_port", 8080))
             resolved_port = int(

@@ -23,6 +23,16 @@ class LlamaCppRuntimeError(RuntimeError):
     """Raised when llama.cpp runtime operations fail."""
 
 
+class LlamaCppStallError(LlamaCppRuntimeError):
+    """Raised when a streamed completion stops producing tokens.
+
+    Distinct from a timeout on purpose. A timeout means "the wall clock ran
+    out", and retrying at a longer limit is reasonable. A stall means the
+    server accepted the request and then went quiet while still holding the
+    connection open, so a longer limit only buys more silence.
+    """
+
+
 def _absolute_keep_symlinks(path: str) -> Path:
     """Absolute, lexically normalized, with symlinks left intact.
 
@@ -34,6 +44,13 @@ def _absolute_keep_symlinks(path: str) -> Path:
 
 def is_llama_timeout_error(value: Any) -> bool:
     """Return True when error content indicates a request timeout."""
+    # A stall is deliberately not a timeout: the retry ladder above exists to
+    # give slow hardware more wall clock, which is the opposite of what a
+    # silent server needs. Checked first so the cause walk below cannot
+    # reclassify it via the socket error that surfaced it.
+    if isinstance(value, LlamaCppStallError):
+        return False
+
     stack: List[Any] = [value]
     seen: set[int] = set()
 
@@ -114,9 +131,15 @@ class LlamaCppRuntimeManager:
         ctx_size: int = 4096,
         gpu_layers: int = -1,
         startup_timeout: float = 90.0,
+        no_reasoning_preserve: bool = False,
     ) -> str:
         """
         Ensure a matching llama.cpp server is available and healthy.
+
+        Args:
+            no_reasoning_preserve: Pass `--no-reasoning-preserve`, which stops
+                the chat template from carrying earlier thinking blocks into
+                each new turn. Only affects templates that support reasoning.
 
         Returns:
             Base URL for OpenAI-compatible server endpoint.
@@ -149,6 +172,7 @@ class LlamaCppRuntimeManager:
             int(resolved_port),
             int(ctx_size),
             int(gpu_layers),
+            bool(no_reasoning_preserve),
         )
         base_url = f"http://{host}:{resolved_port}"
 
@@ -177,6 +201,8 @@ class LlamaCppRuntimeManager:
             ]
             if mmproj:
                 cmd.extend(["--mmproj", str(mmproj)])
+            if no_reasoning_preserve:
+                cmd.append("--no-reasoning-preserve")
 
             try:
                 log_dir = Path(__file__).resolve().parents[1] / "cache" / "llama_cpp" / "logs"
@@ -441,6 +467,8 @@ class LlamaCppRuntimeManager:
         tool_choice: Optional[Dict[str, Any]] = None,
         timeout: float = 120.0,
         on_delta: Optional[Callable[[str], None]] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        stall_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send an OpenAI-compatible chat completion request to llama-server.
 
@@ -448,6 +476,17 @@ class LlamaCppRuntimeManager:
         the callback with each text fragment as it arrives. The return value has
         the same shape either way, so callers that only want the final response
         do not care which transport was used.
+
+        Args:
+            chat_template_kwargs: Extra variables for the jinja chat template,
+                e.g. `{"enable_thinking": False}` on Qwen3-family models.
+            stall_timeout: Streaming only. Abort when no token arrives for this
+                many seconds. `timeout` cannot express this: on a buffered
+                request the socket is idle for the whole generation, so a limit
+                low enough to catch a wedged server also kills slow-but-healthy
+                hardware. With SSE, tokens are the progress signal, so the two
+                cases separate cleanly and this can be strict without
+                penalising a machine that is merely slow.
         """
         with self._lock:
             base_url = self._base_url
@@ -469,6 +508,8 @@ class LlamaCppRuntimeManager:
             payload["tools"] = tools
         if tool_choice:
             payload["tool_choice"] = tool_choice
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = dict(chat_template_kwargs)
 
         data = json.dumps(payload).encode("utf-8")
         req = request.Request(
@@ -477,16 +518,31 @@ class LlamaCppRuntimeManager:
             method="POST",
             headers={"Content-Type": "application/json"},
         )
+        # urllib applies `timeout` per socket operation, not to the request as a
+        # whole. While streaming that already behaves like an idle limit, so the
+        # stall budget is the more useful bound to hand the socket.
+        stalls = streaming and stall_timeout is not None and stall_timeout > 0
+        socket_timeout = float(stall_timeout) if stalls else timeout
+
         try:
-            with request.urlopen(req, timeout=timeout) as resp:
+            with request.urlopen(req, timeout=socket_timeout) as resp:
                 if streaming:
-                    return self._read_sse_completion(resp, on_delta)
+                    return self._read_sse_completion(
+                        resp,
+                        on_delta,
+                        stall_timeout=float(stall_timeout) if stalls else None,
+                    )
                 body = resp.read().decode("utf-8")
                 return json.loads(body)
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise LlamaCppRuntimeError(f"llama-server HTTP error {exc.code}: {detail}") from exc
         except (error.URLError, TimeoutError) as exc:
+            if stalls and is_llama_timeout_error(exc):
+                # Silence on an open SSE connection is a stall, not a deadline.
+                raise LlamaCppStallError(
+                    f"llama-server sent no stream data for {stall_timeout:.0f}s"
+                ) from None
             raise LlamaCppRuntimeError(f"llama-server request failed: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise LlamaCppRuntimeError(f"Invalid JSON response from llama-server: {exc}") from exc
@@ -495,18 +551,36 @@ class LlamaCppRuntimeManager:
     def _read_sse_completion(
         response: Any,
         on_delta: Callable[[str], None],
+        stall_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Consume an SSE chat-completion stream into a non-streaming response.
 
         Content and forced tool-call arguments both arrive as `delta` fragments;
         they are reassembled into the `message` shape the non-streaming endpoint
         returns so response parsing stays in one place.
+
+        `stall_timeout` is measured against generated tokens rather than socket
+        traffic. Keepalives and empty chunks keep the socket warm without the
+        model making progress, so a socket-level limit alone would sit through a
+        wedged generation indefinitely.
         """
         content_parts: List[str] = []
         tool_calls: Dict[int, Dict[str, Any]] = {}
         finish_reason: Optional[str] = None
+        last_progress = time.monotonic()
+
+        def _check_stall() -> None:
+            if stall_timeout is None:
+                return
+            idle = time.monotonic() - last_progress
+            if idle > stall_timeout:
+                raise LlamaCppStallError(
+                    f"llama-server produced no tokens for {idle:.0f}s "
+                    f"(limit {stall_timeout:.0f}s); abandoning the stream"
+                )
 
         for raw_line in response:
+            _check_stall()
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line or not line.startswith("data:"):
                 continue
@@ -534,9 +608,15 @@ class LlamaCppRuntimeManager:
             if not isinstance(delta, dict):
                 continue
 
+            # Thinking is generation progress even when it is not displayed.
+            if any(isinstance(delta.get(key), str) and delta[key]
+                   for key in ("reasoning_content", "reasoning")):
+                last_progress = time.monotonic()
+
             fragment = delta.get("content")
             if isinstance(fragment, str) and fragment:
                 content_parts.append(fragment)
+                last_progress = time.monotonic()
                 on_delta(fragment)
 
             for call in delta.get("tool_calls") or []:
@@ -557,6 +637,7 @@ class LlamaCppRuntimeManager:
                 arguments = function_obj.get("arguments")
                 if isinstance(arguments, str) and arguments:
                     entry["function"]["arguments"] += arguments
+                    last_progress = time.monotonic()
                     on_delta(arguments)
 
         message: Dict[str, Any] = {
