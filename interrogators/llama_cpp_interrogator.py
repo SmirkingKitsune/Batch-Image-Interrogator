@@ -359,6 +359,19 @@ class LlamaCppInterrogator(BaseInterrogator):
         self.is_loaded = False
         self.server_url = None
 
+    def set_disable_reasoning(self, disable_reasoning: bool) -> None:
+        """Change the reasoning setting on an already-loaded model.
+
+        `enable_thinking` rides on each request rather than the server command
+        line, so this needs no reload — unlike `no_reasoning_preserve`, which is
+        a launch flag and does restart the server. Takes effect on the next
+        request, which mid-batch means the next image rather than the one
+        currently generating.
+        """
+        self.disable_reasoning = bool(disable_reasoning)
+        if isinstance(getattr(self, "config", None), dict):
+            self.config["disable_reasoning"] = self.disable_reasoning
+
     def _build_chat_template_kwargs(self) -> Optional[Dict[str, Any]]:
         """Template variables for the current reasoning setting.
 

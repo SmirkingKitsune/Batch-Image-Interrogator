@@ -1077,7 +1077,8 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
         "can spend most of their token budget on thinking that this app "
         "discards, so turning it off cuts time per image sharply and lets a "
         "smaller Max Tokens finish the JSON. May cost some accuracy on "
-        "ambiguous images. Applies per request; no reload needed."
+        "ambiguous images. Takes effect on the next request without a reload, "
+        "an in-flight request keeps its existing setting."
     )
     inference_form.addRow("Reasoning:", disable_reasoning_check)
 

@@ -218,6 +218,29 @@ class ReasoningWiringTests(unittest.TestCase):
         interrogator, _ = self._load(disable_reasoning=False)
         self.assertIsNone(interrogator._build_chat_template_kwargs())
 
+    def test_reasoning_can_be_changed_without_reloading(self):
+        # The tooltip promises no reload. Before this setter existed the value
+        # was only read by load_model(), so a mid-session toggle did nothing.
+        interrogator, runtime_mock = self._load(disable_reasoning=False)
+        self.assertIsNone(interrogator._build_chat_template_kwargs())
+
+        interrogator.set_disable_reasoning(True)
+
+        self.assertEqual(
+            interrogator._build_chat_template_kwargs(),
+            {"enable_thinking": False},
+        )
+        self.assertTrue(interrogator.get_config()["disable_reasoning"])
+        # No reload: the server was started once, at load_model().
+        self.assertEqual(runtime_mock.ensure_server.call_count, 1)
+
+    def test_reasoning_can_be_turned_back_on_without_reloading(self):
+        interrogator, _ = self._load(disable_reasoning=True)
+        interrogator.set_disable_reasoning(False)
+
+        self.assertIsNone(interrogator._build_chat_template_kwargs())
+        self.assertFalse(interrogator.get_config()["disable_reasoning"])
+
     def test_no_reasoning_preserve_reaches_ensure_server(self):
         _, runtime_mock = self._load(no_reasoning_preserve=True)
         kwargs = runtime_mock.ensure_server.call_args.kwargs

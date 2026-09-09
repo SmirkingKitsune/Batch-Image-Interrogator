@@ -436,6 +436,9 @@ class InquiryTab(QWidget):
             self.llama_config_refs[key].toggled.connect(
                 lambda *_: self._save_inquiry_options()
             )
+        self.llama_config_refs["disable_reasoning_check"].toggled.connect(
+            self._on_disable_reasoning_toggled
+        )
         for key in ("ctx_size_spin", "gpu_layers_spin", "temperature_spin", "max_tokens_spin", "server_port_spin"):
             self.llama_config_refs[key].valueChanged.connect(lambda _: self._save_inquiry_options())
         self.single_task_combo.currentTextChanged.connect(lambda *_: self._save_inquiry_options())
@@ -615,6 +618,21 @@ class InquiryTab(QWidget):
             return float(self.get_llama_config().get("temperature", 0.0)) == 0.0
         except (TypeError, ValueError):
             return False
+
+    def _on_disable_reasoning_toggled(self, checked: bool):
+        """Push the reasoning setting onto a model that is already loaded.
+
+        `enable_thinking` travels on each request, so unlike the launch-flag
+        toggle beside it this needs no reload. Without this the checkbox would
+        only be read by load_model() and a mid-session change would silently do
+        nothing until the next 30 GB reload.
+        """
+        interrogator = self.current_interrogator
+        if interrogator is None:
+            return
+        setter = getattr(interrogator, "set_disable_reasoning", None)
+        if callable(setter):
+            setter(bool(checked))
 
     def get_llama_config(self) -> Dict[str, Any]:
         """Return latest llama.cpp configuration from UI controls."""
