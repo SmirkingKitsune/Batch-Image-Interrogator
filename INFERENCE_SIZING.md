@@ -27,6 +27,31 @@ MemAvailable or guarantee memory fit; core.context_sizing.available_memory_bytes
 exists for the deferred workload work and is not called by the UI. Confirm
 actual allocations from the runtime for a hardware-specific budget.
 
+Reasoning Budget caps thinking at N tokens via --reasoning-budget; -1 passes no
+flag and leaves it unrestricted, 0 ends thinking immediately. It is a launch
+flag, so changing it requires reloading the model. It has no effect while Skip
+model reasoning is checked, since that removes the thinking block the budget
+would bound; the control is disabled in that state, but a settings file can
+still hold both and the budget is silently ignored.
+
+Measured on Qwen3-VL 27B with WD/Camie context, two images, per image:
+
+| mode | tags | approx s/image |
+|---|---|---|
+| skip reasoning | 14 / 18 | 45 |
+| budget 512 | 30 / 52 | 155 |
+| budget 1024 | 30 / 56 | 235 |
+| unrestricted | 30 / 39 | 900-1900 |
+
+At budget 1024 one image reproduced the unrestricted tag list exactly, so
+unrestricted reasoning was spending 6,500-13,700 tokens to reach an answer 1024
+tokens reaches. Skipping reasoning also changed an answer, not just its length:
+it emitted two_boys where WD (0.97), unrestricted, 512 and 1024 all agree on
+1boy. Higher budgets are not monotonically better - budget 1024 on the second
+image produced dog_ears and wolf_ears together, and every mode emits synonym
+pairs the prompt forbids. Treat these numbers as two images on one model, not a
+general result.
+
 Skip model reasoning sends enable_thinking=false to compatible chat templates.
 It rides on each request, so it takes effect on the next request with no
 reload; an in-flight request keeps its existing setting. Do not

@@ -931,6 +931,7 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
             'temperature_spin': QDoubleSpinBox,
             'max_tokens_spin': QSpinBox,
             'disable_reasoning_check': QCheckBox,
+            'reasoning_budget_spin': QSpinBox,
             'no_reasoning_preserve_check': QCheckBox,
             'server_port_spin': QSpinBox,
             'metadata_status_label': QLabel,
@@ -1082,6 +1083,28 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     )
     inference_form.addRow("Reasoning:", disable_reasoning_check)
 
+    reasoning_budget_spin = QSpinBox()
+    reasoning_budget_spin.setRange(-1, 32768)
+    reasoning_budget_spin.setSingleStep(128)
+    reasoning_budget_spin.setSpecialValueText("Unrestricted")  # displayed at -1
+    reasoning_budget_spin.setValue(int(llama_config.get("reasoning_budget", -1)))
+    reasoning_budget_spin.setToolTip(
+        "Cap thinking at N tokens instead of removing it. -1 leaves reasoning "
+        "unrestricted; 0 ends it immediately. A smaller budget can reduce "
+        "generation time, but may affect answer quality. Ignored while Skip "
+        "model reasoning is checked. Reload the model to apply a changed budget."
+    )
+    inference_form.addRow("Reasoning Budget:", reasoning_budget_spin)
+
+    def _sync_budget_enabled(*_):
+        # The budget bounds thinking, so with thinking switched off there is
+        # nothing to bound. Grey it out rather than leave a live-looking
+        # control that cannot affect the result.
+        reasoning_budget_spin.setEnabled(not disable_reasoning_check.isChecked())
+
+    disable_reasoning_check.toggled.connect(_sync_budget_enabled)
+    _sync_budget_enabled()
+
     no_reasoning_preserve_check = QCheckBox("Do not carry reasoning between turns")
     no_reasoning_preserve_check.setChecked(
         bool(llama_config.get("no_reasoning_preserve", False))
@@ -1230,6 +1253,7 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
         "temperature_spin": temperature_spin,
         "max_tokens_spin": max_tokens_spin,
         "disable_reasoning_check": disable_reasoning_check,
+        "reasoning_budget_spin": reasoning_budget_spin,
         "no_reasoning_preserve_check": no_reasoning_preserve_check,
         "server_port_spin": server_port_spin,
         "metadata_status_label": metadata_status_label,

@@ -52,6 +52,7 @@ class LlamaCppInterrogator(BaseInterrogator):
         server_host: str = "127.0.0.1",
         disable_reasoning: bool = False,
         no_reasoning_preserve: bool = False,
+        reasoning_budget: int = -1,
         **kwargs,
     ):
         """Start or reuse managed llama.cpp server and load multimodal model.
@@ -63,6 +64,9 @@ class LlamaCppInterrogator(BaseInterrogator):
                 it off is what makes a modest `max_tokens` viable.
             no_reasoning_preserve: Launch the server with
                 `--no-reasoning-preserve`. Changing it restarts the server.
+            reasoning_budget: Cap thinking at N tokens rather than removing it.
+                -1 is unrestricted. Quality and speed depend on the model and
+                task. This launch flag requires reloading the model to apply.
         """
         model_path = Path(llama_model_path).expanduser().resolve()
         resolved_port = self.runtime.resolve_server_port(
@@ -91,6 +95,7 @@ class LlamaCppInterrogator(BaseInterrogator):
             "server_host": str(server_host),
             "disable_reasoning": self.disable_reasoning,
             "no_reasoning_preserve": bool(no_reasoning_preserve),
+            "reasoning_budget": int(reasoning_budget),
             **kwargs,
         }
 
@@ -104,6 +109,7 @@ class LlamaCppInterrogator(BaseInterrogator):
                 ctx_size=self.config["ctx_size"],
                 gpu_layers=self.config["gpu_layers"],
                 no_reasoning_preserve=self.config["no_reasoning_preserve"],
+                reasoning_budget=self.config["reasoning_budget"],
             )
             self._owns_runtime = True
             self.is_loaded = True

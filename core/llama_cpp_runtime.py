@@ -132,6 +132,7 @@ class LlamaCppRuntimeManager:
         gpu_layers: int = -1,
         startup_timeout: float = 90.0,
         no_reasoning_preserve: bool = False,
+        reasoning_budget: int = -1,
     ) -> str:
         """
         Ensure a matching llama.cpp server is available and healthy.
@@ -140,6 +141,10 @@ class LlamaCppRuntimeManager:
             no_reasoning_preserve: Pass `--no-reasoning-preserve`, which stops
                 the chat template from carrying earlier thinking blocks into
                 each new turn. Only affects templates that support reasoning.
+            reasoning_budget: Thinking token budget. -1 leaves it unrestricted
+                and passes no flag at all, so the command line is unchanged for
+                callers that do not set it. 0 ends thinking immediately; N>0
+                caps it at N tokens.
 
         Returns:
             Base URL for OpenAI-compatible server endpoint.
@@ -173,6 +178,7 @@ class LlamaCppRuntimeManager:
             int(ctx_size),
             int(gpu_layers),
             bool(no_reasoning_preserve),
+            int(reasoning_budget),
         )
         base_url = f"http://{host}:{resolved_port}"
 
@@ -203,6 +209,8 @@ class LlamaCppRuntimeManager:
                 cmd.extend(["--mmproj", str(mmproj)])
             if no_reasoning_preserve:
                 cmd.append("--no-reasoning-preserve")
+            if int(reasoning_budget) >= 0:
+                cmd.extend(["--reasoning-budget", str(int(reasoning_budget))])
 
             try:
                 log_dir = Path(__file__).resolve().parents[1] / "cache" / "llama_cpp" / "logs"

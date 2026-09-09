@@ -251,6 +251,15 @@ class ReasoningWiringTests(unittest.TestCase):
         kwargs = runtime_mock.ensure_server.call_args.kwargs
         self.assertFalse(kwargs["no_reasoning_preserve"])
 
+    def test_reasoning_budget_reaches_ensure_server(self):
+        interrogator, runtime_mock = self._load(reasoning_budget=512)
+        self.assertEqual(runtime_mock.ensure_server.call_args.kwargs["reasoning_budget"], 512)
+        self.assertEqual(interrogator.get_config()["reasoning_budget"], 512)
+
+    def test_reasoning_budget_defaults_to_unrestricted(self):
+        _, runtime_mock = self._load()
+        self.assertEqual(runtime_mock.ensure_server.call_args.kwargs["reasoning_budget"], -1)
+
 
 class ServerFlagTests(unittest.TestCase):
     """--no-reasoning-preserve must reach the command line and the config key.
@@ -286,6 +295,24 @@ class ServerFlagTests(unittest.TestCase):
 
     def test_flag_is_absent_by_default(self):
         self.assertNotIn("--no-reasoning-preserve", self._launch_argv())
+
+    def test_reasoning_budget_is_passed_as_a_pair(self):
+        argv = self._launch_argv(reasoning_budget=512)
+        self.assertIn("--reasoning-budget", argv)
+        self.assertEqual(argv[argv.index("--reasoning-budget") + 1], "512")
+
+    def test_zero_budget_is_passed_not_treated_as_unset(self):
+        # 0 is meaningful to llama.cpp ("end thinking immediately"), so it must
+        # not be swallowed by a falsy check the way -1 is deliberately skipped.
+        argv = self._launch_argv(reasoning_budget=0)
+        self.assertIn("--reasoning-budget", argv)
+        self.assertEqual(argv[argv.index("--reasoning-budget") + 1], "0")
+
+    def test_unrestricted_budget_leaves_the_command_line_untouched(self):
+        # -1 must add no flag at all, so upgrading does not change the command
+        # for anyone who never sets this.
+        self.assertNotIn("--reasoning-budget", self._launch_argv(reasoning_budget=-1))
+        self.assertNotIn("--reasoning-budget", self._launch_argv())
 
 
 if __name__ == "__main__":

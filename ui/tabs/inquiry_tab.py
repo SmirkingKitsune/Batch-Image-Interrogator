@@ -439,7 +439,8 @@ class InquiryTab(QWidget):
         self.llama_config_refs["disable_reasoning_check"].toggled.connect(
             self._on_disable_reasoning_toggled
         )
-        for key in ("ctx_size_spin", "gpu_layers_spin", "temperature_spin", "max_tokens_spin", "server_port_spin"):
+        for key in ("ctx_size_spin", "gpu_layers_spin", "temperature_spin",
+                    "max_tokens_spin", "reasoning_budget_spin", "server_port_spin"):
             self.llama_config_refs[key].valueChanged.connect(lambda _: self._save_inquiry_options())
         self.single_task_combo.currentTextChanged.connect(lambda *_: self._save_inquiry_options())
         self.single_prompt_input.textChanged.connect(lambda *_: self._save_inquiry_options())
@@ -653,6 +654,9 @@ class InquiryTab(QWidget):
                 "disable_reasoning": self.llama_config_refs[
                     "disable_reasoning_check"
                 ].isChecked(),
+                "reasoning_budget": self.llama_config_refs[
+                    "reasoning_budget_spin"
+                ].value(),
                 "no_reasoning_preserve": self.llama_config_refs[
                     "no_reasoning_preserve_check"
                 ].isChecked(),
@@ -838,6 +842,7 @@ class InquiryTab(QWidget):
                 server_host="127.0.0.1",
                 disable_reasoning=config.get("disable_reasoning", False),
                 no_reasoning_preserve=config.get("no_reasoning_preserve", False),
+                reasoning_budget=config.get("reasoning_budget", -1),
             )
             requested_port = int(config.get("server_port", 8080))
             resolved_port = int(
