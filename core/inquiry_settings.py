@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from core.atomic_write import write_json_atomic
+
 
 class InquirySettings:
     """Manages persisted llama.cpp inquiry options."""
@@ -61,8 +63,7 @@ class InquirySettings:
     def save_settings(self):
         """Save inquiry options to disk."""
         try:
-            with open(self.settings_file, "w", encoding="utf-8") as f:
-                json.dump(self.options, f, indent=2, ensure_ascii=False)
+            write_json_atomic(self.settings_file, self.options, ensure_ascii=False)
         except Exception as exc:
             print(f"Error saving inquiry settings: {exc}")
 

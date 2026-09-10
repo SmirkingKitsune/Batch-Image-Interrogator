@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import List, Dict, Set, Tuple
 
+from core.atomic_write import write_json_atomic
+
 
 class TagFilterSettings:
     """Manages tag filtering rules for customizing output."""
@@ -64,8 +66,7 @@ class TagFilterSettings:
                 'replace_underscores': self.replace_underscores,
                 'underscore_skip_list': list(self.underscore_skip_list)
             }
-            with open(self.settings_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            write_json_atomic(self.settings_file, data, ensure_ascii=False)
         except Exception as e:
             print(f"Error saving tag filter settings: {e}")
 

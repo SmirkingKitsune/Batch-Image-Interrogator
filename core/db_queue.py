@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+from core.atomic_write import write_json_atomic
+
 
 @dataclass
 class QueuedOperation:
@@ -273,11 +275,10 @@ class DatabaseOperationQueue:
         }
 
         try:
-            # Write atomically using a temp file
-            temp_path = self.queue_path.with_suffix('.tmp')
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-            temp_path.replace(self.queue_path)
+            # This already used a temp file and a rename; the shared helper adds
+            # the fsync that makes the replace survive a power loss, and cleans
+            # up the temp file when the write fails.
+            write_json_atomic(self.queue_path, data)
         except Exception:
             # If save fails, the queue remains in memory
             # Will be retried on next save attempt

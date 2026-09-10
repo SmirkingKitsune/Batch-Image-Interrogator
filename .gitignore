@@ -19,9 +19,9 @@ onnxruntime_build/
 interrogations.db*
 *.log
 1.16.0
-onnx_provider_settings.json
-inquiry_settings.json
-tag_filters.json
+onnx_provider_settings.json*
+inquiry_settings.json*
+tag_filters.json*
 
 # Local tooling/editor state
 .claude/
@@ -29,3 +29,11 @@ tag_filters.json
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Private credentials and local backups
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+/rma-backup/

@@ -6,6 +6,8 @@ from enum import Enum
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
+from core.atomic_write import write_json_atomic
+
 
 class ProviderPreference(Enum):
     """Execution provider preference options."""
@@ -103,8 +105,7 @@ class ONNXProviderSettings:
                 'preference': self.preference.value,
                 'trt_options': self.trt_options
             }
-            with open(self.settings_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
+            write_json_atomic(self.settings_file, data)
         except Exception as e:
             print(f"Error saving ONNX provider settings: {e}")
 
