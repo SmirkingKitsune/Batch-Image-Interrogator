@@ -8,7 +8,6 @@
 # - Detect NVIDIA GPU and CUDA support
 # - Install PyTorch with appropriate CUDA version
 # - Install all dependencies
-# - Provision llama.cpp llama-server from GitHub releases
 # - Verify the setup
 # ============================================================
 
@@ -23,12 +22,6 @@ NC='\033[0m' # No Color
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
-DEFAULT_LLAMA_BIN="$SCRIPT_DIR/cache/llama_cpp/bin/llama-server"
-LLAMA_BINARY_PATH="$DEFAULT_LLAMA_BIN"
-LLAMA_STATUS="not_checked"
-LLAMA_VERSION=""
-LLAMA_MESSAGE=""
-
 detect_cuda_version() {
     local detected=""
     local source="unknown"
@@ -119,7 +112,7 @@ echo "============================================================"
 echo ""
 
 # Check if Python is installed
-echo -e "${BLUE}[1/8] Checking Python installation...${NC}"
+echo -e "${BLUE}[1/7] Checking Python installation...${NC}"
 if ! command -v python3 &> /dev/null; then
     echo -e "${RED}[ERROR] Python 3 is not installed!${NC}"
     echo "Please install Python 3.10 or higher"
@@ -142,7 +135,7 @@ echo -e "${GREEN}      Version check: OK${NC}"
 echo ""
 
 # Create virtual environment if it doesn't exist
-echo -e "${BLUE}[2/8] Setting up virtual environment...${NC}"
+echo -e "${BLUE}[2/7] Setting up virtual environment...${NC}"
 if [ ! -d "venv" ]; then
     echo "      Creating new virtual environment..."
     python3 -m venv venv
@@ -153,14 +146,14 @@ fi
 echo ""
 
 # Activate virtual environment
-echo -e "${BLUE}[3/8] Activating virtual environment...${NC}"
+echo -e "${BLUE}[3/7] Activating virtual environment...${NC}"
 source venv/bin/activate
 echo -e "${GREEN}      Virtual environment activated${NC}"
 echo ""
 
 # Detect OS
 OS_TYPE=$(uname -s)
-echo -e "${BLUE}[4/8] Detecting GPU and acceleration support...${NC}"
+echo -e "${BLUE}[4/7] Detecting GPU and acceleration support...${NC}"
 echo ""
 
 INSTALL_CUDA="n"
@@ -257,7 +250,7 @@ fi
 echo ""
 
 # Check current PyTorch installation
-echo -e "${BLUE}[5/8] Checking PyTorch installation...${NC}"
+echo -e "${BLUE}[5/7] Checking PyTorch installation...${NC}"
 if python3 -c "import torch" 2>/dev/null; then
     TORCH_VERSION=$(python3 -c "import torch; print(f'PyTorch {torch.__version__}')")
     echo "      Current: ${TORCH_VERSION}"
@@ -335,7 +328,7 @@ echo ""
 
 # Install or update PyTorch
 if [ "$NEED_PYTORCH" = "y" ]; then
-    echo -e "${BLUE}[6/8] Installing PyTorch...${NC}"
+    echo -e "${BLUE}[6/7] Installing PyTorch...${NC}"
     echo ""
 
     # Uninstall existing PyTorch
@@ -387,13 +380,13 @@ if [ "$NEED_PYTORCH" = "y" ]; then
     echo ""
     echo -e "${GREEN}      PyTorch installed successfully!${NC}"
 else
-    echo -e "${BLUE}[6/8] PyTorch installation...${NC}"
+    echo -e "${BLUE}[6/7] PyTorch installation...${NC}"
     echo "      Skipping PyTorch installation"
 fi
 echo ""
 
 # Install other requirements
-echo -e "${BLUE}[7/8] Installing remaining dependencies...${NC}"
+echo -e "${BLUE}[7/7] Installing remaining dependencies...${NC}"
 echo ""
 
 # Install ONNX Runtime based on GPU availability
@@ -450,56 +443,6 @@ echo ""
 echo -e "${GREEN}      All dependencies installed successfully!${NC}"
 echo ""
 
-echo -e "${BLUE}[8/8] Provisioning llama.cpp llama-server...${NC}"
-echo ""
-if [ -x "$DEFAULT_LLAMA_BIN" ] && [ -z "${LLAMA_CPP_VERSION:-}" ]; then
-    LLAMA_STATUS="existing"
-    LLAMA_MESSAGE="Existing llama-server binary found; skipping download."
-    if [ -f "$SCRIPT_DIR/cache/llama_cpp/bin/llama-server.version" ]; then
-        LLAMA_VERSION="$(cat "$SCRIPT_DIR/cache/llama_cpp/bin/llama-server.version" 2>/dev/null || true)"
-    fi
-else
-    LLAMA_ARGS=(--cache-dir "$SCRIPT_DIR/cache/llama_cpp")
-    if [ "$INSTALL_CUDA" = "y" ]; then
-        LLAMA_ARGS+=(--prefer-cuda)
-        if [ -n "${DETECTED_CUDA:-}" ]; then
-            LLAMA_ARGS+=(--cuda-version "${DETECTED_CUDA}")
-        fi
-    fi
-    if [ "$INSTALL_ROCM" = "y" ]; then
-        LLAMA_ARGS+=(--prefer-rocm)
-    fi
-    if [ -n "${LLAMA_CPP_VERSION:-}" ]; then
-        LLAMA_ARGS+=(--tag "${LLAMA_CPP_VERSION}")
-    fi
-
-    LLAMA_OUTPUT="$(python3 "$SCRIPT_DIR/provision_llama_server.py" "${LLAMA_ARGS[@]}")"
-    while IFS='=' read -r key value; do
-        case "$key" in
-            LLAMA_STATUS) LLAMA_STATUS="$value" ;;
-            LLAMA_BINARY_PATH) LLAMA_BINARY_PATH="$value" ;;
-            LLAMA_VERSION) LLAMA_VERSION="$value" ;;
-            LLAMA_MESSAGE) LLAMA_MESSAGE="$value" ;;
-        esac
-    done <<< "$LLAMA_OUTPUT"
-fi
-
-if [ "$LLAMA_STATUS" = "installed" ]; then
-    echo -e "${GREEN}      llama-server installed: $LLAMA_BINARY_PATH${NC}"
-elif [ "$LLAMA_STATUS" = "existing" ]; then
-    echo -e "${GREEN}      llama-server ready: $LLAMA_BINARY_PATH${NC}"
-else
-    echo -e "${YELLOW}      [WARNING] Failed to provision llama-server automatically.${NC}"
-    if [ -n "$LLAMA_MESSAGE" ]; then
-        echo -e "${YELLOW}      $LLAMA_MESSAGE${NC}"
-    fi
-    echo "      Manual fallback: https://github.com/ggml-org/llama.cpp/releases"
-    echo "      Tip: retry with build output using:"
-    echo "        python3 provision_llama_server.py --cache-dir \"$SCRIPT_DIR/cache/llama_cpp\" --method source --verbose"
-    echo "      Or provision from the app: Inquiry -> llama-server Path -> Provision..."
-fi
-echo ""
-
 # Verify installation
 echo "============================================================"
 echo "VERIFYING INSTALLATION"
@@ -532,18 +475,9 @@ python3 -c "import PyQt6; print('  PyQt6: Installed')" 2>/dev/null || echo -e "$
 python3 -c "from clip_interrogator import Interrogator; print('  CLIP Interrogator: Installed')" 2>/dev/null || echo -e "${RED}  [ERROR] CLIP Interrogator: NOT INSTALLED${NC}"
 python3 -c "import PIL; print('  Pillow: Installed')" 2>/dev/null || echo -e "${RED}  [ERROR] Pillow: NOT INSTALLED${NC}"
 echo ""
-echo "llama.cpp runtime:"
-if [ -x "$LLAMA_BINARY_PATH" ]; then
-    echo "  Binary: $LLAMA_BINARY_PATH"
-    if [ -n "$LLAMA_VERSION" ]; then
-        echo "  Release: $LLAMA_VERSION"
-    fi
-else
-    echo "  Binary: NOT INSTALLED (set manually in LlamaCpp MM config)"
-    if [ -n "$LLAMA_MESSAGE" ]; then
-        echo "  Note: $LLAMA_MESSAGE"
-    fi
-fi
+echo "llama.cpp can be compiled in the app:"
+echo "  Inquiry -> llama-server Path -> Provision..."
+echo "  Select Install Method: Source build only"
 echo ""
 
 if [ "$INSTALL_ROCM" = "y" ]; then
