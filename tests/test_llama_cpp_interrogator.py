@@ -16,6 +16,61 @@ LlamaCppInterrogator = MODULE.LlamaCppInterrogator
 class TestLlamaCppInterrogator(unittest.TestCase):
     """Tests for parsing and prompt helpers that don't require runtime server."""
 
+    def test_inference_recovers_from_rejected_json_grammar(self):
+        interrogator = LlamaCppInterrogator()
+        interrogator.is_loaded = True
+        interrogator.runtime = mock.Mock()
+        response = {"choices": [{"message": {"content":
+            '{"tags":["cat"],"comment":"A cat.","warnings":[]}'}}]}
+        interrogator.runtime.chat_completion.side_effect = [
+            MODULE.LlamaCppRuntimeError(
+                "llama-server HTTP error 400: Failed to initialize samplers: "
+                "failed to parse grammar"
+            ),
+            response,
+        ]
+        on_delta = mock.Mock()
+        with mock.patch.object(interrogator, "_encode_image_as_data_url",
+                               return_value="data:image/png;base64,test"):
+            result = interrogator.interrogate(
+                "image.png", task="describe", on_stream_delta=on_delta,
+            )
+        self.assertEqual(result["tags"], ["cat"])
+        first, fallback = interrogator.runtime.chat_completion.call_args_list
+        self.assertEqual(first.kwargs["response_format"], {"type": "json_object"})
+        for call in (first, fallback):
+            self.assertIsNone(call.kwargs["tools"])
+            self.assertIsNone(call.kwargs["tool_choice"])
+        self.assertIsNone(fallback.kwargs["response_format"])
+        self.assertEqual(first.kwargs["messages"], fallback.kwargs["messages"])
+        self.assertIs(first.kwargs["on_delta"], fallback.kwargs["on_delta"])
+
+    def test_output_constraint_fallback_is_bounded(self):
+        interrogator = LlamaCppInterrogator()
+        interrogator.runtime = mock.Mock()
+        interrogator.runtime.chat_completion.side_effect = MODULE.LlamaCppRuntimeError(
+            "llama-server HTTP error 400: failed to parse grammar"
+        )
+        with self.assertRaises(MODULE.LlamaCppRuntimeError):
+            interrogator._chat_completion_with_timeout_retry(
+                [], 0.0, 256, response_format={"type": "json_object"},
+            )
+        self.assertEqual(interrogator.runtime.chat_completion.call_count, 2)
+
+    def test_unrelated_http_errors_are_not_retried(self):
+        for detail in ("400: context size exceeded", "500: grammar failure"):
+            with self.subTest(detail=detail):
+                interrogator = LlamaCppInterrogator()
+                interrogator.runtime = mock.Mock()
+                interrogator.runtime.chat_completion.side_effect = MODULE.LlamaCppRuntimeError(
+                    "llama-server HTTP error " + detail
+                )
+                with self.assertRaises(MODULE.LlamaCppRuntimeError):
+                    interrogator._chat_completion_with_timeout_retry(
+                        [], 0.0, 256, response_format={"type": "json_object"},
+                    )
+                self.assertEqual(interrogator.runtime.chat_completion.call_count, 1)
+
     def test_parse_valid_json_response(self):
         raw = (
             '{"tags":["cat","indoor"],'

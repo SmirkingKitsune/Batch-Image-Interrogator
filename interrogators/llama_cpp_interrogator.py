@@ -180,11 +180,6 @@ class LlamaCppInterrogator(BaseInterrogator):
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 response_format={"type": "json_object"},
-                tools=self._build_response_tools(),
-                tool_choice={
-                    "type": "function",
-                    "function": {"name": self.RESPONSE_TOOL_NAME},
-                },
                 on_delta=on_delta,
             )
         except LlamaCppRuntimeError as exc:
@@ -235,11 +230,6 @@ class LlamaCppInterrogator(BaseInterrogator):
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     response_format={"type": "json_object"},
-                    tools=self._build_response_tools(),
-                    tool_choice={
-                        "type": "function",
-                        "function": {"name": self.RESPONSE_TOOL_NAME},
-                    },
                 )
                 retry_content = self._extract_assistant_content(retry_response)
                 parsed = self._parse_and_validate_json_response(retry_content, task=task)
@@ -257,11 +247,6 @@ class LlamaCppInterrogator(BaseInterrogator):
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     response_format=None,
-                    tools=self._build_response_tools(),
-                    tool_choice={
-                        "type": "function",
-                        "function": {"name": self.RESPONSE_TOOL_NAME},
-                    },
                 )
                 fallback_content = self._extract_assistant_content(fallback_response)
                 parsed = self._parse_and_validate_json_response(fallback_content, task=task)
@@ -392,6 +377,40 @@ class LlamaCppInterrogator(BaseInterrogator):
         return {"enable_thinking": False}
 
     def _chat_completion_with_timeout_retry(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+        response_format: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Dict[str, Any]] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        """Retry rejected output constraints once using prompt-only JSON.
+
+        Keep this separate from timeout retries: unrelated HTTP errors and
+        stalled generations must still propagate without another attempt.
+        """
+        try:
+            return self._chat_completion_with_transport_retry(
+                messages, temperature, max_tokens, response_format,
+                tools, tool_choice, on_delta,
+            )
+        except LlamaCppRuntimeError as exc:
+            detail = str(exc).lower()
+            if not (
+                (response_format or tools or tool_choice)
+                and "http error 400:" in detail
+                and any(marker in detail for marker in (
+                    "grammar", "response_format", "tool_choice",
+                ))
+            ):
+                raise
+        return self._chat_completion_with_transport_retry(
+            messages, temperature, max_tokens, on_delta=on_delta,
+        )
+
+    def _chat_completion_with_transport_retry(
         self,
         messages: List[Dict[str, Any]],
         temperature: float,
