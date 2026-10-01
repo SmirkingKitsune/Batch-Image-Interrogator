@@ -14,6 +14,16 @@ from pathlib import Path
 from core.clip_model_loader import get_categorized_models
 from core import FileManager, ProvisionConfig
 from core.gguf_metadata import read_gguf_metadata
+from core.model_catalog import (
+    CAMIE_CATEGORIES,
+    CAMIE_DEFAULT_CATEGORY_THRESHOLDS,
+    CAMIE_MODELS,
+    CAMIE_THRESHOLD_PROFILES,
+    CAPTION_MODELS,
+    CLIP_MODES,
+    FALLBACK_CLIP_MODELS,
+    WD_MODELS,
+)
 from core.context_sizing import (
     format_bytes,
     kv_bytes_per_token,
@@ -125,13 +135,7 @@ def _populate_clip_models_combo(clip_model_combo: QComboBox, models_dict=None):
     except Exception as e:
         logger.error(f"Error populating CLIP models: {e}")
         # Fallback to minimal list
-        clip_model_combo.addItems([
-            'ViT-L-14/openai',
-            'ViT-H-14/laion2b_s32b_b79k',
-            'ViT-g-14/laion2b_s12b_b42k',
-            'ViT-B-32/openai',
-            'ViT-B-16/openai'
-        ])
+        clip_model_combo.addItems(FALLBACK_CLIP_MODELS)
         logger.info("Using fallback CLIP model list")
 
 
@@ -192,14 +196,7 @@ def create_clip_config_widget(clip_config: Dict, parent=None, populate_models: b
 
     # Caption Model selection
     caption_model_combo = QComboBox()
-    caption_model_combo.addItems([
-        'None',
-        'blip-base',
-        'blip-large',
-        'blip2-2.7b',
-        'blip2-flan-t5-xl',
-        'git-large-coco'
-    ])
+    caption_model_combo.addItems(CAPTION_MODELS)
     current_caption_model = clip_config.get('caption_model', 'None')
     index = caption_model_combo.findText(current_caption_model if current_caption_model else 'None')
     if index >= 0:
@@ -208,7 +205,7 @@ def create_clip_config_widget(clip_config: Dict, parent=None, populate_models: b
 
     # Mode selection
     clip_mode_combo = QComboBox()
-    clip_mode_combo.addItems(['best', 'fast', 'classic', 'negative'])
+    clip_mode_combo.addItems(CLIP_MODES)
     current_mode = clip_config.get('mode', 'best')
     clip_mode_combo.setCurrentText(current_mode)
     form_layout.addRow("Interrogation Mode:", clip_mode_combo)
@@ -330,22 +327,7 @@ def create_wd_config_widget(wd_config: Dict, parent=None) -> tuple:
 
     # WD Model selection
     wd_model_combo = QComboBox()
-    wd_model_combo.addItems([
-        # V1.4 models
-        'SmilingWolf/wd-v1-4-moat-tagger-v2',
-        'SmilingWolf/wd-v1-4-vit-tagger-v2',
-        'SmilingWolf/wd-v1-4-vit-tagger',
-        'SmilingWolf/wd-v1-4-convnext-tagger-v2',
-        'SmilingWolf/wd-v1-4-convnext-tagger',
-        'SmilingWolf/wd-v1-4-convnextv2-tagger-v2',
-        'SmilingWolf/wd-v1-4-swinv2-tagger-v2',
-        # V3 models (latest)
-        'SmilingWolf/wd-vit-tagger-v3',
-        'SmilingWolf/wd-vit-large-tagger-v3',
-        'SmilingWolf/wd-convnext-tagger-v3',
-        'SmilingWolf/wd-swinv2-tagger-v3',
-        'SmilingWolf/wd-eva02-large-tagger-v3'
-    ])
+    wd_model_combo.addItems(WD_MODELS)
     current_wd_model = wd_config.get('wd_model', 'SmilingWolf/wd-v1-4-moat-tagger-v2')
     index = wd_model_combo.findText(current_wd_model)
     if index >= 0:
@@ -474,10 +456,7 @@ def create_camie_config_widget(camie_config: Dict, parent=None) -> tuple:
 
     # Camie Model selection
     camie_model_combo = QComboBox()
-    camie_model_combo.addItems([
-        'Camais03/camie-tagger-v2',
-        'Camais03/camie-tagger'
-    ])
+    camie_model_combo.addItems(CAMIE_MODELS)
     current_model = camie_config.get('camie_model', 'Camais03/camie-tagger-v2')
     index = camie_model_combo.findText(current_model)
     if index >= 0:
@@ -486,13 +465,7 @@ def create_camie_config_widget(camie_config: Dict, parent=None) -> tuple:
 
     # Threshold profile
     threshold_profile_combo = QComboBox()
-    threshold_profile_combo.addItems([
-        'overall',
-        'micro_optimized',
-        'macro_optimized',
-        'balanced',
-        'category_specific'
-    ])
+    threshold_profile_combo.addItems(CAMIE_THRESHOLD_PROFILES)
     current_profile = camie_config.get('threshold_profile', 'overall')
     threshold_profile_combo.setCurrentText(current_profile)
     form_layout.addRow("Threshold Profile:", threshold_profile_combo)
@@ -559,7 +532,7 @@ def create_camie_config_widget(camie_config: Dict, parent=None) -> tuple:
     category_filter_layout.addWidget(category_info)
 
     # Category checkboxes
-    categories = ['general', 'character', 'copyright', 'artist', 'meta', 'rating', 'year']
+    categories = list(CAMIE_CATEGORIES)
     enabled_categories = camie_config.get('enabled_categories', categories.copy())
     category_checkboxes = {}
 
@@ -581,10 +554,7 @@ def create_camie_config_widget(camie_config: Dict, parent=None) -> tuple:
     category_thresholds_layout = QFormLayout()
 
     # Get default category thresholds
-    default_cat_thresholds = {
-        'artist': 0.5, 'character': 0.5, 'copyright': 0.5,
-        'general': 0.35, 'meta': 0.5, 'rating': 0.5, 'year': 0.5
-    }
+    default_cat_thresholds = dict(CAMIE_DEFAULT_CATEGORY_THRESHOLDS)
     config_cat_thresholds = camie_config.get('category_thresholds', default_cat_thresholds)
 
     category_threshold_spins = {}

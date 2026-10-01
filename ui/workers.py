@@ -1,31 +1,33 @@
-"""Worker threads for background processing in PyQt6."""
+"""Worker threads for background processing in PyQt6.
 
-import hashlib
-import json
-import os
-import time
-import uuid
-from contextlib import nullcontext
+The batch loops themselves live in core.pipelines so the Electron bridge runs
+the same code; the workers here only move them onto a QThread and turn their
+callbacks into signals.
+"""
+
 from PyQt6.QtCore import QThread, Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QImage, QImageReader
 from pathlib import Path
-from typing import Callable, List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 from core import (
-    InterrogationDatabase, hash_image_content, get_image_metadata,
-    FileManager, TagFilterSettings, DatabaseBusyError, DatabaseQueuedError,
-    ProvisionConfig
+    InterrogationDatabase, FileManager, TagFilterSettings, ProvisionConfig
 )
 from core.base_interrogator import BaseInterrogator
-from interrogators import LlamaCppInterrogator
+from core.pipelines import (
+    InterrogationBatchRunner,
+    MultimodalBatchRunner,
+    StreamRelay,
+    collect_context_sources,
+    context_source_key,
+    scan_image_directory,
+)
 from ui.thumbnail_cache import ThumbnailCache
+
+# StreamRelay and context_source_key are imported for callers that still
+# reach them through this module.
 
 # Shared by the gallery widget and the thumbnail worker.
 thumbnail_cache = ThumbnailCache()
-
-try:
-    from tqdm.auto import tqdm
-except Exception:  # pragma: no cover - optional dependency fallback
-    tqdm = None
 
 
 def decode_thumbnail(image_path: str, target_size: QSize,
@@ -122,11 +124,6 @@ class ThumbnailLoadWorker(QThread):
         self.progress.emit(decoded, total)
 
 
-def context_source_key(model_name: Optional[str], model_type: Optional[str]) -> str:
-    """Stable key identifying a prior-result source."""
-    return f"{model_type or ''}\u001f{model_name or ''}"
-
-
 class ClipModelListWorker(QThread):
     """Worker thread for loading the list of available CLIP models.
 
@@ -172,56 +169,15 @@ class BatchContextScanWorker(QThread):
 
     def run(self):
         """Collect prior-result sources for every queued image."""
-        total = len(self.image_paths)
-        sources: Dict[str, Dict[str, Any]] = {}
-        last_percent = -1
-
-        for index, image_path in enumerate(self.image_paths):
-            if self.is_cancelled:
-                return
-
-            try:
-                file_hash = hash_image_content(image_path)
-                rows = self.database.get_all_interrogations_for_image(file_hash) or []
-            except Exception:
-                continue
-
-            for interrog in rows:
-                source_key = context_source_key(
-                    interrog.get("model_name"),
-                    interrog.get("model_type"),
-                )
-                source = sources.setdefault(
-                    source_key,
-                    {
-                        "source_key": source_key,
-                        "model_name": interrog.get("model_name"),
-                        "model_type": interrog.get("model_type"),
-                        "image_hashes": set(),
-                        "latest_at": interrog.get("interrogated_at") or "",
-                    },
-                )
-                source["image_hashes"].add(file_hash)
-                latest_at = interrog.get("interrogated_at") or ""
-                if latest_at > (source.get("latest_at") or ""):
-                    source["latest_at"] = latest_at
-
-            percent = int(((index + 1) / total) * 100) if total else 100
-            if percent != last_percent:
-                last_percent = percent
-                self.progress.emit(index + 1, total)
-
-        if self.is_cancelled:
+        sources = collect_context_sources(
+            self.image_paths,
+            self.database,
+            is_cancelled=lambda: self.is_cancelled,
+            on_progress=self.progress.emit,
+        )
+        if sources is None:
             return
-
-        self.completed.emit(sorted(
-            sources.values(),
-            key=lambda src: (
-                -(len(src.get("image_hashes") or [])),
-                str(src.get("model_type") or ""),
-                str(src.get("model_name") or ""),
-            ),
-        ))
+        self.completed.emit(sources)
 
 
 class InterrogationWorker(QThread):
@@ -243,182 +199,34 @@ class InterrogationWorker(QThread):
         self.write_files = write_files
         self.overwrite_files = overwrite_files
         self.tag_filters = tag_filters
-        self.is_cancelled = False
-    
+        self._runner = InterrogationBatchRunner(
+            image_paths,
+            interrogator,
+            database,
+            write_files=write_files,
+            overwrite_files=overwrite_files,
+            tag_filters=tag_filters,
+            on_progress=self.progress.emit,
+            on_result=lambda path, results, _meta: self.result.emit(path, results),
+            on_error=self.error.emit,
+        )
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._runner.is_cancelled
+
     def cancel(self):
         """Cancel the operation."""
-        self.is_cancelled = True
-    
+        self._runner.cancel()
+
     def run(self):
         """Execute batch interrogation."""
-        total = len(self.image_paths)
-        model_id = None
-        
-        # Register model once
-        try:
-            model_id = self.database.register_model(
-                self.interrogator.model_name,
-                self.interrogator.get_model_type(),
-                config=self.interrogator.get_config()
-            )
-        except Exception as e:
-            self.error.emit("", f"Failed to register model: {e}")
-            self.finished.emit()
-            return
-        
-        for idx, image_path in enumerate(self.image_paths):
-            if self.is_cancelled:
-                break
-            
-            try:
-                image_path_str = str(image_path)
-                self.progress.emit(idx + 1, total, f"Processing: {image_path.name}")
-                
-                # Hash the image
-                file_hash = hash_image_content(image_path_str)
-                
-                # Check cache first
-                cached = self.database.get_interrogation(
-                    file_hash, 
-                    self.interrogator.model_name
-                )
-                
-                if cached and self._should_use_cached_result(cached):
-                    # Use cached results
-                    results = cached
-                    self.progress.emit(
-                        idx + 1, total, 
-                        f"Using cached: {image_path.name}"
-                    )
-                else:
-                    if cached:
-                        self.progress.emit(
-                            idx + 1, total,
-                            f"Reprocessing empty cached result: {image_path.name}"
-                        )
-
-                    # Interrogate image
-                    results = self.interrogator.interrogate(image_path_str)
-
-                    # Register image and save to database
-                    metadata = get_image_metadata(image_path_str)
-                    try:
-                        image_id = self.database.register_image(
-                            image_path_str,
-                            file_hash,
-                            metadata['width'],
-                            metadata['height'],
-                            metadata['file_size']
-                        )
-                    except DatabaseBusyError as e:
-                        # User chose to abort - can't save without image_id
-                        self.error.emit(image_path_str, f"Database busy: {e}")
-                        continue
-
-                    try:
-                        self.database.save_interrogation(
-                            image_id,
-                            model_id,
-                            results['tags'],
-                            results.get('confidence_scores'),
-                            results.get('raw_output')
-                        )
-                    except DatabaseQueuedError:
-                        # Operation was queued for later - continue processing
-                        pass
-                    except DatabaseBusyError as e:
-                        # User chose to abort this operation
-                        self.error.emit(image_path_str, f"Database busy: {e}")
-                        continue
-
-                # Write to text file if requested
-                if self.write_files:
-                    # Apply tag filters if configured
-                    tags_to_write = results['tags']
-                    if self.tag_filters:
-                        confidence_scores = results.get('confidence_scores')
-
-                        # Use confidence-based filtering if scores are available
-                        if confidence_scores is not None:
-                            # Get threshold from interrogator config
-                            threshold = self.interrogator.get_config().get('threshold', 0.35)
-                            tags_to_write, _ = self.tag_filters.filter_tags_with_confidence(
-                                tags_to_write,
-                                confidence_scores,
-                                threshold
-                            )
-                        else:
-                            # No confidence scores (CLIP), use simple filtering
-                            tags_to_write = self.tag_filters.apply_filters(tags_to_write)
-
-                    FileManager.write_tags_to_file(
-                        image_path,
-                        tags_to_write,
-                        overwrite=self.overwrite_files
-                    )
-                
-                # Emit result
-                self.result.emit(image_path_str, results)
-                
-            except Exception as e:
-                message = str(e).strip() or repr(e)
-                self.error.emit(str(image_path), message)
-        
+        self._runner.run()
         self.finished.emit()
 
     def _should_use_cached_result(self, cached: Dict[str, Any]) -> bool:
         """Return False for stale empty ONNX tagger rows that should be regenerated."""
-        model_type = self.interrogator.get_model_type()
-        if model_type == 'WD':
-            return False
-
-        tags = cached.get('tags')
-        if tags:
-            return True
-
-        if model_type == 'Camie':
-            return False
-        return True
-
-
-class StreamRelay:
-    """Rate-limits streamed model text before it crosses into the GUI thread.
-
-    llama-server emits a delta per token; forwarding every one of them means a
-    queued signal and a relayout per token. Emitting on a fixed interval keeps
-    the transcript visibly live without drowning the event loop.
-    """
-
-    MIN_INTERVAL_SECONDS = 0.06
-
-    def __init__(self, emit: Callable[[str], None]):
-        self._emit = emit
-        self._last_emit = 0.0
-        self._last_text: Optional[str] = None
-        self._pending: Optional[str] = None
-
-    def __call__(self, raw_text: str) -> None:
-        preview = LlamaCppInterrogator.extract_stream_preview(raw_text)
-        if preview == self._last_text:
-            self._pending = None
-            return
-        now = time.monotonic()
-        # An empty preview is the "discard what you saw" reset; never drop it.
-        if preview and now - self._last_emit < self.MIN_INTERVAL_SECONDS:
-            self._pending = preview
-            return
-        self._send(preview, now)
-
-    def flush(self) -> None:
-        """Emit the newest throttled update, if one is still held back."""
-        if self._pending is not None:
-            self._send(self._pending, time.monotonic())
-
-    def _send(self, preview: str, now: float) -> None:
-        self._pending = None
-        self._last_text = preview
-        self._last_emit = now
-        self._emit(preview)
+        return self._runner.should_use_cached_result(cached)
 
 
 class SingleInquiryWorker(QThread):
@@ -473,9 +281,9 @@ class SingleInquiryWorker(QThread):
 class MultimodalInterrogationWorker(QThread):
     """Worker thread for llama.cpp multimodal batch interrogation."""
 
-    CACHE_VERSION = 1
-    PROMPT_BUILDER_VERSION = "llama_cpp_interrogator_prompt_v1"
-    VALID_TXT_OUTPUT_MODES = {"none", "merge", "overwrite"}
+    CACHE_VERSION = MultimodalBatchRunner.CACHE_VERSION
+    PROMPT_BUILDER_VERSION = MultimodalBatchRunner.PROMPT_BUILDER_VERSION
+    VALID_TXT_OUTPUT_MODES = MultimodalBatchRunner.VALID_TXT_OUTPUT_MODES
 
     # Signals
     progress = pyqtSignal(int, int, str)  # current, total, message
@@ -504,244 +312,61 @@ class MultimodalInterrogationWorker(QThread):
         txt_output_mode: Optional[str] = None,
     ):
         super().__init__()
-        self.image_paths = image_paths
-        self.interrogator = interrogator
-        self.database = database
-        self.task = task
-        self.prompt = prompt
-        self.txt_output_mode = self._resolve_txt_output_mode(
+        self._runner = MultimodalBatchRunner(
+            image_paths=image_paths,
+            interrogator=interrogator,
+            database=database,
+            task=task,
+            prompt=prompt,
             write_files=write_files,
             overwrite_files=overwrite_files,
+            tag_filters=tag_filters,
+            include_prior_tables=include_prior_tables,
+            include_prior_transcripts=include_prior_transcripts,
+            included_model_types=included_model_types,
+            included_sources=included_sources,
+            carry_context_across_batch=carry_context_across_batch,
+            use_cache=use_cache,
             txt_output_mode=txt_output_mode,
+            on_progress=self.progress.emit,
+            on_turn_started=self.turn_started.emit,
+            on_stream_delta=self.stream_delta.emit,
+            on_result=lambda path, results, _meta: self.result.emit(path, results),
+            on_error=self.error.emit,
         )
-        self.write_files = self.txt_output_mode != "none"
-        self.overwrite_files = self.txt_output_mode == "overwrite"
-        self.tag_filters = tag_filters
-        self.include_prior_tables = include_prior_tables
-        self.include_prior_transcripts = include_prior_transcripts
-        self.included_model_types = set(included_model_types or [])
-        self.uses_included_sources = included_sources is not None
-        self.included_source_keys = {
-            self._source_key(source.get("model_name"), source.get("model_type"))
-            for source in included_sources or []
-            if isinstance(source, dict)
-        }
-        self.carry_context_across_batch = carry_context_across_batch
-        self.use_cache = bool(use_cache)
-        self.is_cancelled = False
-        self.was_cancelled = False
+        runner = self._runner
+        self.image_paths = runner.image_paths
+        self.interrogator = runner.interrogator
+        self.database = runner.database
+        self.task = runner.task
+        self.prompt = runner.prompt
+        self.txt_output_mode = runner.txt_output_mode
+        self.write_files = runner.write_files
+        self.overwrite_files = runner.overwrite_files
+        self.tag_filters = runner.tag_filters
+        self.include_prior_tables = runner.include_prior_tables
+        self.include_prior_transcripts = runner.include_prior_transcripts
+        self.included_model_types = runner.included_model_types
+        self.uses_included_sources = runner.uses_included_sources
+        self.included_source_keys = runner.included_source_keys
+        self.carry_context_across_batch = runner.carry_context_across_batch
+        self.use_cache = runner.use_cache
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._runner.is_cancelled
+
+    @property
+    def was_cancelled(self) -> bool:
+        return self._runner.was_cancelled
 
     def cancel(self):
         """Cancel the operation."""
-        self.is_cancelled = True
-        self.was_cancelled = True
+        self._runner.cancel()
 
     def run(self):
         """Execute multimodal batch interrogation."""
-        total = len(self.image_paths)
-        model_id = None
-
-        if self.is_cancelled:
-            self.was_cancelled = True
-            self.finished.emit(True)
-            return
-
-        try:
-            model_id = self.database.register_model(
-                self.interrogator.model_name,
-                self.interrogator.get_model_type(),
-                config=self.interrogator.get_config(),
-            )
-        except Exception as e:
-            self.error.emit("", f"Failed to register model: {e}")
-            self.finished.emit(self.was_cancelled)
-            return
-
-        batch_run_id = str(uuid.uuid4())
-        shared_session_key = f"batch:{batch_run_id}" if self.carry_context_across_batch else None
-
-        progress_ctx = (
-            tqdm(
-                total=total,
-                desc=f"llama-cpp {self.task}",
-                unit="job",
-                dynamic_ncols=True,
-                leave=False,
-            )
-            if tqdm and total > 0
-            else nullcontext()
-        )
-        with progress_ctx as tqdm_bar:
-            for idx, image_path in enumerate(self.image_paths):
-                if self.is_cancelled:
-                    self.was_cancelled = True
-                    break
-
-                image_path_str = str(image_path)
-                try:
-                    self.progress.emit(idx + 1, total, f"Processing: {image_path.name}")
-                    file_hash = hash_image_content(image_path_str)
-
-                    metadata = get_image_metadata(image_path_str)
-                    image_id = self.database.register_image(
-                        image_path_str,
-                        file_hash,
-                        metadata["width"],
-                        metadata["height"],
-                        metadata["file_size"],
-                    )
-
-                    included_tables = self._build_included_tables(file_hash)
-                    included_transcripts = self._build_included_transcripts(file_hash)
-                    sidecar_tags = (
-                        FileManager.read_tags_from_file(image_path)
-                        if self.task == "audit"
-                        else []
-                    )
-                    cache_key = None
-                    cache_metadata: Dict[str, Any] = {}
-                    can_use_cache = self.use_cache and not self.carry_context_across_batch
-                    if can_use_cache:
-                        cache_key, cache_metadata = self._build_cache_identity(
-                            included_tables,
-                            included_transcripts,
-                            sidecar_tags,
-                        )
-                        cached = self.database.get_interrogation_cache_entry(
-                            file_hash,
-                            self.interrogator.model_name,
-                            cache_key,
-                        )
-                    else:
-                        cached = None
-
-                    if shared_session_key:
-                        session_key = shared_session_key
-                    else:
-                        session_key = f"batch:{batch_run_id}:{file_hash}"
-
-                    if cached:
-                        results = cached
-                        self.progress.emit(idx + 1, total, f"Using exact cache: {image_path.name}")
-                    else:
-                        # The request half of the turn is fully known now, so
-                        # the transcript can show it while the model works.
-                        self.turn_started.emit(
-                            image_path_str,
-                            {
-                                "prompt_type": self.task,
-                                "prompt_text": self.prompt,
-                                "included_tables": included_tables,
-                                "included_transcripts": included_transcripts,
-                                "sidecar_tags": sidecar_tags,
-                                "model_name": self.interrogator.model_name,
-                                "image_path": image_path_str,
-                            },
-                        )
-                        relay = StreamRelay(
-                            lambda text, path=image_path_str: self.stream_delta.emit(path, text)
-                        )
-                        results = self.interrogator.interrogate(
-                            image_path_str,
-                            task=self.task,
-                            prompt=self.prompt,
-                            session_key=session_key,
-                            keep_context=bool(self.carry_context_across_batch),
-                            included_tables=included_tables,
-                            included_transcripts=included_transcripts,
-                            sidecar_tags=sidecar_tags,
-                            on_stream_delta=relay,
-                        )
-                        relay.flush()
-                        if cache_key:
-                            self.database.save_interrogation_cache_entry(
-                                image_id=image_id,
-                                model_id=model_id,
-                                cache_key=cache_key,
-                                cache_metadata=cache_metadata,
-                                results=results,
-                            )
-                    results["included_tables"] = included_tables
-                    results["included_transcripts"] = included_transcripts
-                    results["sidecar_tags"] = sidecar_tags
-
-                    if self.task == "audit" and self.write_files:
-                        removed_tags, remaining_tags = FileManager.delete_tags_from_file(
-                            image_path,
-                            (results.get("multimodal_response") or {}).get("delete_tags", []),
-                        )
-                        response_json = results.get("multimodal_response", {}) or {}
-                        response_json["removed_tags"] = removed_tags
-                        response_json["remaining_tags"] = remaining_tags
-                        results["multimodal_response"] = response_json
-                        results["audit_removed_tags"] = removed_tags
-                        results["audit_remaining_tags"] = remaining_tags
-                        results["tags"] = remaining_tags
-
-                    # Keep latest multimodal result in main interrogations table.
-                    self.database.save_interrogation(
-                        image_id,
-                        model_id,
-                        results["tags"],
-                        results.get("confidence_scores"),
-                        results.get("raw_output"),
-                    )
-
-                    response_json = results.get("multimodal_response", {})
-                    session_id = self.database.create_or_get_multimodal_session(
-                        image_id=image_id,
-                        model_id=model_id,
-                        mode="batch",
-                        session_key=session_key,
-                    )
-                    self.database.append_multimodal_turn(
-                        session_id=session_id,
-                        prompt_type=self.task,
-                        prompt_text=self.prompt,
-                        included_tables=included_tables,
-                        included_transcripts=included_transcripts,
-                        sidecar_tags=sidecar_tags,
-                        response_json=response_json,
-                        tags=results["tags"],
-                        reasoning_summary=response_json.get("reasoning_summary", ""),
-                    )
-
-                    if self.write_files and self.task != "audit":
-                        tags_to_write = results["tags"]
-                        if self.tag_filters:
-                            confidence_scores = results.get("confidence_scores")
-                            if confidence_scores is not None:
-                                threshold = self.interrogator.get_config().get("threshold", 0.35)
-                                tags_to_write, _ = self.tag_filters.filter_tags_with_confidence(
-                                    tags_to_write,
-                                    confidence_scores,
-                                    threshold,
-                                )
-                            else:
-                                tags_to_write = self.tag_filters.apply_filters(tags_to_write)
-
-                        FileManager.write_tags_to_file(
-                            image_path,
-                            tags_to_write,
-                            overwrite=self.txt_output_mode == "overwrite",
-                        )
-
-                    self.result.emit(image_path_str, results)
-
-                except DatabaseQueuedError:
-                    # Continue even if DB operation queued.
-                    continue
-                except DatabaseBusyError as e:
-                    self.error.emit(image_path_str, f"Database busy: {e}")
-                except Exception as e:
-                    message = str(e).strip() or repr(e)
-                    self.error.emit(image_path_str, message)
-                finally:
-                    if tqdm_bar is not None:
-                        tqdm_bar.set_postfix_str(image_path.name, refresh=False)
-                        tqdm_bar.update(1)
-
-        self.finished.emit(self.was_cancelled)
+        self.finished.emit(self._runner.run())
 
     @classmethod
     def _resolve_txt_output_mode(
@@ -751,63 +376,22 @@ class MultimodalInterrogationWorker(QThread):
         txt_output_mode: Optional[str],
     ) -> str:
         """Normalize text-output settings to the three UI modes."""
-        if txt_output_mode is not None:
-            if txt_output_mode not in cls.VALID_TXT_OUTPUT_MODES:
-                raise ValueError(f"Invalid txt_output_mode: {txt_output_mode}")
-            return txt_output_mode
-
-        if not write_files:
-            return "none"
-        if overwrite_files:
-            return "overwrite"
-        return "merge"
+        return MultimodalBatchRunner.resolve_txt_output_mode(
+            write_files, overwrite_files, txt_output_mode
+        )
 
     def _build_included_tables(self, file_hash: str) -> List[Dict[str, Any]]:
         """Build prior interrogation context tables for a single image."""
-        if not self.include_prior_tables:
-            return []
-        if self.uses_included_sources and not self.included_source_keys:
-            return []
-
-        tables = self.database.get_all_interrogations_for_image(file_hash)
-        filtered: List[Dict[str, Any]] = []
-        for row in tables:
-            source_key = self._source_key(row.get("model_name"), row.get("model_type"))
-            if self.uses_included_sources:
-                if source_key not in self.included_source_keys:
-                    continue
-            elif self.included_model_types and row.get("model_type") not in self.included_model_types:
-                continue
-
-            filtered.append(
-                {
-                    "model_name": row.get("model_name"),
-                    "model_type": row.get("model_type"),
-                    "tags": row.get("tags", []),
-                    "confidence_scores": row.get("confidence_scores"),
-                    "raw_output_summary": (row.get("raw_output") or "")[:1500],
-                    "interrogated_at": row.get("interrogated_at"),
-                }
-            )
-        return filtered
+        return self._runner.build_included_tables(file_hash)
 
     def _build_included_transcripts(self, file_hash: str) -> List[Dict[str, Any]]:
         """Build prior inquiry transcript context for a single image."""
-        if not self.include_prior_transcripts:
-            return []
-        history = self.database.get_multimodal_history(
-            image_hash=file_hash,
-            model_name=self.interrogator.model_name,
-        )
-        builder = getattr(self.interrogator, "build_transcript_context", None)
-        if callable(builder):
-            return builder(history)
-        return history
+        return self._runner.build_included_transcripts(file_hash)
 
     @staticmethod
     def _source_key(model_name: Optional[str], model_type: Optional[str]) -> str:
         """Stable key for matching selected batch context sources."""
-        return f"{model_type or ''}\u001f{model_name or ''}"
+        return context_source_key(model_name, model_type)
 
     def _build_cache_identity(
         self,
@@ -816,64 +400,16 @@ class MultimodalInterrogationWorker(QThread):
         sidecar_tags: Optional[List[str]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Build a deterministic exact-match cache key and its metadata."""
-        normalized_config = self._normalize_cache_config(self.interrogator.get_config())
-        context_digest = self._stable_digest(
-            {
-                "tables": included_tables,
-                "transcripts": included_transcripts or [],
-                "sidecar_tags": sidecar_tags or [],
-            }
-        )
-        metadata: Dict[str, Any] = {
-            "cache_version": self.CACHE_VERSION,
-            "prompt_builder_version": self.PROMPT_BUILDER_VERSION,
-            "model_name": self.interrogator.model_name,
-            "model_type": self.interrogator.get_model_type(),
-            "llama_config": normalized_config,
-            "temperature": normalized_config.get("temperature"),
-            "task": self.task,
-            "prompt": self.prompt,
-            "include_prior_tables": self.include_prior_tables,
-            "included_source_keys": sorted(self.included_source_keys),
-            "included_model_types": sorted(self.included_model_types),
-            "context_tables": included_tables,
-            "context_transcripts": included_transcripts or [],
-            "sidecar_tags": sidecar_tags or [],
-            "context_digest": context_digest,
-        }
-        return self._stable_digest(metadata), metadata
+        return self._runner.build_cache_identity(included_tables, included_transcripts, sidecar_tags)
 
     @classmethod
     def _stable_digest(cls, payload: Any) -> str:
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        return MultimodalBatchRunner.stable_digest(payload)
 
     @staticmethod
     def _normalize_cache_config(config: Dict[str, Any]) -> Dict[str, Any]:
         """Keep only llama settings that can affect model output."""
-        if not isinstance(config, dict):
-            return {}
-
-        relevant_keys = (
-            "llama_binary_path",
-            "llama_model_path",
-            "llama_mmproj_path",
-            "ctx_size",
-            "gpu_layers",
-            "temperature",
-            "max_tokens",
-            "server_host",
-            "server_port",
-        )
-        normalized: Dict[str, Any] = {}
-        for key in relevant_keys:
-            if key not in config:
-                continue
-            value = config.get(key)
-            if isinstance(value, Path):
-                value = str(value)
-            normalized[key] = value
-        return normalized
+        return MultimodalBatchRunner.normalize_cache_config(config)
 
 
 class OrganizationWorker(QThread):
@@ -958,62 +494,13 @@ class DirectoryLoadWorker(QThread):
     def run(self):
         """Execute directory scan using os.scandir for cancellable iteration."""
         try:
-            dir_path = Path(self.directory)
-            if not dir_path.exists() or not dir_path.is_dir():
-                self.error.emit(f"Invalid directory: {self.directory}")
-                self.finished.emit([])
-                return
-
-            image_paths = []
-            count = 0
-
-            if self.recursive:
-                # Use os.walk for recursive scanning (cancellable)
-                for root, dirs, files in os.walk(self.directory):
-                    if self.is_cancelled:
-                        break
-
-                    for filename in files:
-                        if self.is_cancelled:
-                            break
-
-                        ext = os.path.splitext(filename)[1].lower()
-                        if ext in self.SUPPORTED_EXTENSIONS:
-                            full_path = os.path.join(root, filename)
-                            image_paths.append(full_path)
-                            count += 1
-
-                            # Emit progress every 10 files for responsive feedback
-                            if count % 10 == 0:
-                                self.progress.emit(count, filename)
-            else:
-                # Use os.scandir for non-recursive scanning (faster than glob)
-                with os.scandir(self.directory) as entries:
-                    for entry in entries:
-                        if self.is_cancelled:
-                            break
-
-                        if entry.is_file():
-                            ext = os.path.splitext(entry.name)[1].lower()
-                            if ext in self.SUPPORTED_EXTENSIONS:
-                                image_paths.append(entry.path)
-                                count += 1
-
-                                # Emit progress every 10 files for responsive feedback
-                                if count % 10 == 0:
-                                    self.progress.emit(count, entry.name)
-
-            if self.is_cancelled:
-                self.finished.emit([])
-                return
-
-            # Sort and deduplicate
-            image_paths = sorted(set(image_paths))
-
-            # Emit final progress
-            self.progress.emit(len(image_paths), "")
-            self.finished.emit(image_paths)
-
+            image_paths = scan_image_directory(
+                self.directory,
+                recursive=self.recursive,
+                is_cancelled=lambda: self.is_cancelled,
+                on_progress=self.progress.emit,
+            )
+            self.finished.emit(image_paths or [])
         except Exception as e:
             self.error.emit(str(e))
             self.finished.emit([])

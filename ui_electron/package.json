@@ -1,0 +1,13 @@
+{
+  "name": "image-interrogator-electron",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Opt-in Electron front end for Image Interrogator. Started by ./run.sh --electron; installed by ./setup.sh --electron.",
+  "main": "main.js",
+  "license": "MIT",
+  "dependencies": {
+    "@fontsource/jetbrains-mono": "5.3.0",
+    "electron": "44.5.1",
+    "htm": "3.1.1"
+  }
+}

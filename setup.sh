@@ -22,6 +22,64 @@ NC='\033[0m' # No Color
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# --electron additionally installs the opt-in Electron front end, which is
+# started with ./run.sh --electron. The PyQt6 interface needs none of it.
+INSTALL_ELECTRON=n
+for arg in "$@"; do
+    case "$arg" in
+        --electron) INSTALL_ELECTRON=y ;;
+    esac
+done
+
+install_electron_ui() {
+    echo "============================================================"
+    echo "ELECTRON UI (--electron)"
+    echo "============================================================"
+    echo ""
+    if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+        echo -e "${RED}[X] Node.js and npm are needed once to install the Electron UI.${NC}"
+        echo "    Install Node.js 22.12 or newer (https://nodejs.org or your package"
+        echo "    manager), then run ./setup.sh --electron again."
+        echo "    The default PyQt6 interface is unaffected."
+        return 1
+    fi
+    local node_version
+    node_version="$(node -p 'process.versions.node')"
+    if ! node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 12) ? 0 : 1)'; then
+        echo -e "${RED}[X] Node.js ${node_version} is too old; Electron needs 22.12 or newer.${NC}"
+        return 1
+    fi
+    echo "[*] Node.js ${node_version}, npm $(npm --version)"
+
+    if ! (cd ui_electron && if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi); then
+        echo -e "${RED}[X] npm could not install the Electron UI dependencies.${NC}"
+        return 1
+    fi
+    # Electron fetches its binary in a separate, checksum-verified step.
+    if ! (cd ui_electron && node node_modules/electron/install.js); then
+        echo -e "${RED}[X] Downloading the Electron binary failed.${NC}"
+        return 1
+    fi
+
+    local electron_rel
+    electron_rel="$(cat ui_electron/node_modules/electron/path.txt 2>/dev/null || true)"
+    if [ -z "$electron_rel" ] || [ ! -x "ui_electron/node_modules/electron/dist/$electron_rel" ]; then
+        echo -e "${RED}[X] Electron did not install correctly.${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}[+] electron $(node -p "require('./ui_electron/node_modules/electron/package.json').version") installed at ui_electron/node_modules${NC}"
+
+    if [ "$(uname -s)" = "Linux" ] && [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]; then
+        echo ""
+        echo -e "${YELLOW}  Note: this system restricts unprivileged user namespaces, so the Electron${NC}"
+        echo -e "${YELLOW}  window starts with Chromium's sandbox disabled. To keep the sandbox on:${NC}"
+        echo "    sudo chown root:root ui_electron/node_modules/electron/dist/chrome-sandbox"
+        echo "    sudo chmod 4755 ui_electron/node_modules/electron/dist/chrome-sandbox"
+    fi
+    echo ""
+    return 0
+}
 detect_cuda_version() {
     local detected=""
     local source="unknown"
@@ -542,9 +600,25 @@ elif [ "$INSTALL_CUDA" = "y" ]; then
     fi
 fi
 
+ELECTRON_STATUS=""
+if [ "$INSTALL_ELECTRON" = "y" ]; then
+    if install_electron_ui; then
+        ELECTRON_STATUS=ok
+    else
+        ELECTRON_STATUS=failed
+    fi
+fi
+
 echo "============================================================"
 echo "SETUP COMPLETE!"
 echo "============================================================"
 echo ""
 echo "You can now run the application with: ./run.sh"
+if [ "$ELECTRON_STATUS" = "ok" ]; then
+    echo "Electron UI (opt-in):                 ./run.sh --electron"
+elif [ "$ELECTRON_STATUS" = "failed" ]; then
+    echo -e "${YELLOW}The Electron UI was not installed; see the messages above.${NC}"
+    echo ""
+    exit 1
+fi
 echo ""

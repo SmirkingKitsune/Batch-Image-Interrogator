@@ -3,17 +3,30 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.base_interrogator import BaseInterrogator
+from core.gguf_metadata import read_gguf_metadata, recommended_sampling
 from core.llama_cpp_runtime import (
+    LlamaCppRepetitionError,
     LlamaCppRuntimeManager,
     LlamaCppRuntimeError,
     LlamaCppStallError,
     is_llama_timeout_error,
 )
+from core.reasoning_controls import normalize_effort, reasoning_controls_from_metadata
+from core.repetition import DRY_SAMPLING, LoopDetector, loop_excerpt, rescue_sampling
+
+
+# Formats llama.cpp decodes itself (stb_image). Anything else -- WebP above
+# all, which some builds hand to an external ffmpeg that may not be installed --
+# is converted with Pillow before it is sent.
+LLAMA_NATIVE_IMAGE_FORMATS = frozenset({"JPEG", "MPO", "PNG", "GIF", "BMP"})
+# How llama-server words a request whose image it could not decode.
+_IMAGE_LOAD_ERRORS = ("failed to load image", "failed to decode image", "unable to load image")
 
 
 class LlamaCppInterrogator(BaseInterrogator):
@@ -35,6 +48,12 @@ class LlamaCppInterrogator(BaseInterrogator):
         self.temperature = 0.0
         self.max_tokens = 4096
         self.disable_reasoning = False
+        # Requested effort; only sent when the loaded template accepts it.
+        self.reasoning_effort: Optional[str] = None
+        self.reasoning_controls: Optional[Dict[str, Any]] = None
+        # DRY on every request, and loops in the stream abandoned and retried.
+        self.repetition_guard = True
+        self.recommended_sampling: Dict[str, Any] = {}
         self.server_url: Optional[str] = None
         self._owns_runtime = False
         self._session_history: Dict[str, List[Dict[str, Any]]] = {}
@@ -53,6 +72,8 @@ class LlamaCppInterrogator(BaseInterrogator):
         disable_reasoning: bool = False,
         no_reasoning_preserve: bool = False,
         reasoning_budget: int = -1,
+        reasoning_effort: Optional[str] = None,
+        repetition_guard: bool = True,
         **kwargs,
     ):
         """Start or reuse managed llama.cpp server and load multimodal model.
@@ -67,6 +88,13 @@ class LlamaCppInterrogator(BaseInterrogator):
             reasoning_budget: Cap thinking at N tokens rather than removing it.
                 -1 is unrestricted. Quality and speed depend on the model and
                 task. This launch flag requires reloading the model to apply.
+            reasoning_effort: Per-request `reasoning_effort` for templates that
+                read one (gpt-oss, Qwen3.8). Sent only when the model's chat
+                template accepts the value; see `reasoning_controls`.
+            repetition_guard: Send the DRY anti-repetition sampler with every
+                request, and abandon a reply that streams a loop, retrying it
+                once with the model's recommended sampling. Per request; see
+                `set_repetition_guard`.
         """
         model_path = Path(llama_model_path).expanduser().resolve()
         resolved_port = self.runtime.resolve_server_port(
@@ -78,6 +106,10 @@ class LlamaCppInterrogator(BaseInterrogator):
         self.temperature = float(temperature)
         self.max_tokens = int(max_tokens if max_tokens is not None else ctx_size)
         self.disable_reasoning = bool(disable_reasoning)
+        self.reasoning_effort = str(reasoning_effort).strip() if reasoning_effort else None
+        self.reasoning_controls = None
+        self.repetition_guard = bool(repetition_guard)
+        self.recommended_sampling = {}
 
         self.config = {
             "llama_binary_path": str(Path(llama_binary_path).expanduser().resolve()),
@@ -96,6 +128,8 @@ class LlamaCppInterrogator(BaseInterrogator):
             "disable_reasoning": self.disable_reasoning,
             "no_reasoning_preserve": bool(no_reasoning_preserve),
             "reasoning_budget": int(reasoning_budget),
+            "reasoning_effort": None,
+            "repetition_guard": self.repetition_guard,
             **kwargs,
         }
 
@@ -115,6 +149,20 @@ class LlamaCppInterrogator(BaseInterrogator):
             self.is_loaded = True
         except LlamaCppRuntimeError as exc:
             raise RuntimeError(f"Failed to load llama.cpp model: {exc}") from exc
+        # Read once per load (a fraction of a second): the chat template's
+        # reasoning controls and the publisher's recommended sampling. A file
+        # it cannot read leaves effort unsent and the retry on defaults.
+        metadata = self._read_model_metadata(self.config["llama_model_path"])
+        self.reasoning_controls = reasoning_controls_from_metadata(metadata)
+        self.recommended_sampling = recommended_sampling(metadata)
+        self.config["reasoning_effort"] = self._effective_reasoning_effort()
+
+    @staticmethod
+    def _read_model_metadata(model_path: str) -> Dict[str, Any]:
+        try:
+            return read_gguf_metadata(model_path)
+        except Exception:  # noqa: BLE001 - a missing or foreign file is "no metadata"
+            return {}
 
     def interrogate(
         self,
@@ -127,6 +175,8 @@ class LlamaCppInterrogator(BaseInterrogator):
         included_transcripts: Optional[List[Dict[str, Any]]] = None,
         sidecar_tags: Optional[List[str]] = None,
         on_stream_delta: Optional[Callable[[str], None]] = None,
+        on_reasoning_delta: Optional[Callable[[str], None]] = None,
+        on_restart: Optional[Callable[[str], None]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -136,6 +186,12 @@ class LlamaCppInterrogator(BaseInterrogator):
             on_stream_delta: Called with the accumulated raw response text as it
                 streams back. Only the first attempt streams; a reparse retry
                 calls it with an empty string to reset any partial display.
+            on_reasoning_delta: Called with each fragment of the model's
+                thinking as it streams, ahead of the answer. Only the first
+                attempt streams it. Thinking is never part of the result.
+            on_restart: Called with a short notice when the first attempt is
+                abandoned for looping and starts over; whatever streamed so far
+                is void. The answer stream is also reset with "".
 
         Returns:
             Dict with 'tags', 'confidence_scores', 'raw_output', and parsed response.
@@ -173,15 +229,57 @@ class LlamaCppInterrogator(BaseInterrogator):
         messages.append(user_message)
 
         on_delta = self._build_stream_relay(on_stream_delta)
+        first_request = dict(
+            messages=messages,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            response_format={"type": "json_object"},
+            on_delta=on_delta,
+            on_reasoning_delta=on_reasoning_delta,
+        )
 
+        image_resent = loop_retried = False
         try:
-            response = self._chat_completion_with_timeout_retry(
-                messages=messages,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                response_format={"type": "json_object"},
-                on_delta=on_delta,
-            )
+            while True:
+                try:
+                    response = self._chat_completion_with_timeout_retry(**first_request)
+                    break
+                except LlamaCppRepetitionError as loop:
+                    if loop_retried:
+                        raise RuntimeError(
+                            f"Stopped: the model kept repeating {loop_excerpt(loop.unit)} in its "
+                            f"{loop.stream}, even after a retry with its recommended sampling."
+                        ) from loop
+                    # Greedy decoding repeats a loop exactly, so start over with
+                    # the sampling the model was tuned for and a firmer DRY.
+                    loop_retried = True
+                    first_request["temperature"], first_request["sampling"] = rescue_sampling(
+                        self.recommended_sampling, self.temperature,
+                    )
+                    first_request["on_delta"] = self._build_stream_relay(on_stream_delta)
+                    if on_stream_delta is not None:
+                        on_stream_delta("")
+                    if on_restart is not None:
+                        on_restart(
+                            f"Stuck repeating {loop_excerpt(loop.unit)} in the {loop.stream}; "
+                            "retrying with the model's recommended sampling."
+                        )
+                except LlamaCppRuntimeError as exc:
+                    if image_resent or not self._is_image_load_error(exc):
+                        raise
+                    # llama.cpp's decoder refused bytes Pillow can read (an
+                    # unusual JPEG or BMP, say). Send a re-encoded copy, once;
+                    # the later attempts below build on `messages`.
+                    image_resent = True
+                    image_data_url = self._encode_image_as_data_url(image_path, reencode=True)
+                    messages = messages[:-1] + [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user_text},
+                            {"type": "image_url", "image_url": {"url": image_data_url}},
+                        ],
+                    }]
+                    first_request["messages"] = messages
         except LlamaCppRuntimeError as exc:
             raise RuntimeError(f"Multimodal inference failed: {exc}") from exc
 
@@ -225,11 +323,13 @@ class LlamaCppInterrogator(BaseInterrogator):
                         ],
                     }
                 )
+                # After a loop, the later attempts keep the rescue sampling.
                 retry_response = self._chat_completion_with_timeout_retry(
                     messages=retry_messages,
-                    temperature=self.temperature,
+                    temperature=first_request["temperature"],
                     max_tokens=self.max_tokens,
                     response_format={"type": "json_object"},
+                    sampling=first_request.get("sampling"),
                 )
                 retry_content = self._extract_assistant_content(retry_response)
                 parsed = self._parse_and_validate_json_response(retry_content, task=task)
@@ -244,9 +344,10 @@ class LlamaCppInterrogator(BaseInterrogator):
                 fallback_messages = retry_messages if retry_messages else messages
                 fallback_response = self._chat_completion_with_timeout_retry(
                     messages=fallback_messages,
-                    temperature=self.temperature,
+                    temperature=first_request["temperature"],
                     max_tokens=self.max_tokens,
                     response_format=None,
+                    sampling=first_request.get("sampling"),
                 )
                 fallback_content = self._extract_assistant_content(fallback_response)
                 parsed = self._parse_and_validate_json_response(fallback_content, task=task)
@@ -289,6 +390,8 @@ class LlamaCppInterrogator(BaseInterrogator):
         if debug_raw and parse_mode != "primary_json":
             parsed["_debug_raw_response"] = debug_raw[:20000]
         parsed["_parse_mode"] = parse_mode
+        if loop_retried:
+            parsed["_loop_retry"] = True
         if task == "audit":
             delete_tags = self._normalize_tag_list(parsed.get("delete_tags", []))
             parsed["delete_tags"] = delete_tags
@@ -362,6 +465,31 @@ class LlamaCppInterrogator(BaseInterrogator):
         self.disable_reasoning = bool(disable_reasoning)
         if isinstance(getattr(self, "config", None), dict):
             self.config["disable_reasoning"] = self.disable_reasoning
+            self.config["reasoning_effort"] = self._effective_reasoning_effort()
+
+    def set_repetition_guard(self, enabled: bool) -> None:
+        """Turn the repetition guard on or off for the next request; no reload."""
+        self.repetition_guard = bool(enabled)
+        if isinstance(getattr(self, "config", None), dict):
+            self.config["repetition_guard"] = self.repetition_guard
+
+    def set_reasoning_effort(self, reasoning_effort: Optional[str]) -> Optional[str]:
+        """Change the requested effort on a loaded model; no reload needed.
+
+        Like `enable_thinking`, `reasoning_effort` rides on each request. Returns
+        the value that will actually be sent, which is None when this model's
+        template does not accept it (or reasoning is disabled).
+        """
+        self.reasoning_effort = str(reasoning_effort).strip() if reasoning_effort else None
+        effective = self._effective_reasoning_effort()
+        if isinstance(getattr(self, "config", None), dict):
+            self.config["reasoning_effort"] = effective
+        return effective
+
+    def _effective_reasoning_effort(self) -> Optional[str]:
+        if self.disable_reasoning:
+            return None
+        return normalize_effort(self.reasoning_controls, self.reasoning_effort)
 
     def _build_chat_template_kwargs(self) -> Optional[Dict[str, Any]]:
         """Template variables for the current reasoning setting.
@@ -371,10 +499,17 @@ class LlamaCppInterrogator(BaseInterrogator):
         it ignore the variable, so sending it is safe across models; returning
         None when reasoning is left on keeps the payload byte-identical to
         before this option existed.
+
+        `reasoning_effort` is different: a template that validates it (Qwen3.8)
+        fails the request on an unknown value, so it is only sent when the
+        loaded template lists it.
         """
-        if not self.disable_reasoning:
-            return None
-        return {"enable_thinking": False}
+        if self.disable_reasoning:
+            return {"enable_thinking": False}
+        effort = self._effective_reasoning_effort()
+        if effort:
+            return {"reasoning_effort": effort}
+        return None
 
     def _chat_completion_with_timeout_retry(
         self,
@@ -385,16 +520,28 @@ class LlamaCppInterrogator(BaseInterrogator):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Dict[str, Any]] = None,
         on_delta: Optional[Callable[[str], None]] = None,
+        on_reasoning_delta: Optional[Callable[[str], None]] = None,
+        sampling: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Retry rejected output constraints once using prompt-only JSON.
 
         Keep this separate from timeout retries: unrelated HTTP errors and
         stalled generations must still propagate without another attempt.
+
+        Every request comes through here, so this is where the repetition
+        guard applies: DRY rides along unless `sampling` overrides it, and the
+        reply streams through loop detectors even when nobody is watching, so
+        a loop raises `LlamaCppRepetitionError` instead of running to
+        max_tokens.
         """
+        if self.repetition_guard:
+            if sampling is None:
+                sampling = dict(DRY_SAMPLING)
+            on_delta, on_reasoning_delta = self._guard_streams(on_delta, on_reasoning_delta)
         try:
             return self._chat_completion_with_transport_retry(
                 messages, temperature, max_tokens, response_format,
-                tools, tool_choice, on_delta,
+                tools, tool_choice, on_delta, on_reasoning_delta, sampling,
             )
         except LlamaCppRuntimeError as exc:
             detail = str(exc).lower()
@@ -408,7 +555,32 @@ class LlamaCppInterrogator(BaseInterrogator):
                 raise
         return self._chat_completion_with_transport_retry(
             messages, temperature, max_tokens, on_delta=on_delta,
+            on_reasoning_delta=on_reasoning_delta, sampling=sampling,
         )
+
+    @staticmethod
+    def _guard_streams(
+        on_delta: Optional[Callable[[str], None]],
+        on_reasoning_delta: Optional[Callable[[str], None]],
+    ) -> Tuple[Callable[[str], None], Callable[[str], None]]:
+        """Stream callbacks that raise once the answer or the thinking loops.
+
+        Both are always returned, so every guarded request streams and can be
+        abandoned; raising inside the stream closes the connection, which
+        llama-server takes as the cue to stop generating.
+        """
+        detectors = {"answer": LoopDetector(), "thinking": LoopDetector()}
+
+        def watch(stream: str, forward: Optional[Callable[[str], None]]) -> Callable[[str], None]:
+            def guarded(fragment: str) -> None:
+                if forward is not None:
+                    forward(fragment)
+                unit = detectors[stream].feed(fragment)
+                if unit is not None:
+                    raise LlamaCppRepetitionError(unit, stream)
+            return guarded
+
+        return watch("answer", on_delta), watch("thinking", on_reasoning_delta)
 
     def _chat_completion_with_transport_retry(
         self,
@@ -419,6 +591,8 @@ class LlamaCppInterrogator(BaseInterrogator):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Dict[str, Any]] = None,
         on_delta: Optional[Callable[[str], None]] = None,
+        on_reasoning_delta: Optional[Callable[[str], None]] = None,
+        sampling: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Run completion with one timeout-specific retry at a longer timeout.
 
@@ -427,6 +601,10 @@ class LlamaCppInterrogator(BaseInterrogator):
         occurrence instead of buying a wedged generation a second, longer run.
         """
         chat_template_kwargs = self._build_chat_template_kwargs()
+        # Only passed when wanted, so callers and doubles that predate the
+        # thinking stream see the exact call they always did.
+        thinking = {"on_reasoning_delta": on_reasoning_delta} if on_reasoning_delta is not None else {}
+        samplers = {"sampling": sampling} if sampling else {}
         try:
             response = self.runtime.chat_completion(
                 messages=messages,
@@ -439,8 +617,10 @@ class LlamaCppInterrogator(BaseInterrogator):
                 on_delta=on_delta,
                 chat_template_kwargs=chat_template_kwargs,
                 stall_timeout=self.STREAM_STALL_SECONDS,
+                **thinking,
+                **samplers,
             )
-            if on_delta is not None and self._is_empty_completion(response):
+            if (on_delta is not None or thinking) and self._is_empty_completion(response):
                 # Not every llama.cpp build emits tool-call deltas over SSE.
                 # Fall back to the buffered endpoint rather than lose the turn.
                 return self.runtime.chat_completion(
@@ -452,6 +632,7 @@ class LlamaCppInterrogator(BaseInterrogator):
                     tool_choice=tool_choice,
                     timeout=self.REQUEST_TIMEOUT_SECONDS,
                     chat_template_kwargs=chat_template_kwargs,
+                    **samplers,
                 )
             return response
         except LlamaCppStallError:
@@ -470,6 +651,7 @@ class LlamaCppInterrogator(BaseInterrogator):
                 tool_choice=tool_choice,
                 timeout=self.REQUEST_TIMEOUT_RETRY_SECONDS,
                 chat_template_kwargs=chat_template_kwargs,
+                **samplers,
             )
         except LlamaCppRuntimeError as retry_exc:
             if is_llama_timeout_error(retry_exc):
@@ -793,17 +975,62 @@ class LlamaCppInterrogator(BaseInterrogator):
             )
         return context
 
-    @staticmethod
-    def _encode_image_as_data_url(image_path: str) -> str:
+    @classmethod
+    def _encode_image_as_data_url(cls, image_path: str, reencode: bool = False) -> str:
+        """Encode an image as a data URL llama-server can decode.
+
+        A file in a format llama.cpp reads itself is sent byte for byte. Any
+        other format -- judged by content, not extension, so a WebP saved as
+        .png counts -- is converted with Pillow, as is a CMYK JPEG or an image
+        whose EXIF orientation llama.cpp would ignore (the model then sees it
+        upright, as the gallery shows it). `reencode` forces the conversion.
+        """
         path = Path(image_path)
         if not path.exists():
             raise ValueError(f"Image does not exist: {image_path}")
-        suffix = path.suffix.lower().lstrip(".") or "png"
-        if suffix == "jpg":
-            suffix = "jpeg"
-        with path.open("rb") as f:
-            encoded = base64.b64encode(f.read()).decode("ascii")
-        return f"data:image/{suffix};base64,{encoded}"
+        from PIL import Image, UnidentifiedImageError
+
+        try:
+            with Image.open(path) as image:
+                image_format = (image.format or "").upper()
+                try:
+                    orientation = image.getexif().get(0x0112, 1)
+                except Exception:  # noqa: BLE001 - malformed EXIF just means "upright"
+                    orientation = 1
+                if (
+                    reencode
+                    or image_format not in LLAMA_NATIVE_IMAGE_FORMATS
+                    or image.mode == "CMYK"
+                    or orientation not in (0, 1)
+                ):
+                    data, mime = cls._reencode_image(image)
+                    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+        except Image.DecompressionBombError:
+            # Too many pixels for Pillow to open even to look; send it as before.
+            image_format = path.suffix.lower().lstrip(".").replace("jpg", "jpeg").upper() or "PNG"
+        except (UnidentifiedImageError, OSError) as exc:
+            raise ValueError(f"Cannot read image {path.name}: {exc}") from exc
+
+        mime = "image/jpeg" if image_format in ("JPEG", "MPO") else f"image/{image_format.lower()}"
+        return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+
+    @staticmethod
+    def _reencode_image(image: Any) -> Tuple[bytes, str]:
+        """Upright first frame as PNG when it has transparency, else JPEG."""
+        from PIL import ImageOps
+
+        image = ImageOps.exif_transpose(image)
+        buffer = io.BytesIO()
+        if image.mode in ("RGBA", "LA", "PA") or (image.mode == "P" and "transparency" in image.info):
+            image.convert("RGBA").save(buffer, "PNG", compress_level=1)
+            return buffer.getvalue(), "image/png"
+        image.convert("RGB").save(buffer, "JPEG", quality=95, subsampling=0)
+        return buffer.getvalue(), "image/jpeg"
+
+    @staticmethod
+    def _is_image_load_error(exc: Exception) -> bool:
+        detail = str(exc).lower()
+        return "http error 400" in detail and any(marker in detail for marker in _IMAGE_LOAD_ERRORS)
 
     @staticmethod
     def _extract_assistant_content(response: Dict[str, Any]) -> str:

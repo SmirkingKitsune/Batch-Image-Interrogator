@@ -5,6 +5,15 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Arguments are forwarded to main.py. --electron selects the opt-in Electron
+# front end; without it the PyQt6 interface opens as always.
+USE_ELECTRON=0
+for arg in "$@"; do
+    if [ "$arg" = "--electron" ]; then
+        USE_ELECTRON=1
+    fi
+done
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -72,10 +81,27 @@ else
     fi
 fi
 
+# Electron is only looked for when it was asked for. A missing install stops
+# here rather than quietly opening PyQt6, so the UI in use is never a surprise.
+if [ "$USE_ELECTRON" = "1" ]; then
+    echo -e "${BLUE}[*] UI: Electron (--electron)${NC}"
+    ELECTRON_PKG="ui_electron/node_modules/electron"
+    ELECTRON_REL="$(cat "$ELECTRON_PKG/path.txt" 2>/dev/null || true)"
+    if [ -z "$ELECTRON_REL" ] || [ ! -x "$ELECTRON_PKG/dist/$ELECTRON_REL" ]; then
+        echo -e "${RED}[X] --electron requested but Electron is not installed.${NC}"
+        echo "    Run ./setup.sh --electron once, or drop the flag"
+        echo "    to use the default PyQt6 interface."
+        echo ""
+        exit 1
+    fi
+    ELECTRON_VERSION="$(python3 -c "import json; print(json.load(open('$ELECTRON_PKG/package.json'))['version'])" 2>/dev/null || echo "?")"
+    echo -e "${GREEN}[+] electron ${ELECTRON_VERSION} found at ui_electron/node_modules${NC}"
+fi
+
 echo ""
 echo -e "${BLUE}[*] Starting Image Interrogator...${NC}"
 echo ""
-python3 main.py
+python3 main.py "$@"
 
 if [ $? -ne 0 ]; then
     echo ""

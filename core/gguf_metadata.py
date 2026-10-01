@@ -105,6 +105,27 @@ def context_length_from_metadata(metadata: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+# Sampling a model's publisher recommends, as llama-server request fields.
+_SAMPLING_KEYS = {
+    "general.sampling.temp": "temperature",
+    "general.sampling.top_k": "top_k",
+    "general.sampling.top_p": "top_p",
+    "general.sampling.min_p": "min_p",
+}
+
+
+def recommended_sampling(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """The `general.sampling.*` values a GGUF ships, e.g. {"temperature": 1.0, "top_k": 20}."""
+    sampling: Dict[str, Any] = {}
+    for key, field in _SAMPLING_KEYS.items():
+        value = metadata.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        # float32 storage turns 0.95 into 0.949999988.
+        sampling[field] = int(value) if field == "top_k" else round(float(value), 4)
+    return sampling
+
+
 def _read_struct(handle: BinaryIO, fmt: str) -> Any:
     size = struct.calcsize(fmt)
     data = handle.read(size)

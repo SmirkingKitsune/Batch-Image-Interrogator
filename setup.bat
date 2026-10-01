@@ -14,6 +14,13 @@ REM ============================================================
 setlocal enabledelayedexpansion
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
+
+REM --electron additionally installs the opt-in Electron front end, started
+REM with run.bat --electron. The PyQt6 interface needs none of it.
+set "INSTALL_ELECTRON=n"
+for %%a in (%*) do (
+    if /i "%%~a"=="--electron" set "INSTALL_ELECTRON=y"
+)
 echo.
 echo ============================================================
 echo IMAGE INTERROGATOR - SETUP WIZARD
@@ -347,10 +354,71 @@ if "!INSTALL_CUDA!"=="y" (
     )
 )
 
+set "ELECTRON_STATUS="
+if /i "!INSTALL_ELECTRON!"=="y" (
+    call :install_electron
+    if errorlevel 1 (
+        set "ELECTRON_STATUS=failed"
+    ) else (
+        set "ELECTRON_STATUS=ok"
+    )
+)
+
 echo ============================================================
 echo SETUP COMPLETE!
 echo ============================================================
 echo.
 echo You can now run the application with: run.bat
+if "!ELECTRON_STATUS!"=="ok" echo Electron UI, opt-in:                  run.bat --electron
+if "!ELECTRON_STATUS!"=="failed" echo The Electron UI was not installed; see the messages above.
 echo.
 pause
+endlocal
+exit /b
+
+:install_electron
+echo ============================================================
+echo ELECTRON UI (--electron)
+echo ============================================================
+echo.
+where node >nul 2>&1
+if errorlevel 1 goto :electron_no_node
+where npm >nul 2>&1
+if errorlevel 1 goto :electron_no_node
+node -e "const [a,b]=process.versions.node.split('.').map(Number); process.exit(a>22||(a===22&&b>=12)?0:1)"
+if errorlevel 1 (
+    echo [X] Node.js is too old; Electron needs 22.12 or newer.
+    exit /b 1
+)
+pushd ui_electron
+if exist package-lock.json (
+    call npm ci --no-audit --no-fund
+) else (
+    call npm install --no-audit --no-fund
+)
+if errorlevel 1 (
+    popd
+    echo [X] npm could not install the Electron UI dependencies.
+    exit /b 1
+)
+REM Electron fetches its binary in a separate, checksum-verified step.
+call node node_modules\electron\install.js
+if errorlevel 1 (
+    popd
+    echo [X] Downloading the Electron binary failed.
+    exit /b 1
+)
+popd
+if not exist "ui_electron\node_modules\electron\path.txt" (
+    echo [X] Electron did not install correctly.
+    exit /b 1
+)
+echo [+] Electron installed at ui_electron\node_modules
+echo.
+exit /b 0
+
+:electron_no_node
+echo [X] Node.js and npm are needed once to install the Electron UI.
+echo     Install Node.js 22.12 or newer from https://nodejs.org, then run
+echo     setup.bat --electron again. The default PyQt6 interface is unaffected.
+exit /b 1

@@ -22,6 +22,10 @@ interrogations.db*
 onnx_provider_settings.json*
 inquiry_settings.json*
 tag_filters.json*
+electron_settings.json*
+
+# Electron UI dependencies (installed by ./setup.sh --electron)
+ui_electron/node_modules/
 
 # Local tooling/editor state
 .claude/

@@ -85,6 +85,10 @@ class InterrogationDatabase:
 
     def __init__(self, db_path: str = "interrogations.db"):
         self.db_path = Path(db_path)
+        # Global mode returns to this path. Hardcoding "interrogations.db" in
+        # switch_to_directory sent a database opened elsewhere back to the
+        # working directory's file.
+        self._global_db_path = Path(db_path)
         self._lock = threading.Lock()
         self.use_local_db = False  # Global by default
 
@@ -803,7 +807,7 @@ class InterrogationDatabase:
             local_db_path = Path(directory) / ".interrogations.db"
         else:
             # Use global database
-            local_db_path = Path("interrogations.db")
+            local_db_path = self._global_db_path
 
         # Only switch if it's a different database
         if local_db_path != self.db_path:

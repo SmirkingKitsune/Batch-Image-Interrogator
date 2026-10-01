@@ -4,6 +4,13 @@ REM For first-time setup or CUDA issues, run: setup.bat
 
 setlocal enabledelayedexpansion
 
+REM Arguments are forwarded to main.py. --electron selects the opt-in Electron
+REM front end; without it the PyQt6 interface opens as always.
+set "USE_ELECTRON=0"
+for %%a in (%*) do (
+    if /i "%%~a"=="--electron" set "USE_ELECTRON=1"
+)
+
 echo ==========================================
 echo Image Interrogator - Quick Launch
 echo ==========================================
@@ -69,10 +76,13 @@ if not errorlevel 1 (
 )
 
 :run_app
+if "!USE_ELECTRON!"=="1" goto :check_electron
+
+:start_app
 echo.
 echo [*] Starting Image Interrogator...
 echo.
-python main.py
+python main.py %*
 
 if errorlevel 1 (
     echo.
@@ -81,3 +91,24 @@ if errorlevel 1 (
 )
 
 endlocal
+exit /b
+
+REM Electron is only looked for when it was asked for. A missing install stops
+REM here rather than quietly opening PyQt6.
+:check_electron
+echo [*] UI: Electron (--electron)
+set "ELECTRON_REL="
+if exist "ui_electron\node_modules\electron\path.txt" set /p ELECTRON_REL=<"ui_electron\node_modules\electron\path.txt"
+if not defined ELECTRON_REL goto :electron_missing
+if not exist "ui_electron\node_modules\electron\dist\!ELECTRON_REL!" goto :electron_missing
+echo [+] electron found at ui_electron\node_modules
+goto :start_app
+
+:electron_missing
+echo [X] --electron requested but Electron is not installed.
+echo     Run setup.bat --electron once, or drop the flag
+echo     to use the default PyQt6 interface.
+echo.
+pause
+endlocal
+exit /b 1

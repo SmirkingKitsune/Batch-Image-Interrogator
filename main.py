@@ -39,6 +39,12 @@ def main():
 
     print()  # Blank line for readability
 
+    # Opt-in Electron front end: the same backend, run headless behind a local
+    # bridge. Qt is never imported on this path.
+    if "--electron" in sys.argv[1:]:
+        from bridge import start_bridge
+        sys.exit(start_bridge(device_status, sys.argv[1:]))
+
     # NOW safe to import and initialize Qt (PyTorch already claimed CUDA)
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import Qt, QTimer

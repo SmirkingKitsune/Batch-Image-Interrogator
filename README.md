@@ -208,6 +208,40 @@ If the script detects you have an NVIDIA GPU but PyTorch is running in CPU mode,
 python main.py
 ```
 
+### Electron UI (opt-in)
+
+An alternative front end built with Electron is available behind a flag. PyQt6 stays the default and is unchanged; the Electron window only opens when `--electron` is passed. Both interfaces share the same database, tag filters, ONNX provider settings and Inquiry settings.
+
+Install it once (needs Node.js 22.12 or newer at install time only):
+```bash
+./setup.sh --electron      # Windows: setup.bat --electron
+```
+
+Then launch it:
+```bash
+./run.sh --electron        # Windows: run.bat --electron
+```
+
+If Electron is not installed, `--electron` stops with a message instead of silently opening PyQt6.
+
+How it works: `main.py` detects devices first, as always, then starts a headless bridge that runs `core/` and `interrogators/` without importing Qt. The bridge serves the window on `127.0.0.1` with a per-launch token passed to Electron through the environment, streams progress, results and transcript tokens to it, and shuts down when the window closes.
+
+What the Electron UI adds:
+- A run bar with per-image states (queued, running, cached, done, failed), throughput, ETA, pause and cancel
+- Always-visible device, GPU memory, loaded model and llama.cpp runtime status
+- A gallery that shows which images have a `.txt` sidecar, how many models have results, and which results are in the database only
+- An Advanced Inspection diff that can apply a stored result to the `.txt` file
+- An organize dialog that shows the exact number of files to move and where they go before anything moves
+- A first-run environment check, and the llama.cpp acquisition ladder (which install attempt succeeded) on the Settings tab
+
+Linux note: on systems that restrict unprivileged user namespaces (for example Ubuntu 24.04), Electron starts with Chromium's sandbox disabled unless its helper is made setuid-root:
+```bash
+sudo chown root:root ui_electron/node_modules/electron/dist/chrome-sandbox
+sudo chmod 4755 ui_electron/node_modules/electron/dist/chrome-sandbox
+```
+
+For development, `python main.py --electron --bridge-only --bridge-port 51734` serves the UI without launching Electron and prints a one-time URL to open it in a browser.
+
 ### Basic Workflow
 
 1. **Select Directory**: Click "Select Directory" to choose a folder containing images

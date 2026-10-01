@@ -18,6 +18,13 @@ from core import FileManager, TagFilterSettings, InterrogationDatabase, get_imag
 from core.hashing import hash_image_content
 from core.device_detector import get_device_detector
 from core.llama_cpp_runtime import LlamaCppRuntimeManager, is_llama_timeout_error
+from core.tag_review import (
+    apply_common_tag_edits,
+    build_tag_comparison,
+    collect_editor_tags,
+    compute_common_tags,
+    extract_wd_ratings,
+)
 from interrogators import LlamaCppInterrogator
 from ui.llama_runtime import resolve_runtime_binary
 from ui.widgets import InquiryTranscriptWidget, TagEditorWidget, ResultsTableWidget
@@ -846,107 +853,26 @@ class AdvancedImageInspectionDialog(QDialog):
             Set of tags that exist in ALL selected images (intersection).
             Returns canonical form (prefers DB form, then first encountered).
         """
-        # Collect normalized tag sets and track canonical forms
-        # normalized_tag_sets: list of sets of normalized tags per image
-        # canonical_forms: maps normalized -> preferred original form
-        normalized_tag_sets = []
-        canonical_forms = {}  # normalized -> original tag (prefer DB form)
+        def per_image_tags():
+            for image_path in self.selected_images:
+                db_tag_lists = []
+                try:
+                    file_hash = hash_image_content(image_path)
+                    interrogations = self.database.get_all_interrogations_for_image(file_hash) or []
+                    db_tag_lists = [interrog.get('tags', []) for interrog in interrogations]
+                except Exception as e:
+                    logger.error(f"Error loading interrogations for {image_path}: {e}")
+                yield db_tag_lists, FileManager.read_tags_from_file(Path(image_path))
 
-        for image_path in self.selected_images:
-            image_normalized_tags = set()
-
-            # Get tags from all database interrogations for this image
-            try:
-                file_hash = hash_image_content(image_path)
-                interrogations = self.database.get_all_interrogations_for_image(file_hash) or []
-                for interrog in interrogations:
-                    tags = interrog.get('tags', [])
-                    if tags:
-                        for tag in tags:
-                            if self.tag_filters:
-                                normalized = self.tag_filters.normalize_tag_for_comparison(tag)
-                            else:
-                                normalized = tag.lower()
-                            image_normalized_tags.add(normalized)
-                            # DB form takes priority as canonical
-                            if normalized not in canonical_forms:
-                                canonical_forms[normalized] = tag
-            except Exception as e:
-                logger.error(f"Error loading interrogations for {image_path}: {e}")
-
-            # Get tags from .txt file
-            file_tags = FileManager.read_tags_from_file(Path(image_path))
-            for tag in file_tags:
-                if self.tag_filters:
-                    normalized = self.tag_filters.normalize_tag_for_comparison(tag)
-                else:
-                    normalized = tag.lower()
-                image_normalized_tags.add(normalized)
-                # Only set canonical if not already set (DB takes priority)
-                if normalized not in canonical_forms:
-                    canonical_forms[normalized] = tag
-
-            normalized_tag_sets.append(image_normalized_tags)
-
-        # Compute intersection of normalized sets
-        if normalized_tag_sets:
-            common_normalized = set.intersection(*normalized_tag_sets)
-            # Convert back to canonical forms
-            return {canonical_forms[n] for n in common_normalized if n in canonical_forms}
-        else:
-            return set()
+        return compute_common_tags(per_image_tags(), self.tag_filters)
 
     def _populate_tag_selector(self):
         """Collect all tags from all interrogations and populate the tag selector."""
-        # Collect all unique tags from all model interrogations
-        # Use normalized comparison to deduplicate underscore variants
-        all_tags_canonical = {}  # normalized -> canonical form (prefer DB)
-        for interrog in self.current_interrogations:
-            tags = interrog.get('tags', [])
-            if tags:
-                for tag in tags:
-                    if self.tag_filters:
-                        normalized = self.tag_filters.normalize_tag_for_comparison(tag)
-                    else:
-                        normalized = tag.lower()
-                    # DB form takes priority
-                    if normalized not in all_tags_canonical:
-                        all_tags_canonical[normalized] = tag
-
-        # Also include tags from the file that may not be in the database
-        if self.current_file_tags:
-            for tag in self.current_file_tags:
-                if self.tag_filters:
-                    normalized = self.tag_filters.normalize_tag_for_comparison(tag)
-                else:
-                    normalized = tag.lower()
-                # Only add if not already present (DB takes priority)
-                if normalized not in all_tags_canonical:
-                    all_tags_canonical[normalized] = tag
-
-        # Build normalized set of file tags for comparison
-        file_tags_normalized = set()
-        if self.current_file_tags:
-            for tag in self.current_file_tags:
-                if self.tag_filters:
-                    file_tags_normalized.add(self.tag_filters.normalize_tag_for_comparison(tag))
-                else:
-                    file_tags_normalized.add(tag.lower())
-
-        # Convert to sorted list of canonical forms
-        all_tags_list = sorted(all_tags_canonical.values(), key=str.lower)
-
-        # Determine which canonical tags are selected (match via normalized form)
-        selected_tags = []
-        for tag in all_tags_list:
-            if self.tag_filters:
-                normalized = self.tag_filters.normalize_tag_for_comparison(tag)
-            else:
-                normalized = tag.lower()
-            if normalized in file_tags_normalized:
-                selected_tags.append(tag)
-
-        # Set available tags and selected tags in the selector
+        all_tags_list, selected_tags = collect_editor_tags(
+            self.current_interrogations,
+            self.current_file_tags or [],
+            self.tag_filters,
+        )
         self.tag_selector.set_available_tags(all_tags_list, selected_tags)
 
     def _refresh_multimodal_prior_tables(self):
@@ -1365,28 +1291,7 @@ class AdvancedImageInspectionDialog(QDialog):
             Dict with keys: 'general', 'sensitive', 'questionable', 'explicit'
             Values are confidence scores (0.0-1.0)
         """
-        ratings = {
-            'general': 0.0,
-            'sensitive': 0.0,
-            'questionable': 0.0,
-            'explicit': 0.0
-        }
-
-        # Check for rating tags (with or without 'rating:' prefix)
-        rating_mappings = [
-            ('general', ['rating:safe', 'general', 'rating:general']),
-            ('sensitive', ['rating:sensitive', 'sensitive']),
-            ('questionable', ['rating:questionable', 'questionable']),
-            ('explicit', ['rating:explicit', 'explicit'])
-        ]
-
-        for rating_name, possible_tags in rating_mappings:
-            for tag in possible_tags:
-                if tag in tags and tag in confidence_scores:
-                    ratings[rating_name] = confidence_scores[tag]
-                    break
-
-        return ratings
+        return extract_wd_ratings(tags, confidence_scores)
 
     def _update_ratings_display(self, model_data: Dict):
         """Update ratings display with model data."""
@@ -1424,114 +1329,12 @@ class AdvancedImageInspectionDialog(QDialog):
         - location: str
         - original_tag: str (if replaced)
         """
-        db_tags = model_data['tags']
-        db_confidence = model_data.get('confidence_scores', {}) or {}
-        file_tags = self.current_file_tags
-
-        # Apply filters to see what WOULD be written
-        filtered_tags = []
-        if self.tag_filters and db_confidence:
-            threshold = 0.35  # Default, could be model-specific
-            filtered_tags, _ = self.tag_filters.filter_tags_with_confidence(
-                db_tags, db_confidence, threshold
-            )
-        else:
-            filtered_tags = db_tags
-
-        comparison = []
-
-        # Build normalized lookup for file tags to handle underscore equivalence
-        # Maps normalized form -> original file tag
-        file_tags_normalized = {}
-        if self.tag_filters:
-            for ft in file_tags:
-                normalized = self.tag_filters.normalize_tag_for_comparison(ft)
-                file_tags_normalized[normalized] = ft
-        else:
-            for ft in file_tags:
-                file_tags_normalized[ft.lower()] = ft
-
-        # Build normalized lookup for filtered tags
-        filtered_tags_normalized = set()
-        if self.tag_filters:
-            for ft in filtered_tags:
-                filtered_tags_normalized.add(self.tag_filters.normalize_tag_for_comparison(ft))
-        else:
-            filtered_tags_normalized = {ft.lower() for ft in filtered_tags}
-
-        # Track which file tags have been matched (by normalized form) to avoid duplicates
-        matched_file_tags_normalized = set()
-
-        # Process DB tags
-        for tag in db_tags:
-            tag_lower = tag.lower()
-            conf = db_confidence.get(tag, 0.0)
-
-            # Normalize for comparison
-            if self.tag_filters:
-                tag_normalized = self.tag_filters.normalize_tag_for_comparison(tag)
-            else:
-                tag_normalized = tag_lower
-
-            # Check if in file (using normalized comparison)
-            in_file = tag_normalized in file_tags_normalized
-            in_filtered = tag_normalized in filtered_tags_normalized
-
-            if in_file:
-                matched_file_tags_normalized.add(tag_normalized)
-
-            # Determine status
-            if in_file and in_filtered:
-                status = 'in_both'
-                location = 'Both'
-            elif in_file and not in_filtered:
-                status = 'manually_added'
-                location = 'File'
-            elif not in_file and in_filtered:
-                status = 'db_only'
-                location = 'Database'
-            else:  # not in file, not in filtered
-                status = 'removed_by_filter'
-                location = 'Database (filtered)'
-
-            # Check if replaced
-            if self.tag_filters and tag_lower in self.tag_filters.replace_dict:
-                replacement = self.tag_filters.replace_dict[tag_lower]
-                status = 'replaced'
-                comparison.append({
-                    'tag': replacement,
-                    'confidence': conf,
-                    'status': status,
-                    'location': location,
-                    'original_tag': tag
-                })
-            else:
-                comparison.append({
-                    'tag': tag,
-                    'confidence': conf,
-                    'status': status,
-                    'location': location,
-                    'original_tag': None
-                })
-
-        # Add file-only tags (not in DB at all, using normalized comparison)
-        for tag in file_tags:
-            if self.tag_filters:
-                tag_normalized = self.tag_filters.normalize_tag_for_comparison(tag)
-            else:
-                tag_normalized = tag.lower()
-
-            if tag_normalized not in matched_file_tags_normalized:
-                # This file tag wasn't matched to any DB tag
-                comparison.append({
-                    'tag': tag,
-                    'confidence': None,
-                    'status': 'file_only',
-                    'location': 'File only',
-                    'original_tag': None
-                })
-
-        return comparison
+        return build_tag_comparison(
+            model_data['tags'],
+            model_data.get('confidence_scores', {}) or {},
+            self.current_file_tags,
+            self.tag_filters,
+        )
 
     def _update_comparison_view(self, model_data: Dict):
         """Update the comparison table with color-coded tags."""
@@ -1710,53 +1513,14 @@ class AdvancedImageInspectionDialog(QDialog):
         failed_paths = []
         saved_results = []  # Collect results for batch signal
 
-        # Build normalized sets for removal/addition to handle underscore variants
-        # e.g., removing canonical "long_hair" should also remove "long hair" from files
-        tags_to_remove_normalized = set()
-        tags_to_add_normalized = set()
-        for tag in tags_to_remove:
-            if self.tag_filters:
-                tags_to_remove_normalized.add(self.tag_filters.normalize_tag_for_comparison(tag))
-            else:
-                tags_to_remove_normalized.add(tag.lower())
-        for tag in tags_to_add:
-            if self.tag_filters:
-                tags_to_add_normalized.add(self.tag_filters.normalize_tag_for_comparison(tag))
-            else:
-                tags_to_add_normalized.add(tag.lower())
-
-        # Update each image's tags
+        # Update each image's tags. Matching is by normalized form, so removing
+        # canonical "long_hair" also removes "long hair" from files.
         for image_path in self.selected_images:
             try:
-                # Read current tags from file
                 current_tags = FileManager.read_tags_from_file(Path(image_path))
-
-                # Filter out tags that match removal set (using normalized comparison)
-                new_tags = []
-                current_normalized = set()
-                for tag in current_tags:
-                    if self.tag_filters:
-                        tag_normalized = self.tag_filters.normalize_tag_for_comparison(tag)
-                    else:
-                        tag_normalized = tag.lower()
-
-                    # Keep tag if it's not in the removal set
-                    if tag_normalized not in tags_to_remove_normalized:
-                        new_tags.append(tag)
-                        current_normalized.add(tag_normalized)
-
-                # Add any new tags (if their normalized form isn't already present)
-                for tag in tags_to_add:
-                    if self.tag_filters:
-                        tag_normalized = self.tag_filters.normalize_tag_for_comparison(tag)
-                    else:
-                        tag_normalized = tag.lower()
-
-                    if tag_normalized not in current_normalized:
-                        new_tags.append(tag)
-                        current_normalized.add(tag_normalized)
-
-                # Write back
+                new_tags = apply_common_tag_edits(
+                    current_tags, tags_to_remove, tags_to_add, self.tag_filters
+                )
                 FileManager.write_tags_to_file(
                     Path(image_path),
                     new_tags,

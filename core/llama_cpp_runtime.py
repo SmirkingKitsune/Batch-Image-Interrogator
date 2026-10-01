@@ -23,6 +23,18 @@ class LlamaCppRuntimeError(RuntimeError):
     """Raised when llama.cpp runtime operations fail."""
 
 
+class LlamaCppRepetitionError(LlamaCppRuntimeError):
+    """Raised to abandon a streamed completion that is stuck repeating itself.
+
+    `unit` is what repeats; `stream` says where, "thinking" or "answer".
+    """
+
+    def __init__(self, unit: str, stream: str):
+        self.unit = unit
+        self.stream = stream
+        super().__init__(f"llama-server output stuck repeating {unit[:40]!r} in the {stream}")
+
+
 class LlamaCppStallError(LlamaCppRuntimeError):
     """Raised when a streamed completion stops producing tokens.
 
@@ -477,6 +489,8 @@ class LlamaCppRuntimeManager:
         on_delta: Optional[Callable[[str], None]] = None,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
         stall_timeout: Optional[float] = None,
+        on_reasoning_delta: Optional[Callable[[str], None]] = None,
+        sampling: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Send an OpenAI-compatible chat completion request to llama-server.
 
@@ -488,6 +502,11 @@ class LlamaCppRuntimeManager:
         Args:
             chat_template_kwargs: Extra variables for the jinja chat template,
                 e.g. `{"enable_thinking": False}` on Qwen3-family models.
+            on_reasoning_delta: Streaming only. Called with each fragment of
+                the model's thinking (`reasoning_content`), which arrives
+                before the answer and is kept out of it.
+            sampling: Extra llama-server sampler fields for this request, such
+                as the DRY settings or `top_k`; merged into the payload.
             stall_timeout: Streaming only. Abort when no token arrives for this
                 many seconds. `timeout` cannot express this: on a buffered
                 request the socket is idle for the whole generation, so a limit
@@ -501,7 +520,7 @@ class LlamaCppRuntimeManager:
             if not base_url or not self._is_process_running():
                 raise LlamaCppRuntimeError("llama-server is not running")
 
-        streaming = on_delta is not None
+        streaming = on_delta is not None or on_reasoning_delta is not None
         payload: Dict[str, Any] = {
             "model": self._model_alias,
             "messages": messages,
@@ -518,6 +537,8 @@ class LlamaCppRuntimeManager:
             payload["tool_choice"] = tool_choice
         if chat_template_kwargs:
             payload["chat_template_kwargs"] = dict(chat_template_kwargs)
+        if sampling:
+            payload.update(sampling)
 
         data = json.dumps(payload).encode("utf-8")
         req = request.Request(
@@ -537,8 +558,9 @@ class LlamaCppRuntimeManager:
                 if streaming:
                     return self._read_sse_completion(
                         resp,
-                        on_delta,
+                        on_delta or (lambda _fragment: None),
                         stall_timeout=float(stall_timeout) if stalls else None,
+                        on_reasoning_delta=on_reasoning_delta,
                     )
                 body = resp.read().decode("utf-8")
                 return json.loads(body)
@@ -560,6 +582,7 @@ class LlamaCppRuntimeManager:
         response: Any,
         on_delta: Callable[[str], None],
         stall_timeout: Optional[float] = None,
+        on_reasoning_delta: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         """Consume an SSE chat-completion stream into a non-streaming response.
 
@@ -617,9 +640,16 @@ class LlamaCppRuntimeManager:
                 continue
 
             # Thinking is generation progress even when it is not displayed.
-            if any(isinstance(delta.get(key), str) and delta[key]
-                   for key in ("reasoning_content", "reasoning")):
-                last_progress = time.monotonic()
+            # It stays out of the reassembled message: answer parsing reads
+            # `reasoning_content` as a fallback candidate, and a streamed turn
+            # must parse exactly as it did before thinking was shown.
+            for key in ("reasoning_content", "reasoning"):
+                thought = delta.get(key)
+                if isinstance(thought, str) and thought:
+                    last_progress = time.monotonic()
+                    if on_reasoning_delta is not None:
+                        on_reasoning_delta(thought)
+                    break
 
             fragment = delta.get("content")
             if isinstance(fragment, str) and fragment:

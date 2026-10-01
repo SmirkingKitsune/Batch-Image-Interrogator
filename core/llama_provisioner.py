@@ -1302,6 +1302,35 @@ def _last_line(text: str) -> str:
     return text.strip().splitlines()[-1].strip() if text.strip() else ""
 
 
+def _ladder_rung(cfg: ProvisionConfig, ok: bool, detail: str, skipped: bool = False) -> Dict[str, Any]:
+    """One rung of the acquisition ladder, as recorded in active-runtime.json."""
+    return {
+        "method": cfg.install_method,
+        "accelerator": cfg.accelerator,
+        "ok": bool(ok),
+        "skipped": bool(skipped),
+        "detail": detail,
+    }
+
+
+def _record_ladder(provision_dir: Path, ladder: List[Dict[str, Any]]) -> None:
+    """Attach the rungs of the run that installed the runtime to its record.
+
+    Stored beside the version so a front end can show which rung stuck long
+    after the provisioning dialog has closed. Skipped when no record exists,
+    since the ladder only means something next to an installed runtime.
+    """
+    state = Path(provision_dir) / "active-runtime.json"
+    try:
+        record = json.loads(state.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(record, dict):
+        return
+    record["ladder"] = ladder
+    state.write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
@@ -1376,6 +1405,7 @@ class LlamaProvisioner:
 
         attempts = self._attempts()
         errors: List[str] = []
+        ladder = self._skipped_rungs()
         for index, (label, cfg) in enumerate(attempts, 1):
             self.log_sink(f"=== Attempt {index}/{len(attempts)}: {label} ===", False)
             try:
@@ -1384,15 +1414,23 @@ class LlamaProvisioner:
                 raise
             except ProvisionError as exc:
                 errors.append(f"{label}: {exc}")
+                ladder.append(_ladder_rung(cfg, ok=False, detail=_first_line(str(exc))))
                 self.log_sink(f"{label} failed: {exc}", True)
                 continue
 
             found = find_managed_executable(cfg)
             if found is None:
                 errors.append(f"{label}: completed but produced no llama-server")
+                ladder.append(_ladder_rung(cfg, ok=False, detail="completed but produced no llama-server"))
                 continue
 
-            if cfg.accelerator != self.config.accelerator:
+            fell_back = cfg.accelerator != self.config.accelerator
+            ladder.append(
+                _ladder_rung(cfg, ok=True, detail="installed — last rung" if fell_back else "installed")
+            )
+            _record_ladder(cfg.provision_dir, ladder)
+
+            if fell_back:
                 self.target_mismatch = (
                     f"Installed a {cfg.accelerator} runtime, but {self.config.accelerator} "
                     f"was requested. Inference will not use the GPU.\n"
@@ -1403,6 +1441,26 @@ class LlamaProvisioner:
             return found
 
         raise ProvisionError("llama.cpp provisioning failed.\n" + "\n".join(errors))
+
+    def _skipped_rungs(self) -> List[Dict[str, Any]]:
+        """Rungs `_attempts` leaves out, recorded so the ladder reads in full.
+
+        Without this a machine with no published build would show a ladder that
+        starts at the source build, hiding why the quick download was never
+        tried.
+        """
+        cfg = self.config
+        if cfg.install_method != "auto" or release_asset_patterns(cfg):
+            return []
+        release = replace(cfg, install_method="release")
+        return [
+            _ladder_rung(
+                release,
+                ok=False,
+                skipped=True,
+                detail=f"no published build for {cfg.platform}-{cfg.arch} + {cfg.accelerator}",
+            )
+        ]
 
     def _attempts(self) -> List[Tuple[str, ProvisionConfig]]:
         cfg = self.config

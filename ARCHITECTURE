@@ -159,3 +159,29 @@ Main Thread (GUI)              Worker Thread (Background)
 Note: SQLite database handles concurrent access safely.
       Worker thread never directly modifies Qt widgets.
       All UI updates via signal/slot mechanism.
+
+
+┌─────────────────────────────────────────────────────────────────────┐
+│              Opt-in Electron Front End (./run.sh --electron)         │
+└─────────────────────────────────────────────────────────────────────┘
+
+main.py ── detect_devices_early() ──┬── no flag ──► QApplication + MainWindow (PyQt6)
+                                    │
+                                    └── --electron ──► bridge.start_bridge()
+                                                          │
+   ui_electron/ (Electron)                                ▼
+   ┌──────────────────────────┐     127.0.0.1:<port>   ┌──────────────────────────┐
+   │ main.js    window, IPC   │  per-launch token      │ bridge/ (no Qt)          │
+   │ preload.js dialogs,shell │  (HttpOnly cookie)     │ server.py  /rpc /events  │
+   │ renderer/  Preact + htm  │ ◄────────────────────► │ service.py + features/   │
+   └──────────────────────────┘  POST /rpc, SSE events └───────────┬──────────────┘
+                                                                   │ uses
+                                                                   ▼
+                                        core/pipelines.py     batch loops shared with ui/workers.py
+                                        core/tag_review.py    DB-vs-file diff shared with the dialog
+                                        core/inquiry_session.py, core/llama_runtime_info.py,
+                                        core/model_catalog.py, interrogators/
+
+The bridge re-emits the signals MainWindow wires between tabs (image_result_ready,
+database_busy, model loads, streamed transcript text) as server-sent events. It does
+not reimplement them: the loops and rules live in core/ and both front ends call them.
