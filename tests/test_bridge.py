@@ -1,6 +1,7 @@
 """Tests for the headless bridge behind the opt-in Electron front end."""
 
 import http.client
+import io
 import json
 import os
 import queue
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -250,6 +252,20 @@ class BridgeServerTests(unittest.TestCase):
     def test_static_paths_cannot_escape_their_directory(self):
         response, _ = self.request("GET", "/app/../secret.txt", headers={"X-Bridge-Token": TOKEN})
         self.assertEqual(response.status, 404)
+
+    def test_a_client_hanging_up_is_not_reported_as_an_error(self):
+        cases = (
+            (BrokenPipeError(32, "Broken pipe"), False),
+            (ConnectionResetError(104, "Connection reset by peer"), False),
+            (ValueError("a real bug"), True),
+        )
+        for exc, reported in cases:
+            with self.subTest(exc=type(exc).__name__), patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                try:
+                    raise exc
+                except Exception:
+                    self.server.httpd.handle_error(None, ("127.0.0.1", 1))
+                self.assertEqual(type(exc).__name__ in stderr.getvalue(), reported)
 
     def test_events_stream_published_messages(self):
         received = queue.Queue()
@@ -604,6 +620,37 @@ class BridgeServiceTests(unittest.TestCase):
             self.service.dispatch("app.set_setting", {"key": "txt_mode", "value": "shred"})
         with self.assertRaises(RpcError):
             self.service.dispatch("app.set_setting", {"key": "not_a_key", "value": 1})
+
+
+# ── Hardware telemetry ────────────────────────────────────────────────────────
+
+
+class HardwareMonitorTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform.startswith("win"), "PATH search only touches warnings on POSIX")
+    def test_sampling_gpu_memory_does_not_make_warnings_repeat(self):
+        from bridge.hardware import HardwareMonitor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "nvidia-smi"
+            fake.write_text("#!/bin/sh\necho '1024, 16384, 5'\n", encoding="utf-8")
+            fake.chmod(0o755)
+            path = tmp + os.pathsep + os.environ.get("PATH", "")
+            with patch.dict(os.environ, {"PATH": path}), \
+                    warnings.catch_warnings(record=True) as caught:
+                monitor = HardwareMonitor()
+                warnings.simplefilter("default")  # each warning once per place
+
+                def warn():
+                    warnings.warn("shown once", UserWarning)
+
+                warn()
+                sample = monitor.sample()  # once a second while a window is open
+                warn()
+
+        self.assertEqual(sample["used"], 1024 * 1024 * 1024)
+        # A sample that changed the warning filters would make Python forget
+        # the first warning and print it again.
+        self.assertEqual(len(caught), 1)
 
 
 # ── Launch ────────────────────────────────────────────────────────────────────

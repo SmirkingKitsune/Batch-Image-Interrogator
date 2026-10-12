@@ -8,7 +8,11 @@ import numpy as np
 
 class WDInterrogator(BaseInterrogator):
     """Waifu Diffusion Tagger interrogator."""
-    
+
+    # 1: inputs are fed as 0-255 BGR. Rows cached before that fix were produced
+    # from 0-1 RGB inputs and carry wrong (often empty) tags.
+    RESULT_VERSION = 1
+
     def __init__(self, model_name: str = "SmilingWolf/wd-v1-4-moat-tagger-v2"):
         super().__init__(model_name)
         self.threshold = 0.35

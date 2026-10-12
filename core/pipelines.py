@@ -445,6 +445,7 @@ class InterrogationBatchRunner:
                             results['tags'],
                             results.get('confidence_scores'),
                             results.get('raw_output'),
+                            result_version=self.interrogator.RESULT_VERSION,
                         )
                     except DatabaseQueuedError:
                         # Operation was queued for later - continue processing
@@ -472,18 +473,19 @@ class InterrogationBatchRunner:
                 self.on_error(image_path_str, message)
 
     def should_use_cached_result(self, cached: Dict[str, Any]) -> bool:
-        """Return False for stale empty ONNX tagger rows that should be regenerated."""
-        model_type = self.interrogator.get_model_type()
-        if model_type == 'WD':
+        """Return False for cached rows that should be regenerated.
+
+        That covers rows written before the interrogator's current
+        RESULT_VERSION (e.g. WD rows from before its preprocessing fix) and
+        empty ONNX tagger rows, which are left behind by broken runs.
+        """
+        if (cached.get('result_version') or 0) < self.interrogator.RESULT_VERSION:
             return False
 
-        tags = cached.get('tags')
-        if tags:
+        if cached.get('tags'):
             return True
 
-        if model_type == 'Camie':
-            return False
-        return True
+        return self.interrogator.get_model_type() not in ('WD', 'Camie')
 
 
 class MultimodalBatchRunner:

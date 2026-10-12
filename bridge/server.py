@@ -170,6 +170,13 @@ class _Server(ThreadingHTTPServer):
     # would let another process bind the same port, so it stays off there.
     allow_reuse_address = not sys.platform.startswith("win")
 
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # The renderer drops requests it no longer needs, such as thumbnails
+        # scrolled out of view, so a write to a closed socket is routine.
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
+
 
 def _make_handler(bridge: BridgeServer):
     class Handler(BaseHTTPRequestHandler):

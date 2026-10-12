@@ -6,7 +6,12 @@ from typing import List, Dict, Optional, Any
 
 class BaseInterrogator(ABC):
     """Abstract base class for image interrogators."""
-    
+
+    # Bump when a fix changes what interrogate() returns for the same image and
+    # settings. Cached rows are stamped with the version that produced them, and
+    # rows from an older version are regenerated instead of reused.
+    RESULT_VERSION = 0
+
     def __init__(self, model_name: str):
         self.model_name = model_name
         self.model = None

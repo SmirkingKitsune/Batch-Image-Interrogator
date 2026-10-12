@@ -61,7 +61,11 @@ class HardwareMonitor:
 
     def __init__(self, device_status: Optional[Dict[str, Any]] = None):
         self.device_status = dict(device_status or {})
-        self._has_nvidia_smi = shutil.which("nvidia-smi") is not None
+        # Run by full path: given a bare name, subprocess searches PATH with
+        # os.get_exec_path(), which changes the warning filters. Each change
+        # makes Python forget which warnings it has shown, so once a second
+        # every library warning would print again, mid progress bar.
+        self._nvidia_smi = shutil.which("nvidia-smi")
         self._static: Optional[Dict[str, Any]] = None
 
     def static_info(self) -> Dict[str, Any]:
@@ -103,9 +107,9 @@ class HardwareMonitor:
         except Exception:
             pass
 
-        if self._has_nvidia_smi:
+        if self._nvidia_smi:
             line = _run([
-                "nvidia-smi",
+                self._nvidia_smi,
                 "--query-gpu=name,driver_version",
                 "--format=csv,noheader,nounits",
             ]).strip().splitlines()
@@ -130,9 +134,9 @@ class HardwareMonitor:
     def sample(self) -> Dict[str, Any]:
         """Current GPU memory use. Keys: used, total (bytes), unified, util."""
         sample: Dict[str, Any] = {"used": None, "total": None, "unified": False, "util": None}
-        if self._has_nvidia_smi:
+        if self._nvidia_smi:
             line = _run([
-                "nvidia-smi",
+                self._nvidia_smi,
                 "--query-gpu=memory.used,memory.total,utilization.gpu",
                 "--format=csv,noheader,nounits",
             ]).strip().splitlines()

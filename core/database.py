@@ -162,12 +162,19 @@ class InterrogationDatabase:
                     tags TEXT NOT NULL,
                     confidence_scores TEXT,
                     raw_output TEXT,
+                    result_version INTEGER,
                     interrogated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (image_id) REFERENCES images(id),
                     FOREIGN KEY (model_id) REFERENCES models(id),
                     UNIQUE(image_id, model_id)
                 )
             """)
+            cursor.execute("PRAGMA table_info(interrogations)")
+            existing_interrogation_columns = {row["name"] for row in cursor.fetchall()}
+            if "result_version" not in existing_interrogation_columns:
+                # Rows written before this column existed read back as NULL,
+                # which callers treat as version 0.
+                cursor.execute("ALTER TABLE interrogations ADD COLUMN result_version INTEGER")
 
             # Exact-match cache entries for multimodal batch inquiry variants.
             cursor.execute("""
@@ -322,8 +329,13 @@ class InterrogationDatabase:
     def save_interrogation(self, image_id: int, model_id: int,
                           tags: List[str],
                           confidence_scores: Optional[Dict[str, float]] = None,
-                          raw_output: Optional[str] = None):
-        """Save or update interrogation results."""
+                          raw_output: Optional[str] = None,
+                          result_version: Optional[int] = None):
+        """Save or update interrogation results.
+
+        result_version is the interrogator's RESULT_VERSION, so the cache can
+        tell rows produced before an output-changing fix from current ones.
+        """
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
@@ -331,15 +343,18 @@ class InterrogationDatabase:
             scores_json = json.dumps(confidence_scores) if confidence_scores else None
 
             cursor.execute("""
-                INSERT INTO interrogations (image_id, model_id, tags, confidence_scores, raw_output)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO interrogations (
+                    image_id, model_id, tags, confidence_scores, raw_output, result_version
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(image_id, model_id)
                 DO UPDATE SET
                     tags = excluded.tags,
                     confidence_scores = excluded.confidence_scores,
                     raw_output = excluded.raw_output,
+                    result_version = excluded.result_version,
                     interrogated_at = CURRENT_TIMESTAMP
-            """, (image_id, model_id, tags_json, scores_json, raw_output))
+            """, (image_id, model_id, tags_json, scores_json, raw_output, result_version))
     
     @_retry_on_busy()
     def get_interrogation(self, image_hash: str, model_name: str) -> Optional[Dict]:
@@ -348,7 +363,7 @@ class InterrogationDatabase:
             cursor = conn.cursor()
 
             cursor.execute("""
-                SELECT i.tags, i.confidence_scores, i.raw_output, i.interrogated_at
+                SELECT i.tags, i.confidence_scores, i.raw_output, i.result_version, i.interrogated_at
                 FROM interrogations i
                 JOIN images img ON i.image_id = img.id
                 JOIN models m ON i.model_id = m.id
@@ -361,6 +376,7 @@ class InterrogationDatabase:
                     'tags': json.loads(result['tags']),
                     'confidence_scores': json.loads(result['confidence_scores']) if result['confidence_scores'] else None,
                     'raw_output': result['raw_output'],
+                    'result_version': result['result_version'] or 0,
                     'interrogated_at': result['interrogated_at']
                 }
             return None
@@ -1003,7 +1019,8 @@ class InterrogationDatabase:
         model_id: int,
         tags: List[str],
         confidence_scores: Optional[Dict[str, float]] = None,
-        raw_output: Optional[str] = None
+        raw_output: Optional[str] = None,
+        result_version: Optional[int] = None
     ) -> None:
         """Direct save_interrogation without retry decorator (for queue processing)."""
         with self._get_connection() as conn:
@@ -1013,15 +1030,18 @@ class InterrogationDatabase:
             scores_json = json.dumps(confidence_scores) if confidence_scores else None
 
             cursor.execute("""
-                INSERT INTO interrogations (image_id, model_id, tags, confidence_scores, raw_output)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO interrogations (
+                    image_id, model_id, tags, confidence_scores, raw_output, result_version
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(image_id, model_id)
                 DO UPDATE SET
                     tags = excluded.tags,
                     confidence_scores = excluded.confidence_scores,
                     raw_output = excluded.raw_output,
+                    result_version = excluded.result_version,
                     interrogated_at = CURRENT_TIMESTAMP
-            """, (image_id, model_id, tags_json, scores_json, raw_output))
+            """, (image_id, model_id, tags_json, scores_json, raw_output, result_version))
 
     def _vacuum_direct(self) -> None:
         """Direct vacuum without retry decorator (for queue processing)."""
