@@ -6,10 +6,34 @@ to ensure PyTorch can properly initialize CUDA.
 """
 
 import logging
+import os
+import shutil
+import sys
+import sysconfig
 from typing import Dict, Optional
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+
+def _triton_build_blocker() -> Optional[str]:
+    """
+    Say why Triton cannot compile its CUDA launcher here, or None if it can.
+
+    Triton builds a small C extension before its first kernel launch, which
+    needs a C compiler and the Python development headers. The lookups
+    mirror triton.runtime.build._build.
+    """
+    scheme = sysconfig.get_default_scheme()
+    if scheme == 'posix_local':  # Debian's scheme; Triton swaps it the same way
+        scheme = 'posix_prefix'
+    include_dir = sysconfig.get_paths(scheme=scheme)['include']
+    if not os.path.exists(os.path.join(include_dir, 'Python.h')):
+        package = f"python{sys.version_info.major}.{sys.version_info.minor}-dev"
+        return f"Python.h is missing from {include_dir} (install {package})"
+    if not (os.environ.get('CC') or shutil.which('gcc') or shutil.which('clang')):
+        return "no C compiler was found (install gcc)"
+    return None
 
 
 class DeviceType(Enum):
@@ -63,6 +87,7 @@ class DeviceDetector:
                 # Log GPU info
                 gpu_name = torch.cuda.get_device_name(0)
                 logger.info(f"PyTorch CUDA available - GPU: {gpu_name}")
+                self._avoid_unbuildable_triton()
             else:
                 self._pytorch_device = "cpu"
                 logger.info("PyTorch CUDA not available - using CPU")
@@ -77,6 +102,36 @@ class DeviceDetector:
             self._pytorch_device = "cpu"
             self._pytorch_error = str(e)
             logger.error(f"Error detecting PyTorch CUDA: {e}")
+
+    def _avoid_unbuildable_triton(self):
+        """
+        Send PyTorch's Triton-backed CUDA ops back to its stock kernels when
+        Triton cannot build on this machine.
+
+        PyTorch 2.14+ routes some eager ops through Triton -- bmm on batched
+        outer products is one, and BLIP-2's T5 decoder reaches it via
+        scaled_dot_product_attention. Without a compiler or Python.h every
+        such call raises, failing CLIP interrogation at its caption step on
+        every image.
+        """
+        reason = _triton_build_blocker()
+        if reason is None:
+            return
+        try:
+            from torch._native import registry, triton_utils
+            if not registry.get_dsl_operations("triton"):
+                return
+            triton_utils.deregister_op_overrides()
+        except (ImportError, AttributeError):
+            return  # this PyTorch doesn't route eager ops through Triton
+        except Exception as e:
+            # Best effort: never let this cost the CUDA detection itself.
+            logger.warning(f"Could not turn off Triton-backed PyTorch ops ({reason}): {e}")
+            return
+        logger.warning(
+            f"Triton can't build its CUDA launcher: {reason}. "
+            "PyTorch will use its standard CUDA kernels instead."
+        )
 
     def _detect_onnx(self):
         """Detect ONNX Runtime CUDA availability."""

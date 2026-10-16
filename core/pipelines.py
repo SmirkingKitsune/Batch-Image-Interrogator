@@ -409,16 +409,18 @@ class InterrogationBatchRunner:
 
                 # Check cache first
                 cached = self.database.get_interrogation(file_hash, self.interrogator.model_name)
-                from_cache = bool(cached and self.should_use_cached_result(cached))
+                current_version = cached and (cached.get('result_version') or 0) >= self.interrogator.RESULT_VERSION
+                reused = self.interrogator.reuse_cached_result(cached) if current_version else None
+                from_cache = reused is not None
 
                 if from_cache:
-                    results = cached
+                    results = reused
                     self.on_progress(idx + 1, total, f"Using cached: {image_path.name}")
                 else:
                     if cached:
                         self.on_progress(
                             idx + 1, total,
-                            f"Reprocessing empty cached result: {image_path.name}",
+                            f"Reprocessing stale cached result: {image_path.name}",
                         )
 
                     results = self.interrogator.interrogate(image_path_str)
@@ -446,6 +448,7 @@ class InterrogationBatchRunner:
                             results.get('confidence_scores'),
                             results.get('raw_output'),
                             result_version=self.interrogator.RESULT_VERSION,
+                            config=self.interrogator.result_signature(),
                         )
                     except DatabaseQueuedError:
                         # Operation was queued for later - continue processing
@@ -471,21 +474,6 @@ class InterrogationBatchRunner:
             except Exception as e:
                 message = str(e).strip() or repr(e)
                 self.on_error(image_path_str, message)
-
-    def should_use_cached_result(self, cached: Dict[str, Any]) -> bool:
-        """Return False for cached rows that should be regenerated.
-
-        That covers rows written before the interrogator's current
-        RESULT_VERSION (e.g. WD rows from before its preprocessing fix) and
-        empty ONNX tagger rows, which are left behind by broken runs.
-        """
-        if (cached.get('result_version') or 0) < self.interrogator.RESULT_VERSION:
-            return False
-
-        if cached.get('tags'):
-            return True
-
-        return self.interrogator.get_model_type() not in ('WD', 'Camie')
 
 
 class MultimodalBatchRunner:

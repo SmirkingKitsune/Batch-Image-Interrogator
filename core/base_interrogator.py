@@ -49,7 +49,28 @@ class BaseInterrogator(ABC):
     def get_config(self) -> Dict:
         """Get current configuration."""
         return self.config.copy()
-    
+
+    def result_signature(self) -> Optional[Dict[str, Any]]:
+        """
+        Settings that shape interrogate()'s output, saved with each result
+        so reuse_cached_result() can tell whether a cached one still applies.
+        """
+        return None
+
+    def reuse_cached_result(self, cached: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Return a cached result as the current settings would produce it, or
+        None to run the model again. `cached['config']` holds the signature
+        it was saved with, if any.
+
+        By default a result is reused only when it was saved with the current
+        signature; interrogators without one reuse whatever is cached.
+        """
+        signature = self.result_signature()
+        if signature is None or cached.get('config') == signature:
+            return cached
+        return None
+
     def __enter__(self):
         """Context manager entry."""
         return self

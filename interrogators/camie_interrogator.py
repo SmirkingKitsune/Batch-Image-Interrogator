@@ -417,12 +417,9 @@ class CamieInterrogator(BaseInterrogator):
         # Build one threshold per category, then fan it out across tags so the
         # threshold test runs in numpy. Disabled categories get an unreachable
         # threshold rather than a per-tag membership check.
-        enabled = set(self.enabled_categories)
         category_cutoffs = np.array(
             [
-                self.category_thresholds.get(category, self.threshold)
-                if category in enabled
-                else np.inf
+                np.inf if (cutoff := self._category_cutoff(category)) is None else cutoff
                 for category in category_order
             ],
             dtype=np.float32,
@@ -460,6 +457,64 @@ class CamieInterrogator(BaseInterrogator):
             'tags': tags,
             'confidence_scores': tags_with_scores,
             'raw_output': json.dumps(raw_output, indent=2)
+        }
+
+    def _category_cutoff(self, category: str) -> Optional[float]:
+        """Confidence a tag in `category` needs to be kept, or None when the
+        category is disabled."""
+        if category not in self.enabled_categories:
+            return None
+        return self.category_thresholds.get(category, self.threshold)
+
+    def result_signature(self) -> Dict[str, Any]:
+        return {'cutoffs': {category: self._category_cutoff(category) for category in self.CATEGORIES}}
+
+    def reuse_cached_result(self, cached: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Serve a cached result under the current thresholds, when it holds one.
+
+        A result keeps every tag that cleared its category's cutoff, so it
+        answers settings at least as strict in every category -- higher
+        cutoffs, fewer categories -- by dropping what no longer qualifies.
+        Rows saved without a signature can't be checked (some predate the v2
+        metadata fix), so they are re-run.
+        """
+        saved = (cached.get('config') or {}).get('cutoffs')
+        if not isinstance(saved, dict):
+            return None
+        for category in self.CATEGORIES:
+            cutoff = self._category_cutoff(category)
+            saved_cutoff = saved.get(category)
+            if cutoff is not None and (
+                not isinstance(saved_cutoff, (int, float)) or saved_cutoff > cutoff
+            ):
+                return None
+
+        try:
+            raw = json.loads(cached.get('raw_output') or '')
+            category_breakdown = {}
+            for category, entries in raw['categories'].items():
+                cutoff = self._category_cutoff(category)
+                category_breakdown[category] = [
+                    entry for entry in entries
+                    if cutoff is not None and entry['confidence'] >= cutoff
+                ]
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return None
+        kept = {entry['tag'] for entries in category_breakdown.values() for entry in entries}
+        scores = cached.get('confidence_scores') or {}
+        tags = [tag for tag in cached.get('tags') or [] if tag in kept]
+
+        raw.update({
+            'threshold_profile': self.threshold_profile,
+            'enabled_categories': self.enabled_categories,
+            'total_tags': len(tags),
+            'categories': category_breakdown
+        })
+        return {
+            'tags': tags,
+            'confidence_scores': {tag: scores[tag] for tag in tags},
+            'raw_output': json.dumps(raw, indent=2)
         }
 
     def get_model_type(self) -> str:

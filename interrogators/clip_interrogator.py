@@ -300,6 +300,9 @@ class CLIPInterrogator(BaseInterrogator):
         similarities = ci.similarities(image_features, candidates)
         return candidates[similarities.index(max(similarities))]
 
+    def result_signature(self) -> Dict[str, Any]:
+        return {'mode': self.mode, 'caption_model': self.caption_model}
+
     def get_model_type(self) -> str:
         """Return model type identifier."""
         if self.caption_model:

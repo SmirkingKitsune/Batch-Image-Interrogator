@@ -1,7 +1,7 @@
 """Waifu Diffusion Tagger interrogator implementation."""
 
 from core.base_interrogator import BaseInterrogator
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from PIL import Image
 import numpy as np
 
@@ -12,6 +12,11 @@ class WDInterrogator(BaseInterrogator):
     # 1: inputs are fed as 0-255 BGR. Rows cached before that fix were produced
     # from 0-1 RGB inputs and carry wrong (often empty) tags.
     RESULT_VERSION = 1
+
+    # Bump whenever preprocess_image changes what the model sees, so results
+    # computed the old way are re-run rather than served from the cache.
+    # 2: BGR 0-255 input (1 fed RGB scaled to 0-1, which skewed every score).
+    PREPROCESS_VERSION = 2
 
     def __init__(self, model_name: str = "SmilingWolf/wd-v1-4-moat-tagger-v2"):
         super().__init__(model_name)
@@ -188,6 +193,34 @@ class WDInterrogator(BaseInterrogator):
             'raw_output': ', '.join(tags)
         }
     
+    def result_signature(self) -> Dict[str, Any]:
+        return {'preprocess': self.PREPROCESS_VERSION, 'threshold': self.threshold}
+
+    def reuse_cached_result(self, cached: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Serve a cached result at the current threshold, when it holds one.
+
+        A result saved at threshold t keeps every tag scoring >= t, so it
+        answers any threshold >= t exactly by dropping the tags below it. A
+        lower threshold needs tags that were never saved. Rows saved without
+        a signature can't be checked (some predate the BGR preprocessing
+        fix), so they are re-run.
+        """
+        signature = cached.get('config') or {}
+        if signature.get('preprocess') != self.PREPROCESS_VERSION:
+            return None
+        saved_threshold = signature.get('threshold')
+        if not isinstance(saved_threshold, (int, float)) or saved_threshold > self.threshold:
+            return None
+
+        scores = cached.get('confidence_scores') or {}
+        tags = [tag for tag in cached.get('tags') or [] if scores.get(tag, 0.0) >= self.threshold]
+        return {
+            'tags': tags,
+            'confidence_scores': {tag: scores[tag] for tag in tags},
+            'raw_output': ', '.join(tags)
+        }
+
     def get_model_type(self) -> str:
         """Return model type identifier."""
         return "WD"

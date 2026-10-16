@@ -224,10 +224,6 @@ class InterrogationWorker(QThread):
         self._runner.run()
         self.finished.emit()
 
-    def _should_use_cached_result(self, cached: Dict[str, Any]) -> bool:
-        """Return False for stale empty ONNX tagger rows that should be regenerated."""
-        return self._runner.should_use_cached_result(cached)
-
 
 class SingleInquiryWorker(QThread):
     """Runs one multimodal inquiry off the GUI thread, streaming as it goes."""
