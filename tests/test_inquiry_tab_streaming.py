@@ -185,6 +185,7 @@ class InquiryTabStreamingTests(unittest.TestCase):
             inquiry_tab=inquiry, interrogation_tab=None, current_interrogator=None,
             gallery_tab=None, _clip_model_worker=None, database=Mock(),
             statusBar=Mock(return_value=Mock()), close=Mock(),
+            _shutdown_workers=Mock(),
         )
         event = Mock()
         with patch("ui.main_window.QTimer.singleShot") as retry:
@@ -193,11 +194,42 @@ class InquiryTabStreamingTests(unittest.TestCase):
             event.accept.assert_not_called()
             inquiry.current_interrogator.unload_model.assert_not_called()
             window.database.close.assert_not_called()
+            window._shutdown_workers.assert_not_called()
             retry.assert_called_once_with(100, window.close)
             MainWindow.closeEvent(window, event)
+        window._shutdown_workers.assert_called_once()
         inquiry.current_interrogator.unload_model.assert_called_once()
         window.database.close.assert_called_once()
         event.accept.assert_called_once()
+
+    def test_cancel_finishes_the_image_and_a_second_click_force_stops(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                tab = self._build_tab(Path(tmpdir), _FakeInterrogator())
+                worker = Mock()
+                tab.interrogation_worker = worker
+                tab.cancel_button.setEnabled(True)
+
+                tab.cancel_operation()
+                worker.cancel.assert_called_once_with()
+                worker.force_cancel.assert_not_called()
+                self.assertEqual(tab.cancel_button.text(), "Force Stop")
+                self.assertTrue(tab.cancel_button.isEnabled())
+
+                tab.cancel_operation()
+                worker.force_cancel.assert_called_once_with()
+                self.assertFalse(tab.cancel_button.isEnabled())
+
+                tab.interrogation_worker = None
+                tab.on_batch_finished(True)
+                self.assertEqual(tab.cancel_button.text(), "Cancel")
+                # Finishing starts a context-source scan; let it go before the
+                # temp directory is removed.
+                tab._stop_batch_context_scan()
+            finally:
+                os.chdir(old_cwd)
 
     def test_response_is_streamed_into_the_pending_card(self):
         with tempfile.TemporaryDirectory() as tmpdir:

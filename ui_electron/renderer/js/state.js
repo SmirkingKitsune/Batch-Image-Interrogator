@@ -338,7 +338,7 @@ export function wireEvents() {
   })));
   on('inquiry.sources', (e) => patch('inquiry', { sources: e.sources, sourcesScanning: Boolean(e.scanning) }));
   on('inquiry.batch.started', (e) => patch('inquiry', (q) => ({
-    batch: { ...q.batch, running: true, cancelling: false, cards: [], lastRun: null, progress: { total: e.total, done: 0, cached: 0, failed: 0, processed: 0, rejected: 0, task: e.task, tags: [], active: true } },
+    batch: { ...q.batch, running: true, cancelling: false, forceStopping: false, cards: [], lastRun: null, progress: { total: e.total, done: 0, cached: 0, failed: 0, processed: 0, rejected: 0, task: e.task, tags: [], active: true } },
   })));
   on('inquiry.batch.progress', (p) => patch('inquiry', (q) => ({ batch: { ...q.batch, progress: p } })));
   on('inquiry.batch.turn', (e) => patch('inquiry', (q) => ({
@@ -366,12 +366,14 @@ export function wireEvents() {
     },
   })));
   on('inquiry.batch.cancelling', () => patch('inquiry', (q) => ({ batch: { ...q.batch, cancelling: true } })));
+  on('inquiry.batch.force_stopping', () => patch('inquiry', (q) => ({ batch: { ...q.batch, cancelling: true, forceStopping: true } })));
   on('inquiry.batch.finished', (e) => {
     patch('inquiry', (q) => ({
       batch: {
         ...q.batch,
         running: false,
         cancelling: false,
+        forceStopping: false,
         lastRun: e,
         progress: { ...(q.batch.progress || {}), ...pickProgress(e), active: false },
         cards: q.batch.cards.map((c) => (c.state === 'live' ? { ...c, state: 'error', error: 'Batch inquiry ended before this image returned a response.' } : c)),

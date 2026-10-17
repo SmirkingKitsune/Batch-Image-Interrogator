@@ -82,6 +82,7 @@ class MainWindow(QMainWindow):
             'llama_mmproj_path': '',
             'ctx_size': 8192,
             'gpu_layers': -1,
+            'no_repack': False,
             'temperature': 0.0,
             'max_tokens': 8192,
             'server_port': 8080,
@@ -289,7 +290,7 @@ class MainWindow(QMainWindow):
         queued_operations = queue_status.get('operations', [])
 
         # Check if operation is queueable
-        is_queueable = self.database._operation_queue.is_queueable(operation)
+        is_queueable = self.database.can_queue_operation(operation)
 
         # Create and show dialog
         dialog = DatabaseBusyDialog(
@@ -493,6 +494,36 @@ class MainWindow(QMainWindow):
             "• SQLite database for efficiency"
         )
     
+    def _shutdown_workers(self):
+        """Cancel and wait for any running background worker threads.
+
+        Must run before unloading interrogators / closing the database so a live
+        QThread is not left running against resources that are being torn down.
+        """
+        candidates = [
+            (getattr(self, "interrogation_tab", None), "interrogation_worker"),
+            (getattr(self, "interrogation_tab", None), "directory_load_worker"),
+            (getattr(self, "inquiry_tab", None), "interrogation_worker"),
+            (self, "queue_worker"),
+        ]
+        for owner, attr in candidates:
+            worker = getattr(owner, attr, None) if owner is not None else None
+            if worker is None:
+                continue
+            try:
+                if worker.isRunning():
+                    # Closing should not wait out an image in progress, so
+                    # force-stop where the worker supports it.
+                    stop = getattr(worker, "force_cancel", None) or getattr(worker, "cancel", None)
+                    if stop is not None:
+                        stop()
+                    # Best-effort wait; an in-flight network/inference call may
+                    # take a moment to notice cancellation.
+                    worker.wait(5000)
+            except RuntimeError:
+                # Underlying C++ QThread object already deleted.
+                pass
+
     def closeEvent(self, event):
         """Handle application close."""
         if hasattr(self, "inquiry_tab") and self.inquiry_tab:
@@ -501,6 +532,10 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Waiting for the active inquiry before closing...")
                 QTimer.singleShot(100, self.close)
                 return
+
+        # Stop background workers before tearing down shared resources.
+        self._shutdown_workers()
+
         # Cleanup
         if self.interrogation_tab and getattr(self.interrogation_tab, "current_interrogator", None):
             self.interrogation_tab.current_interrogator.unload_model()
@@ -519,5 +554,5 @@ class MainWindow(QMainWindow):
 
         if self.database:
             self.database.close()
-        
+
         event.accept()

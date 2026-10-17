@@ -898,6 +898,7 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
             'mmproj_path_edit': QLineEdit,
             'ctx_size_spin': QSpinBox,
             'gpu_layers_spin': QSpinBox,
+            'no_repack_check': QCheckBox,
             'temperature_spin': QDoubleSpinBox,
             'max_tokens_spin': QSpinBox,
             'disable_reasoning_check': QCheckBox,
@@ -1027,6 +1028,14 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
     gpu_layers_spin.setValue(int(llama_config.get("gpu_layers", -1)))
     gpu_layers_spin.setToolTip("-1 offloads every layer the runtime can fit on the GPU.")
     inference_form.addRow("GPU Layers:", gpu_layers_spin)
+
+    no_repack_check = QCheckBox("Disable weight repacking (--no-repack)")
+    no_repack_check.setChecked(bool(llama_config.get("no_repack", False)))
+    no_repack_check.setToolTip(
+        "Keeps CPU-side weights memory-mapped from the GGUF file so models larger than\n"
+        "free RAM can still load. Slower CPU inference; no effect on GPU-offloaded layers."
+    )
+    inference_form.addRow("Memory:", no_repack_check)
 
     temperature_spin = QDoubleSpinBox()
     temperature_spin.setRange(0.0, 2.0)
@@ -1220,6 +1229,7 @@ def create_llama_config_widget(llama_config: Dict, parent=None) -> tuple:
         "mmproj_path_edit": mmproj_path_edit,
         "ctx_size_spin": ctx_size_spin,
         "gpu_layers_spin": gpu_layers_spin,
+        "no_repack_check": no_repack_check,
         "temperature_spin": temperature_spin,
         "max_tokens_spin": max_tokens_spin,
         "disable_reasoning_check": disable_reasoning_check,
@@ -1315,7 +1325,8 @@ class ModelConfigDialog(QDialog):
             'clip_model': clip_model,
             'caption_model': None if caption_model == 'None' else caption_model,
             'mode': self.clip_mode_combo.currentText(),
-            'device': self.clip_device_combo.currentText()
+            # itemData holds the device id ('cuda'/'cpu'); currentText is a label.
+            'device': self.clip_device_combo.currentData() or self.clip_device_combo.currentText()
         }
 
     def get_wd_config(self) -> Dict:
@@ -1323,7 +1334,7 @@ class ModelConfigDialog(QDialog):
         return {
             'wd_model': self.wd_model_combo.currentText(),
             'threshold': self.threshold_spin.value(),
-            'device': self.wd_device_combo.currentText()
+            'device': self.wd_device_combo.currentData() or self.wd_device_combo.currentText()
         }
 
     def get_config(self) -> Dict:
@@ -1758,31 +1769,20 @@ class OrganizeDialog(QDialog):
                 QMessageBox.warning(self, "Warning", "Please select at least one source directory")
                 return
 
-            # Find images recursively
-            all_images = FileManager.find_images(str(self.current_directory), recursive=True)
-
-            # Filter images to only include those from selected directories
-            images = []
-            for img in all_images:
-                img_path = Path(img)
-                # Get relative path from current directory
-                try:
-                    rel_path = img_path.relative_to(self.current_directory)
-                    # Check if image is in one of the selected directories
-                    if "." in selected_dirs:
-                        # Root directory is selected, check if image is directly in root
-                        if len(rel_path.parts) == 1:
-                            images.append(img)
-                            continue
-
-                    # Check if image is in any of the selected subdirectories
-                    for selected_dir in selected_dirs:
-                        if selected_dir != "." and str(rel_path).startswith(selected_dir):
-                            images.append(img)
-                            break
-                except ValueError:
-                    # Image is not relative to current directory, skip it
-                    continue
+            # Scan only the selected directories instead of globbing the whole
+            # tree and filtering. This both avoids wasted I/O and prevents the
+            # prefix-match bug where 'cats' also matched a sibling 'cats_extra'.
+            collected = []
+            for selected_dir in selected_dirs:
+                if selected_dir == ".":
+                    # Root selected: direct children of the root only.
+                    collected.extend(
+                        FileManager.find_images(str(self.current_directory), recursive=False)
+                    )
+                else:
+                    sub_dir = self.current_directory / selected_dir
+                    collected.extend(FileManager.find_images(str(sub_dir), recursive=True))
+            images = sorted(set(collected))
         else:
             # Non-recursive: only current directory
             images = FileManager.find_images(str(self.current_directory), recursive=False)
@@ -1869,6 +1869,27 @@ class OrganizeDialog(QDialog):
         if self.organization_worker:
             self.organization_worker.cancel()
             self.progress_label.setText("Cancelling...")
+
+    def _stop_worker_for_close(self):
+        """Cancel and join the organization worker so it isn't destroyed while running."""
+        worker = getattr(self, "organization_worker", None)
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    worker.cancel()
+                    worker.wait(3000)
+            except RuntimeError:
+                pass
+
+    def closeEvent(self, event):
+        """Ensure the worker is stopped if the window is closed (X button)."""
+        self._stop_worker_for_close()
+        super().closeEvent(event)
+
+    def reject(self):
+        """Ensure the worker is stopped if the dialog is dismissed (Esc/Cancel)."""
+        self._stop_worker_for_close()
+        super().reject()
 
     def _on_progress(self, current: int, total: int, message: str):
         """Handle organization progress."""

@@ -45,7 +45,9 @@ def hash_image_content(image_path: str) -> str:
 
     digest = sha256_hash.hexdigest()
 
-    if key is not None:
+    # A file rewritten while it was being read produced a digest of neither
+    # version, so only cache it when the identity is unchanged afterwards.
+    if key is not None and _identity(image_path) == key:
         with _hash_cache_lock:
             _hash_cache[key] = digest
             _hash_cache.move_to_end(key)
@@ -68,10 +70,9 @@ def get_image_metadata(image_path: str) -> Dict:
     try:
         with Image.open(image_path) as img:
             width, height = img.size
+        file_size = path.stat().st_size
     except Exception as e:
         raise ValueError(f"Failed to read image metadata: {e}")
-
-    file_size = path.stat().st_size
 
     return {
         'width': width,

@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.llama_cpp_runtime import LlamaCppRuntimeManager  # noqa: E402
 from core.llama_provisioner import BUILD_LOG_GLOB, BUILD_LOG_RETENTION  # noqa: E402
-from core.log_retention import RetentionPolicy, prune_logs  # noqa: E402
+from core.log_retention import RetentionPolicy, open_append_log, prune_logs  # noqa: E402
 
 
 def write_log(directory: Path, name: str, size: int, mtime: float) -> Path:
@@ -129,11 +129,12 @@ class TestLiveLogTruncation(unittest.TestCase):
     def test_a_writing_process_keeps_appending_after_truncation(self):
         """The real scenario: truncate a log a live child is writing to.
 
-        Append mode is what makes this work. Without O_APPEND the child would
-        keep writing at its old offset and recreate a multi-gigabyte sparse
-        file, which is the bug this test pins down.
+        OS-level append mode is what makes this work. Without it the child
+        would keep writing at its old offset and recreate a multi-gigabyte
+        sparse file, which is the bug this test pins down. Plain open("a") is
+        not enough on Windows, so this uses the same helper as the runtime.
         """
-        handle = self.log_path.open("a", encoding="utf-8", errors="replace")
+        handle = open_append_log(self.log_path)
         try:
             child = subprocess.Popen(
                 [

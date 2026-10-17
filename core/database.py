@@ -1,15 +1,23 @@
 """Database management for image interrogations with SQLite."""
 
+import os
 import sqlite3
 import json
-import threading
 import functools
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Dict, Optional, Callable, Tuple, Any
 
+from core.atomic_write import write_json_atomic
+from core.db_connection import SQLiteConnectionManager
 from core.db_queue import DatabaseOperationQueue
+from core.db_schema import ensure_schema
+
+# Local-database mode keeps one of these in each selected image directory.
+LOCAL_DB_NAME = ".interrogations.db"
+# Remembers the last database mode, beside the global database, for both front ends.
+SETTINGS_FILE_NAME = "database_settings.json"
 
 
 class DatabaseBusyError(Exception):
@@ -23,6 +31,15 @@ class DatabaseQueuedError(Exception):
     def __init__(self, operation_id: str, message: str = "Operation queued"):
         self.operation_id = operation_id
         super().__init__(message)
+
+
+def _is_busy_error(error: sqlite3.OperationalError) -> bool:
+    """Recognize SQLite BUSY/LOCKED errors without relying only on wording."""
+    error_code = getattr(error, "sqlite_errorcode", None)
+    if error_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        return True
+    message = str(error).casefold()
+    return "locked" in message or "busy" in message
 
 
 def _retry_on_busy(max_attempts: int = 5, base_delay: float = 0.1):
@@ -42,15 +59,15 @@ def _retry_on_busy(max_attempts: int = 5, base_delay: float = 0.1):
                 try:
                     return func(self, *args, **kwargs)
                 except sqlite3.OperationalError as e:
-                    if "locked" in str(e).lower() and attempt < silent_attempts - 1:
+                    if _is_busy_error(e) and attempt < silent_attempts - 1:
                         delay = base_delay * (2 ** attempt)  # Exponential backoff
                         time.sleep(delay)
-                    elif "locked" in str(e).lower():
+                    elif _is_busy_error(e):
                         # Silent retries exhausted - invoke callback if available
                         if self._busy_callback is not None:
                             params = _build_params_dict(func, args, kwargs)
                             result = self._handle_busy_with_callback(
-                                operation_name, params, silent_attempts, e
+                                operation_name, params, silent_attempts, e, func
                             )
                             if result is not None:
                                 return result
@@ -84,13 +101,15 @@ class InterrogationDatabase:
     """Manages interrogation cache and results using SQLite."""
 
     def __init__(self, db_path: str = "interrogations.db"):
-        self.db_path = Path(db_path)
-        # Global mode returns to this path. Hardcoding "interrogations.db" in
-        # switch_to_directory sent a database opened elsewhere back to the
-        # working directory's file.
         self._global_db_path = Path(db_path)
-        self._lock = threading.Lock()
-        self.use_local_db = False  # Global by default
+        self._connections = SQLiteConnectionManager(self._global_db_path)
+        self._settings_path = self._global_db_path.with_name(SETTINGS_FILE_NAME)
+        # The mode last chosen with set_local_mode(); global until one is.
+        self.use_local_db = self._load_settings().get("use_local_db") is True
+        # The directory last selected for interrogation. In global mode, local
+        # databases under it are consulted for results the global one lacks.
+        self._directory_root: Optional[Path] = None
+        self._local_db_presence: Dict[Path, bool] = {}
 
         # Queue for handling database-busy scenarios
         self._operation_queue: Optional[DatabaseOperationQueue] = None
@@ -100,8 +119,18 @@ class InterrogationDatabase:
         self._init_operation_queue()
         self._process_pending_queue()
 
+    @property
+    def db_path(self) -> Path:
+        """Return the active database path (retained for caller compatibility)."""
+        return self._connections.path
+
+    @db_path.setter
+    def db_path(self, value: Path) -> None:
+        """Switch database paths safely for compatibility with legacy callers."""
+        self._switch_database_path(Path(value))
+
     @contextmanager
-    def _get_connection(self):
+    def _get_connection(self, *, write: bool = False):
         """Context manager for thread-safe database connections.
 
         Opens a fresh connection for each operation with:
@@ -109,176 +138,13 @@ class InterrogationDatabase:
         - WAL mode for improved concurrent read/write
         - Thread lock for intra-process synchronization
         """
-        with self._lock:
-            conn = sqlite3.connect(
-                self.db_path,
-                timeout=30.0,  # Wait up to 30s for locks
-                isolation_level=None  # Autocommit mode
-            )
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            try:
-                yield conn
-            finally:
-                conn.close()
+        with self._connections.connection(write=write) as conn:
+            yield conn
 
     def _ensure_schema(self):
         """Create database schema if it doesn't exist."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-
-            # Images table with hash-based deduplication
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS images (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file_path TEXT NOT NULL,
-                    file_hash TEXT NOT NULL UNIQUE,
-                    width INTEGER,
-                    height INTEGER,
-                    file_size INTEGER,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # Models table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS models (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    model_name TEXT NOT NULL UNIQUE,
-                    model_type TEXT NOT NULL,
-                    version TEXT,
-                    config TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # Interrogations table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS interrogations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    image_id INTEGER NOT NULL,
-                    model_id INTEGER NOT NULL,
-                    tags TEXT NOT NULL,
-                    confidence_scores TEXT,
-                    raw_output TEXT,
-                    result_version INTEGER,
-                    interrogated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    config TEXT,
-                    FOREIGN KEY (image_id) REFERENCES images(id),
-                    FOREIGN KEY (model_id) REFERENCES models(id),
-                    UNIQUE(image_id, model_id)
-                )
-            """)
-            cursor.execute("PRAGMA table_info(interrogations)")
-            if "result_version" not in {row["name"] for row in cursor.fetchall()}:
-                cursor.execute("ALTER TABLE interrogations ADD COLUMN result_version INTEGER")
-            # Settings the row was produced with (the interrogator's
-            # result_signature), which decide whether the cache may reuse it.
-            cursor.execute("PRAGMA table_info(interrogations)")
-            if "config" not in {row["name"] for row in cursor.fetchall()}:
-                cursor.execute("ALTER TABLE interrogations ADD COLUMN config TEXT")
-
-            # Exact-match cache entries for multimodal batch inquiry variants.
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS interrogation_cache_entries (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    image_id INTEGER NOT NULL,
-                    model_id INTEGER NOT NULL,
-                    cache_key TEXT NOT NULL,
-                    cache_metadata TEXT NOT NULL,
-                    result_json TEXT NOT NULL,
-                    tags TEXT NOT NULL,
-                    confidence_scores TEXT,
-                    raw_output TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (image_id) REFERENCES images(id),
-                    FOREIGN KEY (model_id) REFERENCES models(id),
-                    UNIQUE(image_id, model_id, cache_key)
-                )
-            """)
-
-            # Multimodal sessions table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS multimodal_sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    image_id INTEGER NOT NULL,
-                    model_id INTEGER NOT NULL,
-                    mode TEXT NOT NULL CHECK(mode IN ('single', 'batch')),
-                    session_key TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (image_id) REFERENCES images(id),
-                    FOREIGN KEY (model_id) REFERENCES models(id),
-                    UNIQUE(image_id, model_id, mode, session_key)
-                )
-            """)
-
-            # Multimodal turns table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS multimodal_turns (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id INTEGER NOT NULL,
-                    turn_index INTEGER NOT NULL,
-                    prompt_type TEXT NOT NULL,
-                    prompt_text TEXT,
-                    included_tables_json TEXT,
-                    included_transcripts_json TEXT,
-                    sidecar_tags_json TEXT,
-                    response_json TEXT NOT NULL,
-                    tags_json TEXT NOT NULL,
-                    reasoning_summary TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (session_id) REFERENCES multimodal_sessions(id),
-                    UNIQUE(session_id, turn_index)
-                )
-            """)
-            cursor.execute("PRAGMA table_info(multimodal_turns)")
-            existing_turn_columns = {row["name"] for row in cursor.fetchall()}
-            if "included_transcripts_json" not in existing_turn_columns:
-                cursor.execute("ALTER TABLE multimodal_turns ADD COLUMN included_transcripts_json TEXT")
-            if "sidecar_tags_json" not in existing_turn_columns:
-                cursor.execute("ALTER TABLE multimodal_turns ADD COLUMN sidecar_tags_json TEXT")
-
-            # Create indices
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_hash ON images(file_hash)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_image_interrogations ON interrogations(image_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_model_interrogations ON interrogations(model_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_cache_entries_image ON interrogation_cache_entries(image_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_cache_entries_model ON interrogation_cache_entries(model_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_cache_entries_key ON interrogation_cache_entries(cache_key)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_sessions_image ON multimodal_sessions(image_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_turns_session ON multimodal_turns(session_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_turns_created_at ON multimodal_turns(created_at)")
-
-            # No query filters sessions by model alone, and model_id is very
-            # low-cardinality, so this index could only ever lure the planner
-            # into scanning every session for a single-model database.
-            cursor.execute("DROP INDEX IF EXISTS idx_mm_sessions_model")
-
-            self._ensure_planner_statistics(cursor)
-
-    @staticmethod
-    def _ensure_planner_statistics(cursor) -> None:
-        """Populate query planner statistics when they are missing.
-
-        Without sqlite_stat1 the planner has no cardinality information and
-        picks indexes by declaration order, which makes multimodal history
-        lookups scan every session instead of seeking by image. ANALYZE skips
-        empty tables, so key off a table that matters rather than the mere
-        existence of sqlite_stat1 -- otherwise a database analyzed while empty
-        would never pick up statistics as it grows.
-        """
-        cursor.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'"
-        )
-        if cursor.fetchone() is not None:
-            cursor.execute("SELECT 1 FROM sqlite_stat1 WHERE tbl = 'multimodal_sessions'")
-            if cursor.fetchone() is not None:
-                return
-
-        cursor.execute("ANALYZE")
+        with self._get_connection(write=True) as conn:
+            ensure_schema(conn)
     
     @_retry_on_busy()
     def register_image(self, file_path: str, file_hash: str,
@@ -287,7 +153,7 @@ class InterrogationDatabase:
 
         Uses INSERT OR IGNORE + UPDATE pattern to avoid race conditions.
         """
-        with self._get_connection() as conn:
+        with self._get_connection(write=True) as conn:
             cursor = conn.cursor()
 
             # Use INSERT OR IGNORE to atomically insert if not exists
@@ -314,7 +180,7 @@ class InterrogationDatabase:
 
         Uses INSERT OR IGNORE pattern to avoid race conditions.
         """
-        with self._get_connection() as conn:
+        with self._get_connection(write=True) as conn:
             cursor = conn.cursor()
 
             config_json = json.dumps(config) if config else None
@@ -339,9 +205,40 @@ class InterrogationDatabase:
 
         `config` is the interrogator's result_signature for this result.
         """
-        self._save_interrogation_direct(
+        return self._save_interrogation_impl(
             image_id, model_id, tags, confidence_scores, raw_output, result_version, config
         )
+
+    def _save_interrogation_impl(
+        self,
+        image_id: int,
+        model_id: int,
+        tags: List[str],
+        confidence_scores: Optional[Dict[str, float]] = None,
+        raw_output: Optional[str] = None,
+        result_version: Optional[int] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Shared implementation used by calls, retries, and queue replay."""
+        with self._get_connection(write=True) as conn:
+            cursor = conn.cursor()
+
+            tags_json = json.dumps(tags)
+            scores_json = json.dumps(confidence_scores) if confidence_scores else None
+            config_json = json.dumps(config) if config else None
+
+            cursor.execute("""
+                INSERT INTO interrogations (image_id, model_id, tags, confidence_scores, raw_output, config, result_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(image_id, model_id)
+                DO UPDATE SET
+                    tags = excluded.tags,
+                    confidence_scores = excluded.confidence_scores,
+                    raw_output = excluded.raw_output,
+                    config = excluded.config,
+                    result_version = excluded.result_version,
+                    interrogated_at = CURRENT_TIMESTAMP
+            """, (image_id, model_id, tags_json, scores_json, raw_output, config_json, result_version))
 
     @_retry_on_busy()
     def get_interrogation(self, image_hash: str, model_name: str) -> Optional[Dict]:
@@ -370,6 +267,139 @@ class InterrogationDatabase:
             return None
 
     @_retry_on_busy()
+    def import_missing_interrogation(self, image_path: str, image_hash: str, model_name: str) -> bool:
+        """Copy a result the active database lacks from the other database mode.
+
+        Global mode reads the local databases in the image's folder and each
+        parent up to the selected directory, nearest first. Local mode reads the
+        global database. Sources are only read; the copy goes into the active
+        database, and an entry it already has is left alone. Returns True when
+        an entry was copied, so the caller can look it up again through the
+        normal cache path.
+        """
+        for source in self._import_sources_for(image_path):
+            entry = self._read_interrogation(source, image_hash, model_name)
+            if entry is not None:
+                return self._copy_interrogation(image_path, image_hash, model_name, entry)
+        return False
+
+    def _import_sources_for(self, image_path: str) -> List[Path]:
+        """Databases to read a missing result from, best candidate first."""
+        if not self.use_local_db:
+            return self._local_databases_for(image_path)
+        global_db = Path(os.path.abspath(self._global_db_path))
+        if global_db == Path(os.path.abspath(self.db_path)) or not global_db.is_file():
+            # No directory selected yet, so the global database is the active one.
+            return []
+        return [global_db]
+
+    def _local_databases_for(self, image_path: str) -> List[Path]:
+        """Local databases that may hold this image's results, nearest first.
+
+        A recursive scan can reach folders that local mode gave their own
+        database, so every folder from the image's up to the selected directory
+        is checked, not just the selected directory itself.
+        """
+        root = self._directory_root
+        if root is None:
+            return []
+        folder = Path(os.path.abspath(image_path)).parent
+        try:
+            folder.relative_to(root)
+        except ValueError:
+            return []
+
+        active = Path(os.path.abspath(self.db_path))
+        found = []
+        while True:
+            candidate = folder / LOCAL_DB_NAME
+            present = self._local_db_presence.get(candidate)
+            if present is None:
+                present = candidate.is_file()
+                self._local_db_presence[candidate] = present
+            if present and candidate != active:
+                found.append(candidate)
+            if folder == root or folder.parent == folder:
+                break
+            folder = folder.parent
+        return found
+
+    @staticmethod
+    def _read_interrogation(
+        source_db: Path, image_hash: str, model_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read one result from another database without writing beside it.
+
+        A cleanly closed database has no -wal file, so it is opened immutable,
+        which takes no locks and leaves no -wal/-shm files in an image folder.
+        With a -wal present (open elsewhere, or not closed cleanly) a plain
+        read-only open is needed to see its newest writes.
+        """
+        wal = source_db.with_name(source_db.name + "-wal")
+        mode = "mode=ro" if wal.exists() else "mode=ro&immutable=1"
+        try:
+            conn = sqlite3.connect(f"{source_db.resolve().as_uri()}?{mode}", uri=True, timeout=5.0)
+        except (sqlite3.Error, OSError):
+            return None
+        try:
+            conn.row_factory = sqlite3.Row
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(interrogations)")}
+            if not columns:
+                return None
+            # Databases written before these columns existed still hold usable
+            # results; the caller's cache rules decide whether to reuse them.
+            optional = ", ".join(
+                f"i.{name}" if name in columns else f"NULL AS {name}"
+                for name in ("result_version", "config")
+            )
+            row = conn.execute(f"""
+                SELECT i.tags, i.confidence_scores, i.raw_output, i.interrogated_at, {optional},
+                       img.width, img.height, img.file_size,
+                       m.model_type, m.version, m.config AS model_config
+                FROM interrogations i
+                JOIN images img ON i.image_id = img.id
+                JOIN models m ON i.model_id = m.id
+                WHERE img.file_hash = ? AND m.model_name = ?
+            """, (image_hash, model_name)).fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+    def _copy_interrogation(
+        self, image_path: str, image_hash: str, model_name: str, entry: Dict[str, Any]
+    ) -> bool:
+        """Insert a local result, in one transaction, unless one already exists."""
+        with self._get_connection(write=True) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR IGNORE INTO images (file_path, file_hash, width, height, file_size)
+                VALUES (?, ?, ?, ?, ?)
+            """, (image_path, image_hash, entry["width"], entry["height"], entry["file_size"]))
+            cursor.execute("SELECT id FROM images WHERE file_hash = ?", (image_hash,))
+            image_id = cursor.fetchone()["id"]
+
+            cursor.execute("""
+                INSERT OR IGNORE INTO models (model_name, model_type, version, config)
+                VALUES (?, ?, ?, ?)
+            """, (model_name, entry["model_type"], entry["version"], entry["model_config"]))
+            cursor.execute("SELECT id FROM models WHERE model_name = ?", (model_name,))
+            model_id = cursor.fetchone()["id"]
+
+            # Copied verbatim, original timestamp included.
+            cursor.execute("""
+                INSERT INTO interrogations (image_id, model_id, tags, confidence_scores, raw_output,
+                                            result_version, config, interrogated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                ON CONFLICT(image_id, model_id) DO NOTHING
+            """, (
+                image_id, model_id, entry["tags"], entry["confidence_scores"], entry["raw_output"],
+                entry["result_version"], entry["config"], entry["interrogated_at"],
+            ))
+            return cursor.rowcount > 0
+
+    @_retry_on_busy()
     def save_interrogation_cache_entry(
         self,
         image_id: int,
@@ -382,7 +412,7 @@ class InterrogationDatabase:
         if not cache_key:
             raise ValueError("cache_key is required")
 
-        with self._get_connection() as conn:
+        with self._get_connection(write=True) as conn:
             cursor = conn.cursor()
 
             tags = list(results.get("tags") or [])
@@ -513,7 +543,7 @@ class InterrogationDatabase:
         if not session_key:
             raise ValueError("session_key is required")
 
-        with self._get_connection() as conn:
+        with self._get_connection(write=True) as conn:
             cursor = conn.cursor()
 
             cursor.execute(
@@ -558,14 +588,8 @@ class InterrogationDatabase:
         sidecar_tags: Optional[List[str]] = None,
     ) -> int:
         """Append a turn to multimodal conversation history."""
-        with self._get_connection() as conn:
+        with self._get_connection(write=True) as conn:
             cursor = conn.cursor()
-
-            cursor.execute(
-                "SELECT COALESCE(MAX(turn_index), -1) + 1 AS next_idx FROM multimodal_turns WHERE session_id = ?",
-                (session_id,),
-            )
-            next_index = int(cursor.fetchone()["next_idx"])
 
             cursor.execute(
                 """
@@ -574,11 +598,12 @@ class InterrogationDatabase:
                     included_tables_json, included_transcripts_json, sidecar_tags_json,
                     response_json, tags_json, reasoning_summary
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT ?, COALESCE(MAX(turn_index), -1) + 1, ?, ?, ?, ?, ?, ?, ?, ?
+                FROM multimodal_turns
+                WHERE session_id = ?
                 """,
                 (
                     session_id,
-                    next_index,
                     prompt_type,
                     prompt_text,
                     json.dumps(included_tables or [], ensure_ascii=False),
@@ -587,8 +612,10 @@ class InterrogationDatabase:
                     json.dumps(response_json, ensure_ascii=False),
                     json.dumps(tags, ensure_ascii=False),
                     reasoning_summary,
+                    session_id,
                 ),
             )
+            turn_id = cursor.lastrowid
 
             cursor.execute(
                 """
@@ -599,7 +626,7 @@ class InterrogationDatabase:
                 (session_id,),
             )
 
-            return cursor.lastrowid
+            return turn_id
 
     @_retry_on_busy()
     def get_multimodal_history(
@@ -710,7 +737,7 @@ class InterrogationDatabase:
         if session_id is None and not session_key:
             raise ValueError("Either session_id or session_key must be provided")
 
-        with self._get_connection() as conn:
+        with self._get_connection(write=True) as conn:
             cursor = conn.cursor()
 
             query = [
@@ -783,8 +810,11 @@ class InterrogationDatabase:
         Optimize the database by reclaiming unused space and reorganizing data.
         This rebuilds the database file, removing deleted data and defragmenting.
         """
+        return self._vacuum_impl()
+
+    def _vacuum_impl(self) -> None:
+        """Shared implementation used by calls, retries, and queue replay."""
         with self._get_connection() as conn:
-            # WAL mode requires checkpoint before vacuum
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.execute("VACUUM")
 
@@ -795,8 +825,24 @@ class InterrogationDatabase:
         Args:
             enabled: If True, use local databases in image directories.
                     If False, use global database.
+
+        The choice is saved and restored the next time the database opens.
         """
-        self.use_local_db = enabled
+        self.use_local_db = bool(enabled)
+        settings = self._load_settings()
+        settings["use_local_db"] = self.use_local_db
+        try:
+            write_json_atomic(self._settings_path, settings)
+        except OSError as exc:
+            print(f"Error saving database settings: {exc}")
+
+    def _load_settings(self) -> Dict[str, Any]:
+        """Saved database settings, or {} when there are none yet."""
+        try:
+            data = json.loads(self._settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def switch_to_directory(self, directory: str):
         """
@@ -806,18 +852,35 @@ class InterrogationDatabase:
         Args:
             directory: Path to the image directory
         """
+        self._directory_root = Path(os.path.abspath(directory))
+        self._local_db_presence = {}
+
         if self.use_local_db:
             # Use local database in image directory
-            local_db_path = Path(directory) / ".interrogations.db"
+            local_db_path = Path(directory) / LOCAL_DB_NAME
         else:
             # Use global database
             local_db_path = self._global_db_path
 
         # Only switch if it's a different database
-        if local_db_path != self.db_path:
-            # Update path and ensure schema exists
-            self.db_path = local_db_path
+        self._switch_database_path(local_db_path)
+
+    def _switch_database_path(self, target: Path) -> None:
+        """Switch paths only after the target schema and queue are ready."""
+        if target == self.db_path:
+            return
+        previous_queue = getattr(self, "_operation_queue", None)
+
+        def initialize_target() -> None:
             self._ensure_schema()
+            self._init_operation_queue()
+            self._process_pending_queue()
+
+        try:
+            self._connections.switch_atomically(target, initialize_target)
+        except Exception:
+            self._operation_queue = previous_queue
+            raise
 
     def get_db_location(self) -> str:
         """Get the current database file location."""
@@ -827,11 +890,16 @@ class InterrogationDatabase:
 
     def _init_operation_queue(self) -> None:
         """Initialize the operation queue."""
-        queue_path = self.db_path.parent / "db_queue.json"
+        queue_path = self.db_path.parent / f"{self.db_path.name}.queue.json"
         self._operation_queue = DatabaseOperationQueue(
             queue_path=queue_path,
-            database_path=self.db_path
+            database_path=self.db_path,
+            legacy_queue_path=self.db_path.parent / "db_queue.json",
         )
+
+    def can_queue_operation(self, operation: str) -> bool:
+        """Return whether an operation is eligible for durable queueing."""
+        return bool(self._operation_queue and self._operation_queue.is_queueable(operation))
 
     def set_busy_callback(self, callback: Optional[Callable[[str, Dict, int], str]]) -> None:
         """
@@ -857,7 +925,8 @@ class InterrogationDatabase:
         operation: str,
         params: Dict,
         retry_count: int,
-        error: Exception
+        error: Exception,
+        func: Optional[Callable] = None
     ) -> Optional[Any]:
         """
         Handle database busy state by invoking the callback.
@@ -878,8 +947,11 @@ class InterrogationDatabase:
                 # Try the operation again
                 current_retry += 1
                 try:
-                    # Re-execute the operation
-                    method = getattr(self, f"_{operation}_impl", None)
+                    # Re-execute the original (undecorated) operation directly.
+                    if func is not None:
+                        return func(self, **params)
+                    # Legacy fallback: use the decorator-free *_direct variant.
+                    method = getattr(self, f"_{operation}_direct", None)
                     if method:
                         return method(**params)
                     else:
@@ -887,7 +959,7 @@ class InterrogationDatabase:
                         delay = min(base_delay * (1.5 ** (current_retry - retry_count)), 5.0)
                         time.sleep(delay)
                 except sqlite3.OperationalError as e:
-                    if "locked" not in str(e).lower():
+                    if not _is_busy_error(e):
                         raise
                     # Continue the retry loop
                     delay = min(base_delay * (1.5 ** (current_retry - retry_count)), 5.0)
@@ -895,7 +967,7 @@ class InterrogationDatabase:
 
             elif response == "queue":
                 # Check if operation is queueable
-                if self._operation_queue and self._operation_queue.is_queueable(operation):
+                if self.can_queue_operation(operation):
                     op_id = self._operation_queue.add_operation(operation, params)
                     raise DatabaseQueuedError(op_id, f"Operation {operation} queued as {op_id}")
                 else:
@@ -950,17 +1022,13 @@ class InterrogationDatabase:
         # Try to process each operation (silently, without UI)
         for op in pending:
             try:
-                self._execute_queued_operation(op.id, op.operation, op.params)
-                self._operation_queue.mark_completed(op.id)
+                self.process_queued_operation(op.id)
             except sqlite3.OperationalError as e:
-                if "locked" in str(e).lower():
+                if _is_busy_error(e):
                     # Database still busy, stop trying
-                    self._operation_queue.mark_failed(op.id, str(e))
                     break
-                else:
-                    self._operation_queue.mark_failed(op.id, str(e))
-            except Exception as e:
-                self._operation_queue.mark_failed(op.id, str(e))
+            except Exception:
+                continue
 
     def process_queued_operations(self) -> Tuple[int, int]:
         """
@@ -978,14 +1046,48 @@ class InterrogationDatabase:
 
         for op in pending:
             try:
-                self._execute_queued_operation(op.id, op.operation, op.params)
-                self._operation_queue.mark_completed(op.id)
-                success_count += 1
-            except Exception as e:
-                self._operation_queue.mark_failed(op.id, str(e))
+                if self.process_queued_operation(op.id):
+                    success_count += 1
+                else:
+                    failed_count += 1
+            except Exception:
                 failed_count += 1
 
         return (success_count, failed_count)
+
+    def process_queued_operation(self, operation_id: str) -> bool:
+        """Execute and durably remove one queued operation by ID.
+
+        Returns False if the ID is no longer pending. Execution and queue
+        persistence errors are intentionally propagated to the caller.
+        """
+        if not self._operation_queue:
+            return False
+        operation = next(
+            (
+                item
+                for item in self._operation_queue.get_pending_operations()
+                if item.id == operation_id
+            ),
+            None,
+        )
+        if operation is None:
+            return False
+        try:
+            self._execute_queued_operation(
+                operation.id, operation.operation, operation.params
+            )
+            if not self._operation_queue.mark_completed(operation.id):
+                raise RuntimeError(
+                    f"Queued operation disappeared before completion: {operation.id}"
+                )
+        except Exception as error:
+            try:
+                self._operation_queue.mark_failed(operation.id, str(error))
+            except Exception as persistence_error:
+                raise persistence_error from error
+            raise
+        return True
 
     def _execute_queued_operation(
         self,
@@ -995,9 +1097,9 @@ class InterrogationDatabase:
     ) -> Any:
         """Execute a single queued operation."""
         if operation == 'save_interrogation':
-            return self._save_interrogation_direct(**params)
+            return self._save_interrogation_impl(**params)
         elif operation == 'vacuum':
-            return self._vacuum_direct()
+            return self._vacuum_impl()
         else:
             raise ValueError(f"Unknown queued operation: {operation}")
 
@@ -1012,31 +1114,13 @@ class InterrogationDatabase:
         config: Optional[Dict[str, Any]] = None
     ) -> None:
         """Direct save_interrogation without retry decorator (for queue processing)."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-
-            tags_json = json.dumps(tags)
-            scores_json = json.dumps(confidence_scores) if confidence_scores else None
-            config_json = json.dumps(config) if config else None
-
-            cursor.execute("""
-                INSERT INTO interrogations (image_id, model_id, tags, confidence_scores, raw_output, config, result_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(image_id, model_id)
-                DO UPDATE SET
-                    tags = excluded.tags,
-                    confidence_scores = excluded.confidence_scores,
-                    raw_output = excluded.raw_output,
-                    config = excluded.config,
-                    result_version = excluded.result_version,
-                    interrogated_at = CURRENT_TIMESTAMP
-            """, (image_id, model_id, tags_json, scores_json, raw_output, config_json, result_version))
+        return self._save_interrogation_impl(
+            image_id, model_id, tags, confidence_scores, raw_output, result_version, config
+        )
 
     def _vacuum_direct(self) -> None:
         """Direct vacuum without retry decorator (for queue processing)."""
-        with self._get_connection() as conn:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            conn.execute("VACUUM")
+        return self._vacuum_impl()
 
     def clear_operation_queue(self) -> int:
         """

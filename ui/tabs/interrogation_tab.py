@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
                              QRadioButton, QButtonGroup, QScrollArea,
                              QLineEdit, QTextEdit)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QIcon, QPixmap
+from PyQt6.QtGui import QIcon, QPixmap, QImageReader
 from pathlib import Path
 from typing import Dict, Optional, List
 
@@ -514,6 +514,11 @@ class InterrogationTab(QWidget):
         if not self.current_directory:
             return
 
+        # Don't re-scan/clear the queue while a batch is running; the active
+        # batch holds index mappings into the current queue.
+        if self.interrogation_worker and self.interrogation_worker.isRunning():
+            return
+
         # Cancel any existing directory load operation (non-blocking)
         if self.directory_load_worker and self.directory_load_worker.isRunning():
             self.directory_load_worker.cancel()
@@ -861,6 +866,9 @@ class InterrogationTab(QWidget):
         # Update UI
         self.batch_interrogate_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
+        # Lock controls that would mutate model/directory state mid-batch and
+        # crash the worker (unload) or desync the queue (directory rescan).
+        self._set_concurrent_controls_enabled(False)
         self.progress_bar.setMaximum(len(images))
 
         # Build path-to-index lookup for O(1) queue item updates
@@ -881,6 +889,21 @@ class InterrogationTab(QWidget):
             self.interrogation_worker.cancel()
             self.progress_label.setText("Cancelling...")
 
+    def _set_concurrent_controls_enabled(self, enabled: bool):
+        """Toggle controls that must not change while a batch is running.
+
+        Unloading the model mid-batch would crash the worker, and changing the
+        directory would clear/rebuild the queue out from under the active batch.
+        """
+        self.select_dir_button.setEnabled(enabled)
+        self.recursive_checkbox.setEnabled(enabled)
+        self.load_model_button.setEnabled(enabled)
+        model_loaded = bool(
+            self.current_interrogator
+            and getattr(self.current_interrogator, "is_loaded", False)
+        )
+        self.unload_model_button.setEnabled(enabled and model_loaded)
+
     def on_interrogation_progress(self, current: int, total: int, message: str):
         """Handle interrogation progress update."""
         self.progress_bar.setValue(current)
@@ -894,16 +917,19 @@ class InterrogationTab(QWidget):
                 image_path = item.data(Qt.ItemDataRole.UserRole)
                 item.setText(f"☑ {Path(image_path).name}")
 
-        # Show current image preview
+        # Show current image preview (decode at reduced size to avoid loading
+        # the full-resolution image on the UI thread for every progress tick).
         if image_path:
-            pixmap = QPixmap(str(image_path))
-            if not pixmap.isNull():
-                scaled_pixmap = pixmap.scaled(
-                    400, 400,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
+            reader = QImageReader(str(image_path))
+            reader.setAutoTransform(True)
+            source_size = reader.size()
+            if source_size.isValid() and (source_size.width() > 400 or source_size.height() > 400):
+                reader.setScaledSize(
+                    source_size.scaled(400, 400, Qt.AspectRatioMode.KeepAspectRatio)
                 )
-                self.image_preview.setPixmap(scaled_pixmap)
+            image = reader.read()
+            if not image.isNull():
+                self.image_preview.setPixmap(QPixmap.fromImage(image))
             self.current_image_label.setText(f"Processing: {Path(image_path).name}")
         else:
             self.current_image_label.setText(f"Processing: {message}")
@@ -1053,6 +1079,9 @@ class InterrogationTab(QWidget):
             self.progress_label.setText("Batch interrogation complete")
         self.batch_interrogate_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
+        # Restore controls locked during the batch (before any auto-unload,
+        # which will re-disable the unload button if it frees the model).
+        self._set_concurrent_controls_enabled(True)
 
         # Clear current image preview
         self.image_preview.clear()
@@ -1062,9 +1091,12 @@ class InterrogationTab(QWidget):
         # Keep discovered tags visible so user can see all tags from batch
         # They will be cleared when starting a new batch
 
-        # Auto-unload model if enabled in settings
-        if self.parent() and hasattr(self.parent(), 'settings_tab'):
-            if self.parent().settings_tab.get_auto_unload_enabled():
+        # Auto-unload model if enabled in settings.
+        # Use window() (top-level MainWindow) because addTab() reparents this
+        # widget to the QTabWidget's internal stack, so parent() is not MainWindow.
+        main_window = self.window()
+        if main_window is not None and hasattr(main_window, 'settings_tab'):
+            if main_window.settings_tab.get_auto_unload_enabled():
                 if self.current_interrogator and self.current_interrogator.is_loaded:
                     try:
                         self.current_interrogator.unload_model()

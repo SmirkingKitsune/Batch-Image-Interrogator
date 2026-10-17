@@ -357,8 +357,12 @@ class MultimodalInterrogationWorker(QThread):
         return self._runner.was_cancelled
 
     def cancel(self):
-        """Cancel the operation."""
+        """Stop once the image in progress has finished."""
         self._runner.cancel()
+
+    def force_cancel(self):
+        """Stop now, abandoning the image in progress."""
+        self._runner.force_cancel()
 
     def run(self):
         """Execute multimodal batch interrogation."""
@@ -446,7 +450,7 @@ class OrganizationWorker(QThread):
                 self.progress.emit(idx + 1, total, f"Checking: {image_path.name}")
                 
                 # Try to organize
-                was_moved = FileManager.organize_by_tags(
+                destination_path = FileManager.organize_by_tags_destination(
                     image_path,
                     self.tag_criteria,
                     self.target_subdir,
@@ -455,11 +459,9 @@ class OrganizationWorker(QThread):
                     self.target_root_dir
                 )
                 
-                if was_moved:
+                if destination_path is not None:
                     moved_count += 1
-                    destination_root = self.target_root_dir if self.target_root_dir else image_path.parent
-                    dest_path = str(destination_root / self.target_subdir / image_path.name)
-                    self.moved.emit(str(image_path), dest_path)
+                    self.moved.emit(str(image_path), str(destination_path))
                 
             except Exception as e:
                 self.error.emit(str(image_path), str(e))
@@ -544,17 +546,7 @@ class DatabaseQueueWorker(QThread):
             self.progress.emit(idx + 1, total, f"Processing: {summary}")
 
             try:
-                # Get the pending operations and find this one
-                pending = self.database._operation_queue.get_pending_operations()
-                matching_op = next((p for p in pending if p.id == op_id), None)
-
-                if matching_op:
-                    self.database._execute_queued_operation(
-                        matching_op.id,
-                        matching_op.operation,
-                        matching_op.params
-                    )
-                    self.database._operation_queue.mark_completed(op_id)
+                if self.database.process_queued_operation(op_id):
                     success_count += 1
                     self.operation_completed.emit(op_id)
                 else:
@@ -562,7 +554,6 @@ class DatabaseQueueWorker(QThread):
                     failed_count += 1
 
             except Exception as e:
-                self.database._operation_queue.mark_failed(op_id, str(e))
                 failed_count += 1
                 self.operation_failed.emit(op_id, str(e))
 

@@ -37,7 +37,7 @@ class AtomicWriteTests(unittest.TestCase):
     def test_non_ascii_survives(self):
         write_json_atomic(self.path, {"p": "artist’s gallery — ünïcode"},
                           ensure_ascii=False)
-        self.assertEqual(json.loads(self.path.read_text())["p"],
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["p"],
                          "artist’s gallery — ünïcode")
 
     def test_original_survives_a_failed_write(self):

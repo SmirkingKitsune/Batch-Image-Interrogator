@@ -31,9 +31,13 @@ class TagFilterSettings:
         # Underscore replacement settings
         self.replace_underscores: bool = False  # Toggle underscore→space
         self.underscore_skip_list: Set[str] = set(self.DEFAULT_UNDERSCORE_SKIP_LIST)
+        # Cached lowercased skip list, rebuilt only when the skip list changes
+        # (avoids rebuilding the set on every per-tag comparison).
+        self._underscore_skip_lower: Set[str] = set()
 
         # Load saved settings
         self.load_settings()
+        self._rebuild_underscore_skip_lower()
 
     def load_settings(self):
         """Load filter settings from file."""
@@ -52,6 +56,7 @@ class TagFilterSettings:
                         self.underscore_skip_list = set(skip_list)
                     else:
                         self.underscore_skip_list = set(self.DEFAULT_UNDERSCORE_SKIP_LIST)
+                    self._rebuild_underscore_skip_lower()
             except Exception as e:
                 print(f"Error loading tag filter settings: {e}")
 
@@ -169,17 +174,24 @@ class TagFilterSettings:
     def add_underscore_skip_tag(self, tag: str):
         """Add a tag to the underscore skip list."""
         self.underscore_skip_list.add(tag.strip())
+        self._rebuild_underscore_skip_lower()
         self.save_settings()
 
     def remove_underscore_skip_tag(self, tag: str):
         """Remove a tag from the underscore skip list."""
         self.underscore_skip_list.discard(tag.strip())
+        self._rebuild_underscore_skip_lower()
         self.save_settings()
 
     def reset_underscore_skip_list(self):
         """Reset the underscore skip list to defaults."""
         self.underscore_skip_list = set(self.DEFAULT_UNDERSCORE_SKIP_LIST)
+        self._rebuild_underscore_skip_lower()
         self.save_settings()
+
+    def _rebuild_underscore_skip_lower(self) -> None:
+        """Refresh the cached lowercased skip list (call after it mutates)."""
+        self._underscore_skip_lower = {t.lower() for t in self.underscore_skip_list}
 
     def replace_underscore_in_tag(self, tag: str) -> str:
         """
@@ -195,7 +207,7 @@ class TagFilterSettings:
             return tag
 
         # Check if tag should be skipped (preserve emoji-style tags)
-        if tag.lower() in {t.lower() for t in self.underscore_skip_list}:
+        if tag.lower() in self._underscore_skip_lower:
             return tag
 
         return tag.replace('_', ' ')
@@ -214,7 +226,7 @@ class TagFilterSettings:
         normalized = tag.lower()
         if self.replace_underscores:
             # Check if tag should be skipped (preserve emoji-style tags)
-            if normalized not in {t.lower() for t in self.underscore_skip_list}:
+            if normalized not in self._underscore_skip_lower:
                 normalized = normalized.replace('_', ' ')
         return normalized
 
@@ -252,6 +264,8 @@ class TagFilterSettings:
             Filtered list of tags (with prefix tags prepended)
         """
         filtered_tags = []
+        # Seed with prefix tags so the body does not duplicate them.
+        seen = {tag.casefold(): tag for tag in self.prefix_tags}
 
         for tag in tags:
             tag_lower = tag.lower()
@@ -268,6 +282,16 @@ class TagFilterSettings:
 
             # Apply underscore replacement
             final_tag = self.replace_underscore_in_tag(final_tag)
+
+            # Skip replacement targets that are themselves blacklisted
+            if final_tag.strip().lower() in self.remove_list:
+                continue
+
+            # De-duplicate (case-insensitive), keeping the first occurrence
+            key = final_tag.casefold()
+            if key in seen:
+                continue
+            seen[key] = final_tag
 
             filtered_tags.append(final_tag)
 
@@ -296,6 +320,8 @@ class TagFilterSettings:
         """
         filtered_tags = []
         filtered_scores = {}
+        # Seed with prefix tags so the body does not duplicate them.
+        seen = {tag.casefold(): tag for tag in self.prefix_tags}
 
         for tag in tags:
             tag_lower = tag.lower()
@@ -314,6 +340,19 @@ class TagFilterSettings:
 
             # Apply underscore replacement
             final_tag = self.replace_underscore_in_tag(final_tag)
+
+            # Skip replacement targets that are themselves blacklisted
+            if final_tag.strip().lower() in self.remove_list:
+                continue
+
+            # De-duplicate (case-insensitive); keep the highest confidence seen
+            key = final_tag.casefold()
+            if key in seen:
+                retained_tag = seen[key]
+                if retained_tag in filtered_scores:
+                    filtered_scores[retained_tag] = max(filtered_scores[retained_tag], confidence)
+                continue
+            seen[key] = final_tag
 
             filtered_tags.append(final_tag)
             filtered_scores[final_tag] = confidence

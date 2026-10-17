@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -12,6 +13,7 @@ from core.base_interrogator import BaseInterrogator
 from core.gguf_metadata import read_gguf_metadata, recommended_sampling
 from core.llama_cpp_runtime import (
     LlamaCppRepetitionError,
+    LlamaCppRequestAborted,
     LlamaCppRuntimeManager,
     LlamaCppRuntimeError,
     LlamaCppStallError,
@@ -27,6 +29,14 @@ from core.repetition import DRY_SAMPLING, LoopDetector, loop_excerpt, rescue_sam
 LLAMA_NATIVE_IMAGE_FORMATS = frozenset({"JPEG", "MPO", "PNG", "GIF", "BMP"})
 # How llama-server words a request whose image it could not decode.
 _IMAGE_LOAD_ERRORS = ("failed to load image", "failed to decode image", "unable to load image")
+
+
+class LlamaCppInterrogationCancelled(RuntimeError):
+    """Raised inside interrogate() when cancellation is requested mid-inference.
+
+    Either should_cancel() turned true between attempts, or abort_active_request()
+    cut off the request that was running.
+    """
 
 
 class LlamaCppInterrogator(BaseInterrogator):
@@ -57,6 +67,9 @@ class LlamaCppInterrogator(BaseInterrogator):
         self.server_url: Optional[str] = None
         self._owns_runtime = False
         self._session_history: Dict[str, List[Dict[str, Any]]] = {}
+        # Guards _session_history against concurrent access (a batch worker
+        # thread and the UI-thread single-inquiry path share this instance).
+        self._session_history_lock = threading.Lock()
 
     def load_model(
         self,
@@ -65,6 +78,7 @@ class LlamaCppInterrogator(BaseInterrogator):
         llama_mmproj_path: Optional[str] = None,
         ctx_size: int = 4096,
         gpu_layers: int = -1,
+        no_repack: bool = False,
         temperature: float = 0.0,
         max_tokens: Optional[int] = None,
         server_port: int = 8080,
@@ -104,7 +118,11 @@ class LlamaCppInterrogator(BaseInterrogator):
         model_label = f"LlamaCpp/{model_path.name}"
         self.model_name = model_label
         self.temperature = float(temperature)
-        self.max_tokens = int(max_tokens if max_tokens is not None else ctx_size)
+        # When unset, leave headroom for the prompt + image rather than letting
+        # generation consume the entire context window.
+        self.max_tokens = int(
+            max_tokens if max_tokens is not None else min(max(256, int(ctx_size) // 4), 4096)
+        )
         self.disable_reasoning = bool(disable_reasoning)
         self.reasoning_effort = str(reasoning_effort).strip() if reasoning_effort else None
         self.reasoning_controls = None
@@ -121,6 +139,7 @@ class LlamaCppInterrogator(BaseInterrogator):
             ),
             "ctx_size": int(ctx_size),
             "gpu_layers": int(gpu_layers),
+            "no_repack": bool(no_repack),
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "server_port": int(resolved_port),
@@ -144,6 +163,7 @@ class LlamaCppInterrogator(BaseInterrogator):
                 gpu_layers=self.config["gpu_layers"],
                 no_reasoning_preserve=self.config["no_reasoning_preserve"],
                 reasoning_budget=self.config["reasoning_budget"],
+                no_repack=self.config["no_repack"],
             )
             self._owns_runtime = True
             self.is_loaded = True
@@ -177,6 +197,7 @@ class LlamaCppInterrogator(BaseInterrogator):
         on_stream_delta: Optional[Callable[[str], None]] = None,
         on_reasoning_delta: Optional[Callable[[str], None]] = None,
         on_restart: Optional[Callable[[str], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -192,6 +213,9 @@ class LlamaCppInterrogator(BaseInterrogator):
             on_restart: Called with a short notice when the first attempt is
                 abandoned for looping and starts over; whatever streamed so far
                 is void. The answer stream is also reset with "".
+            should_cancel: Optional callable polled before each (potentially long)
+                completion call; when it returns True a LlamaCppInterrogationCancelled
+                is raised so a cancel takes effect without waiting out every retry.
 
         Returns:
             Dict with 'tags', 'confidence_scores', 'raw_output', and parsed response.
@@ -200,6 +224,10 @@ class LlamaCppInterrogator(BaseInterrogator):
             raise RuntimeError("Model not loaded. Call load_model() first.")
         if task not in self.TASK_MODES:
             raise ValueError(f"Invalid task '{task}'. Choose from {self.TASK_MODES}")
+
+        def _raise_if_cancelled():
+            if should_cancel is not None and should_cancel():
+                raise LlamaCppInterrogationCancelled("Inquiry cancelled")
 
         system_prompt = self._build_system_prompt()
         user_text = self._build_user_prompt(
@@ -212,10 +240,11 @@ class LlamaCppInterrogator(BaseInterrogator):
         image_data_url = self._encode_image_as_data_url(image_path)
 
         if keep_context and session_key:
-            history = self._session_history.setdefault(
-                session_key, [{"role": "system", "content": system_prompt}]
-            )
-            messages = list(history)
+            with self._session_history_lock:
+                history = self._session_history.setdefault(
+                    session_key, [{"role": "system", "content": system_prompt}]
+                )
+                messages = list(history)
         else:
             messages = [{"role": "system", "content": system_prompt}]
 
@@ -239,6 +268,7 @@ class LlamaCppInterrogator(BaseInterrogator):
         )
 
         image_resent = loop_retried = False
+        _raise_if_cancelled()
         try:
             while True:
                 try:
@@ -324,6 +354,7 @@ class LlamaCppInterrogator(BaseInterrogator):
                     }
                 )
                 # After a loop, the later attempts keep the rescue sampling.
+                _raise_if_cancelled()
                 retry_response = self._chat_completion_with_timeout_retry(
                     messages=retry_messages,
                     temperature=first_request["temperature"],
@@ -334,6 +365,8 @@ class LlamaCppInterrogator(BaseInterrogator):
                 retry_content = self._extract_assistant_content(retry_response)
                 parsed = self._parse_and_validate_json_response(retry_content, task=task)
                 parse_mode = "retry_with_format_example_json"
+            except LlamaCppInterrogationCancelled:
+                raise
             except Exception as exc:
                 retry_error = exc
 
@@ -342,6 +375,7 @@ class LlamaCppInterrogator(BaseInterrogator):
             # Fallback: retry without response_format for servers/models that ignore or mishandle it.
             try:
                 fallback_messages = retry_messages if retry_messages else messages
+                _raise_if_cancelled()
                 fallback_response = self._chat_completion_with_timeout_retry(
                     messages=fallback_messages,
                     temperature=first_request["temperature"],
@@ -352,15 +386,20 @@ class LlamaCppInterrogator(BaseInterrogator):
                 fallback_content = self._extract_assistant_content(fallback_response)
                 parsed = self._parse_and_validate_json_response(fallback_content, task=task)
                 parse_mode = "fallback_no_response_format_json"
+            except LlamaCppInterrogationCancelled:
+                raise
             except Exception as exc:
                 fallback_error = exc
 
         if parsed is None:
             raw_text = (fallback_content or retry_content or primary_content or "").strip()
             if raw_text:
+                _raise_if_cancelled()
                 try:
                     parsed = self._repair_response_to_json(raw_text, task=task)
                     parse_mode = "repair_json"
+                except LlamaCppInterrogationCancelled:
+                    raise
                 except Exception:
                     parsed = self._build_non_json_fallback_response(
                         raw_text=raw_text,
@@ -403,17 +442,19 @@ class LlamaCppInterrogator(BaseInterrogator):
                     if tag.strip().casefold() not in delete_lookup
                 ]
 
-        if keep_context and session_key:
+        # Don't poison ongoing context with un-parseable model output.
+        if keep_context and session_key and parse_mode != "non_json_fallback":
             compact_user = {"role": "user", "content": user_text}
             compact_assistant = {
                 "role": "assistant",
                 "content": json.dumps(parsed, ensure_ascii=False),
             }
-            history = self._session_history.setdefault(
-                session_key, [{"role": "system", "content": system_prompt}]
-            )
-            history.append(compact_user)
-            history.append(compact_assistant)
+            with self._session_history_lock:
+                history = self._session_history.setdefault(
+                    session_key, [{"role": "system", "content": system_prompt}]
+                )
+                history.append(compact_user)
+                history.append(compact_assistant)
 
         return {
             "tags": parsed["tags"],
@@ -434,11 +475,13 @@ class LlamaCppInterrogator(BaseInterrogator):
                 assistant_content = json.dumps(response_json or {}, ensure_ascii=False)
             history.append({"role": "user", "content": prompt_text})
             history.append({"role": "assistant", "content": assistant_content})
-        self._session_history[session_key] = history
+        with self._session_history_lock:
+            self._session_history[session_key] = history
 
     def reset_session(self, session_key: str) -> None:
         """Clear context for a single session."""
-        self._session_history.pop(session_key, None)
+        with self._session_history_lock:
+            self._session_history.pop(session_key, None)
 
     def get_model_type(self) -> str:
         """Return model type identifier."""
@@ -446,7 +489,8 @@ class LlamaCppInterrogator(BaseInterrogator):
 
     def unload_model(self):
         """Unload model/runtime references."""
-        self._session_history.clear()
+        with self._session_history_lock:
+            self._session_history.clear()
         if self._owns_runtime:
             self.runtime.release_server()
             self._owns_runtime = False
@@ -543,6 +587,8 @@ class LlamaCppInterrogator(BaseInterrogator):
                 messages, temperature, max_tokens, response_format,
                 tools, tool_choice, on_delta, on_reasoning_delta, sampling,
             )
+        except LlamaCppRequestAborted as exc:
+            raise LlamaCppInterrogationCancelled("Inquiry stopped") from exc
         except LlamaCppRuntimeError as exc:
             detail = str(exc).lower()
             if not (
@@ -553,10 +599,18 @@ class LlamaCppInterrogator(BaseInterrogator):
                 ))
             ):
                 raise
-        return self._chat_completion_with_transport_retry(
-            messages, temperature, max_tokens, on_delta=on_delta,
-            on_reasoning_delta=on_reasoning_delta, sampling=sampling,
-        )
+        try:
+            return self._chat_completion_with_transport_retry(
+                messages, temperature, max_tokens, on_delta=on_delta,
+                on_reasoning_delta=on_reasoning_delta, sampling=sampling,
+            )
+        except LlamaCppRequestAborted as exc:
+            raise LlamaCppInterrogationCancelled("Inquiry stopped") from exc
+
+    def abort_active_request(self) -> None:
+        """Cut off the request in flight now; interrogate() then raises
+        LlamaCppInterrogationCancelled. Safe to call from any thread."""
+        self.runtime.abort_active_requests()
 
     @staticmethod
     def _guard_streams(
@@ -1044,6 +1098,7 @@ class LlamaCppInterrogator(BaseInterrogator):
         message = first.get("message", {})
         if isinstance(message, dict):
             tool_calls = message.get("tool_calls", [])
+            tool_args: List[str] = []
             if isinstance(tool_calls, list):
                 for call in tool_calls:
                     if not isinstance(call, dict):
@@ -1052,7 +1107,14 @@ class LlamaCppInterrogator(BaseInterrogator):
                     if isinstance(function_obj, dict):
                         args = function_obj.get("arguments")
                         if isinstance(args, str) and args.strip():
-                            candidates.append(args)
+                            tool_args.append(args)
+
+            # Prefer tool-call arguments EXCLUSIVELY when present. Mixing in
+            # message.content / reasoning_content prose lets the later
+            # first-brace..last-brace slice splice unrelated text into the JSON
+            # arguments and corrupt the parse.
+            if tool_args:
+                return "\n".join(tool_args).strip()
 
             candidates.extend(LlamaCppInterrogator._collect_text_candidates(message.get("content")))
             candidates.extend(LlamaCppInterrogator._collect_text_candidates(message.get("reasoning_content")))

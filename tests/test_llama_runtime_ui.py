@@ -18,7 +18,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
-from core.llama_provisioner import ProvisionError, UpdateStatus  # noqa: E402
+from core.llama_provisioner import (  # noqa: E402
+    ProvisionConfig,
+    ProvisionError,
+    UpdateStatus,
+    current_platform,
+)
 from ui.llama_runtime import (  # noqa: E402
     RUNTIME_MODE_CUSTOM,
     RUNTIME_MODE_MANAGED,
@@ -35,7 +40,10 @@ def make_runtime(root: Path, accelerator: str = "cuda", **extra) -> Path:
     """Create a fake installed runtime with provisioner state."""
     bin_dir = root / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
-    executable = bin_dir / "llama-server"
+    # Named for this host (llama-server.exe on Windows), which is what the
+    # managed-runtime lookup searches for.
+    exe_name = ProvisionConfig(provision_dir=root, platform=current_platform()).exe_name
+    executable = bin_dir / exe_name
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     executable.chmod(0o755)
 

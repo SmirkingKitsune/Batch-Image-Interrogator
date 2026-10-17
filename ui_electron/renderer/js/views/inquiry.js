@@ -223,6 +223,9 @@ function GgufSheet() {
           <${Check} checked=${Boolean(config.no_reasoning_preserve)} aside="reload" asideClass="reload"
             title="Passes --no-reasoning-preserve. Changing this restarts the server."
             onChange=${(v) => setConfig({ no_reasoning_preserve: v })}>No reasoning preserve</${Check}>
+          <${Check} checked=${Boolean(config.no_repack)} aside="reload" asideClass="reload"
+            title="Passes --no-repack, which keeps CPU-side weights memory-mapped from the GGUF file so models larger than free RAM can still load. Slower CPU inference; no effect on GPU-offloaded layers. Changing this restarts the server."
+            onChange=${(v) => setConfig({ no_repack: v })}>Disable weight repacking</${Check}>
           <${Check} checked=${config.repetition_guard !== false} aside="live" asideClass="live"
             title="Adds llama.cpp's DRY sampler to every request, which penalizes runaway repetition, and stops a reply that still gets stuck repeating itself, retrying it once with the model's recommended sampling. Takes effect on the next request."
             onChange=${(v) => { patch('inquiry', (q) => ({ config: { ...q.config, repetition_guard: v } })); rpc('inquiry.set_guard', { enabled: v }).catch(reportError); }}>Repetition guard</${Check}>
@@ -499,8 +502,10 @@ function BatchControls() {
     <div class="row gap8" style=${{ padding: '12px', borderTop: '1px solid var(--line)' }}>
       <${Btn} class="grow" size="tall" variant=${running ? 'fill' : 'primary'} disabled=${!model || !total || running || singleRunning} onClick=${start}
         title=${model ? '' : 'Load a llama model first'}>Start Batch Inquiry</${Btn}>
-      <${Btn} size="tall" variant="danger" disabled=${!running || batch.cancelling} onClick=${() => rpc('inquiry.batch_cancel').catch(reportError)}>
-        ${batch.cancelling ? 'Cancelling…' : 'Cancel'}</${Btn}>
+      <${Btn} size="tall" variant="danger" disabled=${!running || batch.forceStopping}
+        title=${batch.cancelling ? 'Stop now, abandoning the image in progress.' : 'Stop after the image in progress finishes.'}
+        onClick=${() => rpc('inquiry.batch_cancel').catch(reportError)}>
+        ${batch.forceStopping ? 'Stopping…' : batch.cancelling ? 'Force stop' : 'Cancel'}</${Btn}>
     </div>
   </div>`;
 }

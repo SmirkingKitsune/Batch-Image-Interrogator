@@ -340,6 +340,45 @@ class TestLlamaCppInterrogator(unittest.TestCase):
         )
         ensure_kwargs = runtime_mock.ensure_server.call_args.kwargs
         self.assertEqual(ensure_kwargs["port"], 18081)
+        self.assertFalse(ensure_kwargs["no_repack"])
+
+    def test_load_model_passes_no_repack_to_runtime(self):
+        interrogator = LlamaCppInterrogator(model_name="LlamaCpp")
+        runtime_mock = mock.Mock()
+        runtime_mock.resolve_server_port.return_value = 8080
+        runtime_mock.ensure_server.return_value = "http://127.0.0.1:8080"
+        interrogator.runtime = runtime_mock
+
+        interrogator.load_model(
+            llama_binary_path="C:/tmp/llama-server.exe",
+            llama_model_path="C:/tmp/model.gguf",
+            no_repack=True,
+        )
+
+        self.assertTrue(interrogator.get_config()["no_repack"])
+        self.assertTrue(runtime_mock.ensure_server.call_args.kwargs["no_repack"])
+
+
+class TestForceStop(unittest.TestCase):
+    def test_aborted_request_raises_interrogation_cancelled(self):
+        interrogator = LlamaCppInterrogator(model_name="LlamaCpp")
+        runtime_mock = mock.Mock()
+        runtime_mock.chat_completion.side_effect = MODULE.LlamaCppRequestAborted("stopped")
+        interrogator.runtime = runtime_mock
+        interrogator.repetition_guard = False
+
+        with self.assertRaises(MODULE.LlamaCppInterrogationCancelled):
+            interrogator._chat_completion_with_timeout_retry(
+                messages=[{"role": "user", "content": "hi"}], temperature=0.0, max_tokens=8,
+            )
+        # A stop is not retried the way a timeout is.
+        self.assertEqual(runtime_mock.chat_completion.call_count, 1)
+
+    def test_abort_active_request_reaches_the_runtime(self):
+        interrogator = LlamaCppInterrogator(model_name="LlamaCpp")
+        interrogator.runtime = mock.Mock()
+        interrogator.abort_active_request()
+        interrogator.runtime.abort_active_requests.assert_called_once_with()
 
 
 if __name__ == "__main__":

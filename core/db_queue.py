@@ -12,6 +12,10 @@ from typing import List, Dict, Any, Optional
 from core.atomic_write import write_json_atomic
 
 
+class QueuePersistenceError(RuntimeError):
+    """Raised when an in-memory queue mutation cannot be persisted durably."""
+
+
 @dataclass
 class QueuedOperation:
     """Represents a database operation waiting to be executed."""
@@ -51,7 +55,12 @@ class DatabaseOperationQueue:
         'vacuum',
     }
 
-    def __init__(self, queue_path: Optional[Path] = None, database_path: Optional[Path] = None):
+    def __init__(
+        self,
+        queue_path: Optional[Path] = None,
+        database_path: Optional[Path] = None,
+        legacy_queue_path: Optional[Path] = None,
+    ):
         """
         Initialize the operation queue.
 
@@ -61,9 +70,11 @@ class DatabaseOperationQueue:
         """
         self.queue_path = queue_path or Path("db_queue.json")
         self.database_path = database_path
+        self.legacy_queue_path = legacy_queue_path
         self.queue: List[QueuedOperation] = []
         self._lock = threading.Lock()
-        self._load_queue()
+        if not self._adopt_legacy_queue():
+            self._load_queue()
 
     def is_queueable(self, operation: str) -> bool:
         """Check if an operation can be safely queued."""
@@ -96,8 +107,9 @@ class DatabaseOperationQueue:
                 retry_count=0,
                 last_error=None
             )
+            snapshot = self._snapshot()
             self.queue.append(queued_op)
-            self._save_queue()
+            self._persist_or_rollback(snapshot)
             return op_id
 
     def remove_operation(self, op_id: str) -> bool:
@@ -113,8 +125,9 @@ class DatabaseOperationQueue:
         with self._lock:
             for i, op in enumerate(self.queue):
                 if op.id == op_id:
+                    snapshot = self._snapshot()
                     del self.queue[i]
-                    self._save_queue()
+                    self._persist_or_rollback(snapshot)
                     return True
             return False
 
@@ -159,9 +172,10 @@ class DatabaseOperationQueue:
         with self._lock:
             for op in self.queue:
                 if op.id == op_id:
+                    snapshot = self._snapshot()
                     op.retry_count += 1
                     op.last_error = error
-                    self._save_queue()
+                    self._persist_or_rollback(snapshot)
                     return True
             return False
 
@@ -174,8 +188,9 @@ class DatabaseOperationQueue:
         """
         with self._lock:
             count = len(self.queue)
+            snapshot = self._snapshot()
             self.queue.clear()
-            self._save_queue()
+            self._persist_or_rollback(snapshot)
             return count
 
     def is_near_capacity(self) -> bool:
@@ -229,6 +244,68 @@ class DatabaseOperationQueue:
         else:
             return f"{op.operation}({len(op.params)} params)"
 
+    def _snapshot(self) -> List[QueuedOperation]:
+        """Return a deep-enough snapshot for rolling back queue mutations."""
+        return [QueuedOperation.from_dict(op.to_dict()) for op in self.queue]
+
+    def _persist_or_rollback(self, snapshot: List[QueuedOperation]) -> None:
+        if self._save_queue():
+            return
+        self.queue = snapshot
+        raise QueuePersistenceError(
+            f"Failed to persist queued operations to {self.queue_path}"
+        )
+
+    @staticmethod
+    def _same_database_path(first: str, second: Path) -> bool:
+        try:
+            return Path(first).resolve(strict=False) == second.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def _adopt_legacy_queue(self) -> bool:
+        """Migrate a matching legacy ``db_queue.json`` to the scoped name."""
+        legacy_path = self.legacy_queue_path
+        if self.queue_path.exists() or legacy_path is None or not legacy_path.exists():
+            return False
+        if self.database_path is None:
+            return False
+
+        try:
+            with open(legacy_path, 'r', encoding='utf-8') as handle:
+                data = json.load(handle)
+            stored_path = data.get('database_path')
+            if not stored_path or not self._same_database_path(stored_path, self.database_path):
+                return False
+            if data.get('version', 0) != self.QUEUE_VERSION:
+                return False
+
+            self.queue = [
+                QueuedOperation.from_dict(op_data)
+                for op_data in data.get('queue', [])
+            ]
+            if not self._save_queue():
+                self.queue = []
+                raise QueuePersistenceError(
+                    f"Failed to migrate legacy queue to {self.queue_path}"
+                )
+
+            migrated_path = legacy_path.with_suffix(
+                f'.migrated.{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+            )
+            try:
+                legacy_path.replace(migrated_path)
+            except OSError:
+                # The scoped queue now takes precedence, so leaving the legacy
+                # file in place cannot replay it in this version.
+                pass
+            return True
+        except QueuePersistenceError:
+            raise
+        except Exception:
+            self.queue = []
+            return False
+
     def _load_queue(self) -> None:
         """Load queue from disk."""
         if not self.queue_path.exists():
@@ -265,8 +342,13 @@ class DatabaseOperationQueue:
         except Exception as e:
             self._backup_and_reset(f"Load error: {e}")
 
-    def _save_queue(self) -> None:
-        """Save queue to disk."""
+    def _save_queue(self) -> bool:
+        """Save queue to disk atomically.
+
+        Returns True on success, False if the write failed (so callers that
+        depend on durability, e.g. add_operation, can react instead of
+        silently assuming the operation was persisted).
+        """
         data = {
             'version': self.QUEUE_VERSION,
             'database_path': str(self.database_path) if self.database_path else None,
@@ -275,14 +357,12 @@ class DatabaseOperationQueue:
         }
 
         try:
-            # This already used a temp file and a rename; the shared helper adds
-            # the fsync that makes the replace survive a power loss, and cleans
-            # up the temp file when the write fails.
+            # The shared helper writes a temp file beside the queue, fsyncs it,
+            # renames it over the original, and cleans up the temp on failure.
             write_json_atomic(self.queue_path, data)
+            return True
         except Exception:
-            # If save fails, the queue remains in memory
-            # Will be retried on next save attempt
-            pass
+            return False
 
     def _backup_and_reset(self, reason: str) -> None:
         """Backup corrupt queue file and start fresh."""

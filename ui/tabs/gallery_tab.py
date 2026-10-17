@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
 from PyQt6.QtCore import Qt, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap
 from pathlib import Path
+import os
 from typing import Dict, Optional, List
 from datetime import datetime
 
@@ -473,6 +474,10 @@ class GalleryTab(QWidget):
         # Background thumbnail decoding for the current gallery contents.
         self._thumbnail_worker = None
 
+        # Sidecar tag cache keyed by image path -> ((mtime_ns, size) | None, tags)
+        # so filter/sort/show changes don't re-read every .txt from disk.
+        self._tag_cache = {}
+
         # Setup UI
         self.setup_ui()
         self.setup_connections()
@@ -654,7 +659,7 @@ class GalleryTab(QWidget):
             # the number of distinct tags rather than to total tag occurrences.
             tags = tuple(
                 pool.setdefault(tag, tag)
-                for tag in FileManager.read_tags_from_file(Path(image_path))
+                for tag in self._cached_sidecar_tags(image_path)
             )
             image_tags[image_path] = tags
             for tag in tags:
@@ -726,8 +731,30 @@ class GalleryTab(QWidget):
 
     def _image_has_tags(self, image_path: str, required_tags: List[str]) -> bool:
         """Check if image has all required tags."""
-        image_tags = FileManager.read_tags_from_file(Path(image_path))
+        image_tags = self._cached_sidecar_tags(image_path)
         return all(tag in image_tags for tag in required_tags)
+
+    def _cached_sidecar_tags(self, image_path: str) -> List[str]:
+        """Read sidecar tags, cached by (mtime, size) of the .txt file.
+
+        Editing tags changes the sidecar's mtime, which invalidates the entry
+        automatically, so no explicit cache busting is needed on save.
+        """
+        txt_path = FileManager.get_text_file_path(Path(image_path))
+        try:
+            st = os.stat(txt_path)
+            signature = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            self._tag_cache[image_path] = (None, [])
+            return []
+
+        entry = self._tag_cache.get(image_path)
+        if entry is not None and entry[0] == signature:
+            return entry[1]
+
+        tags = FileManager.read_tags_from_file(Path(image_path))
+        self._tag_cache[image_path] = (signature, tags)
+        return tags
 
     def _sort_images(self, images: List[str], sort_mode: str) -> List[str]:
         """Sort images by specified mode."""

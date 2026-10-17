@@ -61,7 +61,11 @@ class InquirySettings:
         self._saved_keys.update(normalized.keys())
 
     def save_settings(self):
-        """Save inquiry options to disk."""
+        """Save inquiry options to disk atomically.
+
+        Writes to a temp file then os.replace()s it onto the target so a crash
+        mid-write can never truncate the existing valid settings file.
+        """
         try:
             write_json_atomic(self.settings_file, self.options, ensure_ascii=False)
         except Exception as exc:

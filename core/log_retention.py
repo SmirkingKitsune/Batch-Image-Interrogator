@@ -18,7 +18,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import IO, Iterable
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,59 @@ class RetentionPolicy:
         a fresh `max_bytes` log would exceed the advertised total.
         """
         return max(0, self.keep_total_bytes - self.max_bytes)
+
+
+def open_append_log(log_path: Path, encoding: str = "utf-8", errors: str = "replace") -> IO[str]:
+    """Open a log so that a child process inheriting it also appends.
+
+    On POSIX, append mode sets O_APPEND on the file description, which the
+    child inherits. On Windows, O_APPEND is emulated by the opening process's C
+    runtime only: the OS handle a child inherits writes at its own file
+    pointer, so after truncate_log its next write lands at the old offset and
+    zero-fills the gap back to the original size. A handle granted
+    FILE_APPEND_DATA without FILE_WRITE_DATA makes the OS itself append every
+    write, including the child's.
+    """
+    if os.name != "nt":
+        return open(log_path, "a", encoding=encoding, errors=errors)
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    FILE_READ_ATTRIBUTES = 0x0080
+    FILE_APPEND_DATA = 0x0004
+    SYNCHRONIZE = 0x00100000
+    # Share everything, so truncate_log and log pruning can still reach the file.
+    FILE_SHARE_ALL = 0x1 | 0x2 | 0x4
+    OPEN_ALWAYS = 4
+    FILE_ATTRIBUTE_NORMAL = 0x80
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+
+    handle = create_file(
+        str(log_path),
+        FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_ALL,
+        None,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_APPEND)
+    except OSError:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise
+    return os.fdopen(fd, "a", encoding=encoding, errors=errors)
 
 
 def truncate_log(log_path: Path, tail_bytes: int) -> None:

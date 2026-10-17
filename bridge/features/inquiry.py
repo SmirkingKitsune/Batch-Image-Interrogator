@@ -44,6 +44,8 @@ LLAMA_DEFAULTS: Dict[str, Any] = {
     "llama_mmproj_path": "",
     "ctx_size": 8192,
     "gpu_layers": -1,
+    # --no-repack keeps CPU-side weights memory-mapped; see ui/dialogs.py.
+    "no_repack": False,
     "temperature": 0.0,
     "max_tokens": 8192,
     "server_port": 8080,
@@ -180,6 +182,7 @@ class InquiryFeature:
                 llama_mmproj_path=mmproj_path,
                 ctx_size=config["ctx_size"],
                 gpu_layers=config["gpu_layers"],
+                no_repack=bool(config.get("no_repack", False)),
                 temperature=config["temperature"],
                 max_tokens=config["max_tokens"],
                 server_port=config["server_port"],
@@ -681,11 +684,17 @@ class InquiryFeature:
             self._refresh_batch_sources()
 
     def rpc_inquiry_batch_cancel(self) -> Dict[str, Any]:
+        """First call stops after the image in progress; a second stops now."""
         runner = self._llama_batch
-        if runner is not None:
-            runner.cancel()
-            self.bus.publish("inquiry.batch.cancelling", {})
-        return {"cancelling": runner is not None}
+        if runner is None:
+            return {"cancelling": False, "forced": False}
+        if runner.is_cancelled:
+            runner.force_cancel()
+            self.bus.publish("inquiry.batch.force_stopping", {})
+            return {"cancelling": True, "forced": True}
+        runner.cancel()
+        self.bus.publish("inquiry.batch.cancelling", {})
+        return {"cancelling": True, "forced": False}
 
     def _on_llama_batch_progress(self, current: int, total: int, message: str) -> None:
         self.bus.publish("inquiry.batch.progress", {**self._llama_batch_payload(), "message": message})

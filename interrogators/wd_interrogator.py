@@ -11,7 +11,8 @@ class WDInterrogator(BaseInterrogator):
 
     # 1: inputs are fed as 0-255 BGR. Rows cached before that fix were produced
     # from 0-1 RGB inputs and carry wrong (often empty) tags.
-    RESULT_VERSION = 1
+    # 2: exactly one rating, retained independently of the tag threshold.
+    RESULT_VERSION = 2
 
     # Bump whenever preprocess_image changes what the model sees, so results
     # computed the old way are re-run rather than served from the cache.
@@ -25,9 +26,10 @@ class WDInterrogator(BaseInterrogator):
         self.tags = None
         self.target_size = 448
         self.input_name = None
-        # Tag-name column cached from self.tags (see _get_tag_names).
+        # Tag-name column and rating mask cached from self.tags (see _get_tag_names).
         self._tag_names_source = None
         self._tag_names = []
+        self._rating_mask = np.zeros(0, dtype=bool)
     
     def load_model(self, threshold: float = 0.35, device: str = 'cuda',
                    provider_settings=None, **kwargs):
@@ -108,6 +110,12 @@ class WDInterrogator(BaseInterrogator):
         """
         if self._tag_names_source is not self.tags:
             self._tag_names = self.tags['name'].tolist()
+            # WD selected_tags.csv categories: 0 = general, 4 = character,
+            # 9 = rating. Without a category column, every row is thresholded.
+            if 'category' in self.tags.columns:
+                self._rating_mask = self.tags['category'].to_numpy() == 9
+            else:
+                self._rating_mask = np.zeros(len(self._tag_names), dtype=bool)
             self._tag_names_source = self.tags
         return self._tag_names
 
@@ -177,11 +185,19 @@ class WDInterrogator(BaseInterrogator):
         # vectorized so only tags that actually pass cost Python time.
         tag_names = self._get_tag_names()
         limit = min(len(probs), len(tag_names))
+        scores = probs[:limit]
+        # Ratings are mutually exclusive, so emit only the top (argmax) rating
+        # instead of every rating pseudo-tag that crosses the threshold.
+        is_rating = self._rating_mask[:limit]
 
         tags_with_scores = {
-            tag_names[i]: float(probs[i])
-            for i in np.flatnonzero(probs[:limit] >= threshold)
+            tag_names[i]: float(scores[i])
+            for i in np.flatnonzero((scores >= threshold) & ~is_rating)
         }
+        rating_indices = np.flatnonzero(is_rating)
+        if rating_indices.size:
+            best = rating_indices[np.argmax(scores[rating_indices])]
+            tags_with_scores[tag_names[best]] = float(scores[best])
 
         # Sort by confidence (descending)
         sorted_items = sorted(tags_with_scores.items(), key=lambda x: x[1], reverse=True)
@@ -194,27 +210,34 @@ class WDInterrogator(BaseInterrogator):
         }
     
     def result_signature(self) -> Dict[str, Any]:
-        return {'preprocess': self.PREPROCESS_VERSION, 'threshold': self.threshold}
+        return {'preprocess': self.PREPROCESS_VERSION, 'threshold': self.threshold, 'rating_policy': 1}
 
     def reuse_cached_result(self, cached: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Serve a cached result at the current threshold, when it holds one.
 
         A result saved at threshold t keeps every tag scoring >= t, so it
-        answers any threshold >= t exactly by dropping the tags below it. A
+        answers any threshold >= t by dropping non-rating tags below it.
+        The selected rating is retained regardless of threshold. A
         lower threshold needs tags that were never saved. Rows saved without
         a signature can't be checked (some predate the BGR preprocessing
         fix), so they are re-run.
         """
         signature = cached.get('config') or {}
-        if signature.get('preprocess') != self.PREPROCESS_VERSION:
+        if (signature.get('preprocess') != self.PREPROCESS_VERSION
+                or signature.get('rating_policy') != 1):
             return None
         saved_threshold = signature.get('threshold')
         if not isinstance(saved_threshold, (int, float)) or saved_threshold > self.threshold:
             return None
 
         scores = cached.get('confidence_scores') or {}
-        tags = [tag for tag in cached.get('tags') or [] if scores.get(tag, 0.0) >= self.threshold]
+        rating_tags = set()
+        if self.tags is not None:
+            names = self._get_tag_names()
+            rating_tags = {name for name, rating in zip(names, self._rating_mask) if rating}
+        tags = [tag for tag in cached.get('tags') or []
+                if tag in scores and (tag in rating_tags or scores[tag] >= self.threshold)]
         return {
             'tags': tags,
             'confidence_scores': {tag: scores[tag] for tag in tags},
@@ -232,4 +255,5 @@ class WDInterrogator(BaseInterrogator):
         self.input_name = None
         self._tag_names_source = None
         self._tag_names = []
+        self._rating_mask = np.zeros(0, dtype=bool)
         self.is_loaded = False

@@ -442,6 +442,7 @@ class InquiryTab(QWidget):
         for key in ("ctx_size_spin", "gpu_layers_spin", "temperature_spin",
                     "max_tokens_spin", "reasoning_budget_spin", "server_port_spin"):
             self.llama_config_refs[key].valueChanged.connect(lambda _: self._save_inquiry_options())
+        self.llama_config_refs["no_repack_check"].toggled.connect(lambda *_: self._save_inquiry_options())
         self.single_task_combo.currentTextChanged.connect(lambda *_: self._save_inquiry_options())
         self.single_prompt_input.textChanged.connect(lambda *_: self._save_inquiry_options())
         self.single_include_transcripts_check.toggled.connect(lambda *_: self._save_inquiry_options())
@@ -649,6 +650,7 @@ class InquiryTab(QWidget):
                 "llama_mmproj_path": self.llama_config_refs["mmproj_path_edit"].text().strip() or None,
                 "ctx_size": self.llama_config_refs["ctx_size_spin"].value(),
                 "gpu_layers": self.llama_config_refs["gpu_layers_spin"].value(),
+                "no_repack": self.llama_config_refs["no_repack_check"].isChecked(),
                 "temperature": self.llama_config_refs["temperature_spin"].value(),
                 "max_tokens": self.llama_config_refs["max_tokens_spin"].value(),
                 "disable_reasoning": self.llama_config_refs[
@@ -836,6 +838,7 @@ class InquiryTab(QWidget):
                 llama_mmproj_path=mmproj_path,
                 ctx_size=config["ctx_size"],
                 gpu_layers=config["gpu_layers"],
+                no_repack=bool(config.get("no_repack", False)),
                 temperature=config["temperature"],
                 max_tokens=config["max_tokens"],
                 server_port=config["server_port"],
@@ -1481,20 +1484,48 @@ class InquiryTab(QWidget):
         self.interrogation_worker.finished.connect(self.on_batch_finished)
 
         self.batch_inquiry_button.setEnabled(False)
+        self.cancel_button.setText("Cancel")
         self.cancel_button.setEnabled(True)
+        # Prevent single inquiries / model load/unload from racing the shared
+        # interrogator while the batch worker is running.
+        self._set_concurrent_controls_enabled(False)
         self.progress_bar.setMaximum(len(images))
         self.progress_bar.setValue(0)
         self.progress_label.setText(f"Starting batch inquiry on {len(images)} image(s)...")
         self.inquiry_started.emit()
         self.interrogation_worker.start()
 
+    def _set_concurrent_controls_enabled(self, enabled: bool):
+        """Toggle controls that must not run concurrently with a batch run.
+
+        The single-inquiry button and model load/unload all touch the shared
+        self.current_interrogator, so they are disabled while a batch worker is
+        active and restored when it finishes.
+        """
+        self.send_single_button.setEnabled(enabled)
+        self.load_model_button.setEnabled(enabled)
+        self.unload_model_button.setEnabled(enabled and bool(self.current_interrogator))
+
     def cancel_operation(self):
-        """Cancel active batch inquiry."""
-        if self.interrogation_worker:
+        """Cancel the batch inquiry.
+
+        The first click lets the image in progress finish and be saved, then
+        stops. A second click force-stops, abandoning that image mid-request.
+        """
+        if not self.interrogation_worker:
+            return
+        if not self.batch_cancel_requested:
             self.batch_cancel_requested = True
             self.interrogation_worker.cancel()
-            self.cancel_button.setEnabled(False)
-            self.progress_label.setText("Cancelling after the current image finishes...")
+            self.cancel_button.setText("Force Stop")
+            self.cancel_button.setToolTip("Stop now, abandoning the image in progress.")
+            self.progress_label.setText(
+                "Cancelling after the current image finishes. Click Force Stop to end it now."
+            )
+            return
+        self.interrogation_worker.force_cancel()
+        self.cancel_button.setEnabled(False)
+        self.progress_label.setText("Force stopping...")
 
     def on_batch_progress(self, current: int, total: int, message: str):
         """Update progress UI for batch inquiry."""
@@ -1600,6 +1631,10 @@ class InquiryTab(QWidget):
         self.pending_batch_cards.clear()
         self.batch_inquiry_button.setEnabled(bool(self.current_interrogator and self.loaded_image_paths))
         self.cancel_button.setEnabled(False)
+        self.cancel_button.setText("Cancel")
+        self.cancel_button.setToolTip("")
+        # Restore single-inquiry / load / unload controls disabled at batch start.
+        self._set_concurrent_controls_enabled(True)
         worker_cancelled = bool(was_cancelled)
         if self.interrogation_worker is not None:
             worker_cancelled = worker_cancelled or bool(

@@ -708,5 +708,27 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(env["II_BRIDGE_URL"], "http://127.0.0.1:1")
 
 
+class InquiryBatchCancelTests(unittest.TestCase):
+    def test_second_cancel_force_stops(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from bridge.features.inquiry import InquiryFeature
+
+        runner = SimpleNamespace(is_cancelled=False, cancel=Mock(), force_cancel=Mock())
+        runner.cancel.side_effect = lambda: setattr(runner, "is_cancelled", True)
+        feature = SimpleNamespace(_llama_batch=runner, bus=Mock())
+
+        first = InquiryFeature.rpc_inquiry_batch_cancel(feature)
+        second = InquiryFeature.rpc_inquiry_batch_cancel(feature)
+
+        self.assertEqual(first, {"cancelling": True, "forced": False})
+        self.assertEqual(second, {"cancelling": True, "forced": True})
+        runner.cancel.assert_called_once_with()
+        runner.force_cancel.assert_called_once_with()
+        events = [call.args[0] for call in feature.bus.publish.call_args_list]
+        self.assertEqual(events, ["inquiry.batch.cancelling", "inquiry.batch.force_stopping"])
+
+
 if __name__ == "__main__":
     unittest.main()

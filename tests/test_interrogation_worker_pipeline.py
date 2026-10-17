@@ -183,7 +183,7 @@ class InterrogationWorkerPipelineTests(unittest.TestCase):
             self.assertEqual(interrogator.model.calls, 1)
             cached = db.get_interrogation(image_hash, "FakeWD")
             self.assertEqual(cached["tags"], ["fresh_tag"])
-            self.assertEqual(cached["config"], {"preprocess": 2, "threshold": 0.35})
+            self.assertEqual(cached["config"], {"preprocess": 2, "threshold": 0.35, "rating_policy": 1})
 
     def _run(self, image_path, db, interrogator):
         """Run a one-image batch; return (results, served_from_cache)."""
@@ -239,7 +239,7 @@ class InterrogationWorkerPipelineTests(unittest.TestCase):
             self.assertEqual(self._run_tags(image_path, db, looser), (["cat", "dog", "tree"], False))
             self.assertEqual(looser.model.calls, 1)
             cached = db.get_interrogation(hash_image_content(str(image_path)), "FakeWD")
-            self.assertEqual(cached["config"], {"preprocess": 2, "threshold": 0.35})
+            self.assertEqual(cached["config"], {"preprocess": 2, "threshold": 0.35, "rating_policy": 1})
 
     def test_wd_cache_is_rerun_after_a_preprocessing_change(self):
         with tempfile.TemporaryDirectory() as tmpdir:

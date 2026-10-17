@@ -5,7 +5,7 @@ from .hashing import hash_image_content, get_image_metadata
 from .file_manager import FileManager
 from .base_interrogator import BaseInterrogator
 from .tag_filters import TagFilterSettings
-from .db_queue import DatabaseOperationQueue, QueuedOperation
+from .db_queue import DatabaseOperationQueue, QueuedOperation, QueuePersistenceError
 from .onnx_providers import ONNXProviderSettings, ProviderPreference
 from .model_cache import ModelCacheManager, ModelCacheInfo
 from .llama_cpp_runtime import LlamaCppRuntimeManager, LlamaCppRuntimeError
@@ -24,6 +24,7 @@ __all__ = [
     'DatabaseQueuedError',
     'DatabaseOperationQueue',
     'QueuedOperation',
+    'QueuePersistenceError',
     'hash_image_content',
     'get_image_metadata',
     'FileManager',

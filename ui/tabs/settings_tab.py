@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                              QSlider, QProgressBar, QMessageBox, QTextEdit,
                              QTabWidget, QListWidget, QListWidgetItem,
                              QTableWidget, QTableWidgetItem, QFrame)
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -795,6 +795,7 @@ class SettingsTab(QWidget):
 
         self.local_db_radio = QRadioButton("Local Database (saved in each image directory)")
         self.local_db_radio.setChecked(self.database.use_local_db)
+        self.local_db_radio.toggled.connect(self._on_db_mode_changed)
         settings_layout.addWidget(self.local_db_radio)
 
         # Database mode description
@@ -918,8 +919,9 @@ class SettingsTab(QWidget):
         cache_group.setLayout(cache_layout)
         layout.addWidget(cache_group)
 
-        # Update cache summary
-        self._update_cache_summary()
+        # Update cache summary after construction so the recursive cache-size
+        # directory walk doesn't block building/showing the tab.
+        QTimer.singleShot(0, self._update_cache_summary)
 
         # === Database Management ===
         db_mgmt_group = QGroupBox("Database Management")

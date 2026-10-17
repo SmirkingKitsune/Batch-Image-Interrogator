@@ -310,7 +310,7 @@ class CLIPInterrogator(BaseInterrogator):
         return "CLIP"
 
     def unload_model(self):
-        """Unload model from memory."""
+        """Unload model from memory and release cached GPU/VRAM."""
         self.ci = None
         self.is_loaded = False
         _release_cuda_cache()

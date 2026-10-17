@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import atexit
+import http.client
+from contextlib import contextmanager
 import json
 import os
 import socket
@@ -14,7 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib import request, error
 from urllib.parse import urlparse
 
-from core.log_retention import RetentionPolicy, prune_logs, truncate_log
+from core.log_retention import RetentionPolicy, open_append_log, prune_logs, truncate_log
 
 SERVER_LOG_GLOB = "llama-server-*.log"
 
@@ -42,6 +45,13 @@ class LlamaCppStallError(LlamaCppRuntimeError):
     out", and retrying at a longer limit is reasonable. A stall means the
     server accepted the request and then went quiet while still holding the
     connection open, so a longer limit only buys more silence.
+    """
+
+
+class LlamaCppRequestAborted(LlamaCppRuntimeError):
+    """Raised by chat_completion when abort_active_requests() cut it off.
+
+    Not a timeout or a stall: nothing is retried, the caller asked to stop.
     """
 
 
@@ -124,6 +134,17 @@ class LlamaCppRuntimeManager:
         self._model_alias = "local-llama-cpp"
         self._log_watchdog: Optional[threading.Thread] = None
         self._log_watchdog_stop: Optional[threading.Event] = None
+        # Chat responses still being read, so abort_active_requests() can cut
+        # them off from another thread. The serial tells a request whether an
+        # abort happened while it was running.
+        self._requests_lock = threading.Lock()
+        self._active_responses: set = set()
+        self._active_sockets: set = set()
+        self._abort_serial = 0
+        # Safety net: ensure the child llama-server is terminated on normal
+        # interpreter exit / unhandled exception so it is not orphaned holding
+        # the port. (Hard crashes / SIGKILL cannot be covered here.)
+        atexit.register(self.stop)
 
     @classmethod
     def get_instance(cls) -> "LlamaCppRuntimeManager":
@@ -145,6 +166,7 @@ class LlamaCppRuntimeManager:
         startup_timeout: float = 90.0,
         no_reasoning_preserve: bool = False,
         reasoning_budget: int = -1,
+        no_repack: bool = False,
     ) -> str:
         """
         Ensure a matching llama.cpp server is available and healthy.
@@ -157,6 +179,8 @@ class LlamaCppRuntimeManager:
                 and passes no flag at all, so the command line is unchanged for
                 callers that do not set it. 0 ends thinking immediately; N>0
                 caps it at N tokens.
+            no_repack: Pass --no-repack so CPU-resident weights stay memory-mapped
+                from the GGUF file instead of being copied into RAM for repacking.
 
         Returns:
             Base URL for OpenAI-compatible server endpoint.
@@ -191,6 +215,7 @@ class LlamaCppRuntimeManager:
             int(gpu_layers),
             bool(no_reasoning_preserve),
             int(reasoning_budget),
+            bool(no_repack),
         )
         base_url = f"http://{host}:{resolved_port}"
 
@@ -223,6 +248,8 @@ class LlamaCppRuntimeManager:
                 cmd.append("--no-reasoning-preserve")
             if int(reasoning_budget) >= 0:
                 cmd.extend(["--reasoning-budget", str(int(reasoning_budget))])
+            if no_repack:
+                cmd.append("--no-repack")
 
             try:
                 log_dir = Path(__file__).resolve().parents[1] / "cache" / "llama_cpp" / "logs"
@@ -231,11 +258,11 @@ class LlamaCppRuntimeManager:
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 log_path = log_dir / f"llama-server-{resolved_port}-{timestamp}.log"
                 process_env = self._build_process_env(binary.parent)
-                # Append mode, so the file descriptor the server inherits carries
-                # O_APPEND. That is what lets the watchdog truncate a runaway log
-                # without the next write landing at a stale offset and leaving a
-                # sparse file behind.
-                self._log_handle = log_path.open("a", encoding="utf-8", errors="replace")
+                # Opened so the handle the server inherits appends at the OS
+                # level (see open_append_log). That is what lets the watchdog
+                # truncate a runaway log without the next write landing at a
+                # stale offset and leaving a sparse file behind.
+                self._log_handle = open_append_log(log_path)
                 self._log_handle.write(f"# Started at {datetime.now().isoformat()}\n")
                 self._log_handle.write("# Command:\n")
                 self._log_handle.write(" ".join(cmd) + "\n\n")
@@ -553,17 +580,53 @@ class LlamaCppRuntimeManager:
         stalls = streaming and stall_timeout is not None and stall_timeout > 0
         socket_timeout = float(stall_timeout) if stalls else timeout
 
+        abort_serial = self._abort_serial
         try:
-            with request.urlopen(req, timeout=socket_timeout) as resp:
-                if streaming:
-                    return self._read_sse_completion(
-                        resp,
-                        on_delta or (lambda _fragment: None),
-                        stall_timeout=float(stall_timeout) if stalls else None,
-                        on_reasoning_delta=on_reasoning_delta,
-                    )
-                body = resp.read().decode("utf-8")
-                return json.loads(body)
+            result = self._send_chat_request(
+                req, socket_timeout, streaming, stalls, stall_timeout,
+                on_delta, on_reasoning_delta, abort_serial,
+            )
+        except Exception:
+            # Whatever a cut-off socket surfaced as, the cause was the abort.
+            if self._abort_serial != abort_serial:
+                raise LlamaCppRequestAborted("llama-server request was stopped") from None
+            raise
+        if self._abort_serial != abort_serial:
+            # A shut socket can also just end the stream early.
+            raise LlamaCppRequestAborted("llama-server request was stopped")
+        return result
+
+    def _send_chat_request(
+        self,
+        req: request.Request,
+        socket_timeout: float,
+        streaming: bool,
+        stalls: bool,
+        stall_timeout: Optional[float],
+        on_delta: Optional[Callable[[str], None]],
+        on_reasoning_delta: Optional[Callable[[str], None]],
+        abort_serial: int,
+    ) -> Dict[str, Any]:
+        """POST one chat completion, registered for abort while it is read."""
+        try:
+            with self._open_chat_request(req, socket_timeout, abort_serial) as resp:
+                with self._requests_lock:
+                    self._active_responses.add(resp)
+                try:
+                    if self._abort_serial != abort_serial:
+                        raise LlamaCppRequestAborted("llama-server request was stopped")
+                    if streaming:
+                        return self._read_sse_completion(
+                            resp,
+                            on_delta or (lambda _fragment: None),
+                            stall_timeout=float(stall_timeout) if stalls else None,
+                            on_reasoning_delta=on_reasoning_delta,
+                        )
+                    body = resp.read().decode("utf-8")
+                    return json.loads(body)
+                finally:
+                    with self._requests_lock:
+                        self._active_responses.discard(resp)
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise LlamaCppRuntimeError(f"llama-server HTTP error {exc.code}: {detail}") from exc
@@ -576,6 +639,71 @@ class LlamaCppRuntimeManager:
             raise LlamaCppRuntimeError(f"llama-server request failed: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise LlamaCppRuntimeError(f"Invalid JSON response from llama-server: {exc}") from exc
+
+    @contextmanager
+    def _open_chat_request(self, req, timeout, abort_serial):
+        """Register the connection before urllib waits for response headers."""
+        manager = self
+        sockets = set()
+
+        class AbortableConnection(http.client.HTTPConnection):
+            def connect(self):
+                super().connect()
+                with manager._requests_lock:
+                    if manager._abort_serial != abort_serial:
+                        self.close()
+                        raise LlamaCppRequestAborted("llama-server request was stopped")
+                    sockets.add(self.sock)
+                    manager._active_sockets.add(self.sock)
+
+        class AbortableHandler(request.HTTPHandler):
+            def http_open(self, request_obj):
+                return self.do_open(AbortableConnection, request_obj)
+
+        # The managed server is local HTTP; bypass environment proxy settings.
+        opener = request.build_opener(request.ProxyHandler({}), AbortableHandler())
+        try:
+            with opener.open(req, timeout=timeout) as response:
+                yield response
+        finally:
+            with self._requests_lock:
+                manager._active_sockets.difference_update(sockets)
+
+    def abort_active_requests(self) -> None:
+        """Cut off every chat request in flight. Safe to call from any thread.
+
+        This releases a read that is still waiting for the first token (prompt
+        processing can take a while) as well as a stream in progress, and
+        llama-server stops generating once the connection closes.
+        """
+        with self._requests_lock:
+            self._abort_serial += 1
+            sockets = set(self._active_sockets)
+            sockets.update(
+                sock for resp in self._active_responses
+                if (sock := self._response_socket(resp)) is not None
+            )
+        for sock in sockets:
+            # shutdown() wakes a blocked recv() on POSIX but not on Windows,
+            # where only closing the handle does. socket.close() would wait for
+            # the response's file wrapper to let go, so detach the handle (the
+            # socket object then no longer owns it, and cannot close it twice)
+            # and close it directly.
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                socket.close(sock.detach())
+            except OSError:
+                pass
+
+    @staticmethod
+    def _response_socket(resp: Any) -> Optional[socket.socket]:
+        """The socket under a urllib response (BufferedReader -> SocketIO -> socket)."""
+        raw = getattr(getattr(resp, "fp", None), "raw", None)
+        sock = getattr(raw, "_sock", None)
+        return sock if isinstance(sock, socket.socket) else None
 
     @staticmethod
     def _read_sse_completion(

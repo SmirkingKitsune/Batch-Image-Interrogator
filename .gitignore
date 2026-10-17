@@ -21,6 +21,7 @@ interrogations.db*
 1.16.0
 onnx_provider_settings.json*
 inquiry_settings.json*
+database_settings.json*
 tag_filters.json*
 electron_settings.json*
 

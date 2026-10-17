@@ -5,6 +5,8 @@ from typing import List, Set, Optional, Tuple
 import os
 import shutil
 
+from core.atomic_write import write_text_atomic
+
 
 class FileManager:
     """Manages image files and associated text files."""
@@ -51,22 +53,52 @@ class FileManager:
     def get_text_file_path(image_path: Path) -> Path:
         """Get the corresponding .txt file path for an image."""
         return image_path.with_suffix('.txt')
-    
+
     @staticmethod
-    def write_tags_to_file(image_path: Path, tags: List[str], 
-                          overwrite: bool = True, separator: str = ', '):
-        """Write tags to text file."""
+    def _read_tags_strict(image_path: Path) -> List[str]:
+        """Read sidecar tags, raising on a genuine read error.
+
+        Returns [] only for a missing or empty file. Unlike read_tags_from_file
+        this does NOT swallow read errors, so callers that merge-then-overwrite
+        do not silently discard existing content when the read fails.
+        """
         txt_path = FileManager.get_text_file_path(image_path)
-        
+        if not txt_path.exists():
+            return []
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        if not content:
+            return []
+        return [tag.strip() for tag in content.split(',') if tag.strip()]
+
+    @staticmethod
+    def _dedupe_preserve_order(tags: List[str]) -> List[str]:
+        """Case-insensitive de-dupe keeping first-seen spelling/order."""
+        seen: Set[str] = set()
+        result: List[str] = []
+        for tag in tags:
+            key = tag.strip().casefold()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            result.append(tag.strip())
+        return result
+
+    @staticmethod
+    def write_tags_to_file(image_path: Path, tags: List[str],
+                          overwrite: bool = True, separator: str = ', '):
+        """Write tags to text file (atomically)."""
+        txt_path = FileManager.get_text_file_path(image_path)
+
         if overwrite:
-            with open(txt_path, 'w', encoding='utf-8') as f:
-                f.write(separator.join(tags))
+            write_text_atomic(txt_path, separator.join(tags))
         else:
-            # Append mode
-            existing_tags = FileManager.read_tags_from_file(image_path)
-            all_tags = list(dict.fromkeys(existing_tags + tags))  # Remove duplicates, preserve order
-            with open(txt_path, 'w', encoding='utf-8') as f:
-                f.write(separator.join(all_tags))
+            # Append mode: merge with existing. Use a strict read so a failed
+            # read raises instead of truncating the file to only the new tags.
+            existing_tags = FileManager._read_tags_strict(image_path)
+            # Case-insensitive de-dupe to match delete/organize semantics.
+            all_tags = FileManager._dedupe_preserve_order(existing_tags + tags)
+            write_text_atomic(txt_path, separator.join(all_tags))
 
     @staticmethod
     def delete_tags_from_file(
@@ -79,7 +111,7 @@ class FileManager:
         Returns:
             Tuple of (removed_tags, remaining_tags), preserving sidecar order and spelling.
         """
-        existing_tags = FileManager.read_tags_from_file(image_path)
+        existing_tags = FileManager._read_tags_strict(image_path)
         if not existing_tags or not tags_to_delete:
             return [], existing_tags
 
@@ -101,8 +133,7 @@ class FileManager:
 
         if removed_tags:
             txt_path = FileManager.get_text_file_path(image_path)
-            with open(txt_path, 'w', encoding='utf-8') as f:
-                f.write(separator.join(remaining_tags))
+            write_text_atomic(txt_path, separator.join(remaining_tags))
 
         return removed_tags, remaining_tags
     
@@ -152,45 +183,97 @@ class FileManager:
         Returns:
             True if file was moved, False otherwise
         """
-        existing_tags = FileManager.read_tags_from_file(image_path)
-        existing_tags_lower = [tag.lower() for tag in existing_tags]
-        tag_criteria_lower = [tag.lower() for tag in tag_criteria]
-        
-        # Check matching
-        if match_mode == 'any':
-            matches = any(tag in existing_tags_lower for tag in tag_criteria_lower)
-        else:  # 'all'
-            matches = all(tag in existing_tags_lower for tag in tag_criteria_lower)
-        
+        return FileManager.organize_by_tags_destination(
+            image_path=image_path,
+            tag_criteria=tag_criteria,
+            target_subdir=target_subdir,
+            move_text=move_text,
+            match_mode=match_mode,
+            target_root_dir=target_root_dir,
+        ) is not None
+
+    @staticmethod
+    def organize_by_tags_destination(
+        image_path: Path,
+        tag_criteria: List[str],
+        target_subdir: str,
+        move_text: bool = True,
+        match_mode: str = 'any',
+        target_root_dir: Optional[Path] = None,
+    ) -> Optional[Path]:
+        """Move a matching image and return its actual destination.
+
+        Returns None when the image does not match. Invalid organization rules
+        raise ValueError instead of silently broadening their meaning.
+        """
+        image_path = Path(image_path)
+        if match_mode not in {'any', 'all'}:
+            raise ValueError("match_mode must be 'any' or 'all'")
+
+        normalized_criteria = [
+            tag.strip().casefold()
+            for tag in tag_criteria
+            if isinstance(tag, str) and tag.strip()
+        ]
+        if not normalized_criteria:
+            return None
+
+        existing_tags = {
+            tag.casefold() for tag in FileManager._read_tags_strict(image_path)
+        }
+        matches = (
+            any(tag in existing_tags for tag in normalized_criteria)
+            if match_mode == 'any'
+            else all(tag in existing_tags for tag in normalized_criteria)
+        )
         if not matches:
-            return False
-        
-        # Create target directory
-        destination_root = target_root_dir if target_root_dir is not None else image_path.parent
-        target_dir = destination_root / target_subdir
+            return None
+
+        destination_root = Path(
+            target_root_dir if target_root_dir is not None else image_path.parent
+        ).resolve(strict=False)
+        subdir_path = Path(target_subdir)
+        if not target_subdir.strip() or subdir_path.is_absolute():
+            raise ValueError("target_subdir must be a non-empty relative path")
+        target_dir = (destination_root / subdir_path).resolve(strict=False)
+        try:
+            relative_target = target_dir.relative_to(destination_root)
+        except ValueError as exc:
+            raise ValueError("target_subdir must remain inside the destination root") from exc
+        if not relative_target.parts:
+            raise ValueError("target_subdir must name a child directory")
         target_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Move image
-        new_image_path = target_dir / image_path.name
-        if new_image_path.exists():
-            # Handle duplicate names
-            stem = image_path.stem
-            suffix = image_path.suffix
-            counter = 1
-            while new_image_path.exists():
-                new_image_path = target_dir / f"{stem}_{counter}{suffix}"
-                counter += 1
-        
+
+        source_sidecar = FileManager.get_text_file_path(image_path)
+        move_existing_sidecar = move_text and source_sidecar.exists()
+        stem = image_path.stem
+        suffix = image_path.suffix
+        counter = 0
+        while True:
+            candidate_name = image_path.name if counter == 0 else f"{stem}_{counter}{suffix}"
+            new_image_path = target_dir / candidate_name
+            new_sidecar_path = FileManager.get_text_file_path(new_image_path)
+            if not new_image_path.exists() and not (
+                move_existing_sidecar and new_sidecar_path.exists()
+            ):
+                break
+            counter += 1
+
         shutil.move(str(image_path), str(new_image_path))
-        
-        # Move text file if exists
-        if move_text:
-            txt_path = FileManager.get_text_file_path(image_path)
-            if txt_path.exists():
-                new_txt_path = FileManager.get_text_file_path(new_image_path)
-                shutil.move(str(txt_path), str(new_txt_path))
-        
-        return True
+        if move_existing_sidecar:
+            try:
+                shutil.move(str(source_sidecar), str(new_sidecar_path))
+            except Exception as sidecar_error:
+                try:
+                    shutil.move(str(new_image_path), str(image_path))
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        "Sidecar move failed and image rollback also failed; "
+                        f"image remains at {new_image_path}, sidecar remains at {source_sidecar}"
+                    ) from rollback_error
+                raise sidecar_error
+
+        return new_image_path
     
     @staticmethod
     def get_all_tags_in_directory(directory: str) -> Set[str]:

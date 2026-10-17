@@ -20,6 +20,23 @@ from core.model_paths import (  # noqa: E402
 )
 
 
+def _can_symlink() -> bool:
+    """Creating symlinks on Windows needs Developer Mode or admin rights."""
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "target"
+        target.write_bytes(b"")
+        try:
+            (Path(tmp) / "link").symlink_to(target)
+        except (OSError, NotImplementedError):
+            return False
+    return True
+
+
+requires_symlinks = unittest.skipUnless(
+    _can_symlink(), "creating symlinks needs Windows Developer Mode or admin rights"
+)
+
+
 class HubCache:
     """A miniature HuggingFace hub cache."""
 
@@ -73,17 +90,20 @@ class TestResolution(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    @requires_symlinks
     def test_split_blob_resolves_to_its_snapshot_name(self):
         blob = self.cache.add("aa" * 32, "Model-BF16-00001-of-00002.gguf", subdir="BF16")
         resolved, note = resolve_model_path(str(blob))
         self.assertTrue(resolved.endswith("Model-BF16-00001-of-00002.gguf"))
         self.assertIn("split GGUF", note)
 
+    @requires_symlinks
     def test_resolved_path_is_the_same_file(self):
         blob = self.cache.add("bb" * 32, "Model-00001-of-00002.gguf")
         resolved, _ = resolve_model_path(str(blob))
         self.assertEqual(Path(resolved).resolve(), blob.resolve())
 
+    @requires_symlinks
     def test_single_file_blob_also_resolves_with_a_milder_note(self):
         blob = self.cache.add("cc" * 32, "mmproj-F16.gguf")
         resolved, note = resolve_model_path(str(blob))
@@ -95,6 +115,7 @@ class TestResolution(unittest.TestCase):
         path = "/models/some-model.gguf"
         self.assertEqual(resolve_model_path(path), (path, ""))
 
+    @requires_symlinks
     def test_snapshot_path_is_left_alone(self):
         self.cache.add("dd" * 32, "Model-00001-of-00002.gguf")
         link = self.cache.snapshot / "Model-00001-of-00002.gguf"
@@ -117,6 +138,7 @@ class TestResolution(unittest.TestCase):
         missing = str(self.cache.blobs / ("ff" * 32))
         self.assertEqual(resolve_model_path(missing), (missing, ""))
 
+    @requires_symlinks
     def test_resolution_is_deterministic_across_revisions(self):
         # The same blob referenced by two revisions must not alternate.
         blob = self.cache.add("ab" * 32, "Model-00001-of-00002.gguf")

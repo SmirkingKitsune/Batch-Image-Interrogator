@@ -67,7 +67,10 @@ class LadderTests(unittest.TestCase):
                 patch.object(lp, "detect_accelerator", return_value="cuda"):
             provisioner = lp.LlamaProvisioner(cfg_for(root))
             binary = provisioner.ensure_runtime()
-            summary = summarize_runtime(root, detect=lambda: "cuda")
+            # Describe the install with the same pinned linux config, rather than
+            # this host's, whose executable name differs on Windows.
+            with patch("core.llama_runtime_info.managed_config", return_value=cfg_for(root)):
+                summary = summarize_runtime(root, detect=lambda: "cuda")
 
         self.assertTrue(binary.name.startswith("llama-server"))
         self.assertIn("Installed a cpu runtime", provisioner.target_mismatch)

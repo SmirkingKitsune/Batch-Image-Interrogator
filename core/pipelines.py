@@ -409,6 +409,13 @@ class InterrogationBatchRunner:
 
                 # Check cache first
                 cached = self.database.get_interrogation(file_hash, self.interrogator.model_name)
+                if cached is None and self.database.import_missing_interrogation(
+                    image_path_str, file_hash, self.interrogator.model_name
+                ):
+                    # The other database mode had this result (a local database
+                    # in global mode, the global one in local mode). It is now in
+                    # the active database too, and judged like any cache hit.
+                    cached = self.database.get_interrogation(file_hash, self.interrogator.model_name)
                 current_version = cached and (cached.get('result_version') or 0) >= self.interrogator.RESULT_VERSION
                 reused = self.interrogator.reuse_cached_result(cached) if current_version else None
                 from_cache = reused is not None
@@ -553,13 +560,25 @@ class MultimodalBatchRunner:
         self.on_error = on_error or _noop
         self.is_cancelled = False
         self.was_cancelled = False
+        self.force_stopped = False
 
     def cancel(self) -> None:
+        """Stop once the image in progress has finished and been saved."""
         self.is_cancelled = True
         self.was_cancelled = True
 
+    def force_cancel(self) -> None:
+        """Stop now, abandoning the image in progress mid-request."""
+        self.cancel()
+        self.force_stopped = True
+        abort = getattr(self.interrogator, "abort_active_request", None)
+        if callable(abort):
+            abort()
+
     def run(self) -> bool:
         """Execute multimodal batch interrogation."""
+        from interrogators.llama_cpp_interrogator import LlamaCppInterrogationCancelled
+
         total = len(self.image_paths)
 
         if self.is_cancelled:
@@ -686,6 +705,9 @@ class MultimodalBatchRunner:
                             included_transcripts=included_transcripts,
                             sidecar_tags=sidecar_tags,
                             on_stream_delta=answer_delta,
+                            # Only a force stop interrupts an image; a plain
+                            # cancel lets it finish and stops before the next.
+                            should_cancel=lambda: self.force_stopped,
                             **extra,
                         )
                         relay.flush()
@@ -767,6 +789,10 @@ class MultimodalBatchRunner:
                 except DatabaseQueuedError:
                     # Continue even if DB operation queued.
                     continue
+                except LlamaCppInterrogationCancelled:
+                    # Force-stopped mid-image; stop without emitting an error.
+                    self.was_cancelled = True
+                    break
                 except DatabaseBusyError as e:
                     self.on_error(image_path_str, f"Database busy: {e}")
                 except Exception as e:
@@ -921,4 +947,8 @@ class MultimodalBatchRunner:
         # guarded (default) results so turning the guard back on never serves it.
         if config.get("repetition_guard") is False:
             normalized["repetition_guard"] = False
+        # Repacked and mmap-backed CPU kernels can round differently, so a
+        # --no-repack run gets its own cache entries.
+        if config.get("no_repack"):
+            normalized["no_repack"] = True
         return normalized
